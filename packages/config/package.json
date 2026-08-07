@@ -1,0 +1,12 @@
+{
+  "name": "@inflynx/config",
+  "version": "1.0.0",
+  "description": "Validation, configuration profiles, and secret redaction for Inflynx Code",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rimraf dist"
+  }
+}

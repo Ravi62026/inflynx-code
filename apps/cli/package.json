@@ -1,0 +1,35 @@
+{
+  "name": "inflynx-agent",
+  "version": "1.0.0",
+  "description": "Inflynx Code CLI Agent - Local AI agent engine",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "inflynx-agent": "./dist/index.js",
+    "inflynx": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^7.8.10",
+    "@inflynx/agent-core": "workspace:*",
+    "@inflynx/config": "workspace:*",
+    "@inflynx/model-gateway": "workspace:*",
+    "@inflynx/patch-engine": "workspace:*",
+    "@inflynx/policy-engine": "workspace:*",
+    "@inflynx/protocol": "workspace:*",
+    "@inflynx/tool-runtime": "workspace:*",
+    "@inflynx/ui-components": "workspace:*",
+    "@inflynx/workspace-runtime": "workspace:*",
+    "inquirer": "^13.3.2"
+  },
+  "devDependencies": {
+    "@types/inquirer": "^9.0.7",
+    "@types/node": "^25.5.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}

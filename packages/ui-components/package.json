@@ -1,0 +1,18 @@
+{
+  "name": "@inflynx/ui-components",
+  "version": "1.0.0",
+  "description": "Renderer-independent UI primitives for Inflynx Code",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rimraf dist"
+  },
+  "dependencies": {
+    "cli-highlight": "^2.1.11",
+    "cli-table3": "^0.6.5",
+    "marked": "^12.0.2",
+    "marked-terminal": "^7.0.0"
+  }
+}

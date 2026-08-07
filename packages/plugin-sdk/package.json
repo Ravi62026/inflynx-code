@@ -1,0 +1,12 @@
+{
+  "name": "@inflynx/plugin-sdk",
+  "version": "1.0.0",
+  "description": "Extensible plugin SDK for Inflynx Code ecosystem extensions",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rimraf dist"
+  }
+}
