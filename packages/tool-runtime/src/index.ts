@@ -38,6 +38,8 @@ export interface ToolDefinition<TArgs = Record<string, unknown>> {
   };
   isMutating?: boolean;
   permissionLevel: "readonly" | "readwrite" | "shell";
+  origin?: "core" | "mcp" | "plugin";
+  serverName?: string;
   execute: (args: TArgs, signal?: AbortSignal) => Promise<string>;
 }
 
@@ -495,12 +497,20 @@ export class ToolRegistry {
     this.tools.set(tool.name, tool);
   }
 
+  unregister(name: string): boolean {
+    return this.tools.delete(name);
+  }
+
   get(name: string): ToolDefinition | undefined {
     return this.tools.get(name);
   }
 
   list(): ToolDefinition[] {
     return Array.from(this.tools.values());
+  }
+
+  listByOrigin(origin: "core" | "mcp" | "plugin"): ToolDefinition[] {
+    return this.list().filter((t) => (t.origin || "core") === origin);
   }
 
   /** Returns JSON schema array formatted for OpenAI/DeepSeek tool_choice */

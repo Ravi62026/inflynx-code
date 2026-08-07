@@ -11,6 +11,8 @@ import { loadEnv, saveKeyToEnv, redactSecrets, findWorkspaceRoot, TOP_PROVIDERS,
 import { streamModel, type Message } from "@inflynx/model-gateway";
 import { ToolRegistry, executeTool, CORE_TOOLS, type ToolCall } from "@inflynx/tool-runtime";
 import { applySurgicalPatch, computeUnifiedDiff } from "@inflynx/patch-engine";
+import { McpClientManager } from "@inflynx/mcp-runtime";
+import { SkillManager } from "@inflynx/skill-runtime";
 import {
   buildWorkspaceIndex,
   rankFilesByRelevance,
@@ -29,13 +31,16 @@ import {
 // ─── Slash Command Palette ─────────────────────────────────────────────────────
 
 const SLASH_COMMANDS = [
-  { name: "/provider", value: "/provider", description: "Select AI Provider & configure API key" },
-  { name: "/model",    value: "/model",    description: "Select AI Model across providers" },
-  { name: "/tools",   value: "/tools",    description: "List available agent tools" },
-  { name: "/index",   value: "/index",    description: "View workspace index summary & relevant files" },
-  { name: "/clear",   value: "/clear",    description: "Clear terminal screen & conversation" },
-  { name: "/help",    value: "/help",     description: "Show all available commands" },
-  { name: "/exit",    value: "/exit",     description: "Exit Inflynx Code CLI agent" },
+  { name: "/provider",     value: "/provider",     description: "Select AI Provider & configure API key" },
+  { name: "/model",        value: "/model",        description: "Select AI Model across providers" },
+  { name: "/tools",       value: "/tools",        description: "List available agent tools" },
+  { name: "/mcp",         value: "/mcp",          description: "Manage & list Model Context Protocol (MCP) connectors" },
+  { name: "/skills",      value: "/skills",       description: "List & view discovered agent skills (.inflynx/skills)" },
+  { name: "/create-skill",value: "/create-skill", description: "Interactively create a new reusable agent skill" },
+  { name: "/index",       value: "/index",        description: "View workspace index summary & relevant files" },
+  { name: "/clear",       value: "/clear",        description: "Clear terminal screen & conversation" },
+  { name: "/help",        value: "/help",         description: "Show all available commands" },
+  { name: "/exit",        value: "/exit",         description: "Exit Inflynx Code CLI agent" },
 ];
 
 const KNOWN_COMMANDS = new Set(SLASH_COMMANDS.map((c) => c.value.slice(1)));
@@ -136,8 +141,15 @@ async function main() {
   const workspaceRoot = findWorkspaceRoot(process.cwd());
   process.env.INFLYNX_WORKSPACE_ROOT = workspaceRoot;
 
-  // Init tool registry & workspace indexer with monorepo root
+  // Init tool registry, MCP client manager, Skill manager & workspace indexer
   const registry = new ToolRegistry(CORE_TOOLS);
+  const mcpManager = new McpClientManager();
+  const mcpServers = await mcpManager.connectAll(workspaceRoot);
+  const mcpToolsCount = mcpManager.registerToolsInto(registry);
+
+  const skillManager = new SkillManager();
+  const discoveredSkills = skillManager.discoverSkills(workspaceRoot);
+
   let workspaceIndex: WorkspaceIndex = buildWorkspaceIndex(workspaceRoot);
 
   // Determine active provider
@@ -162,7 +174,11 @@ async function main() {
 
   console.log(`${colors.gray}⚡ Indexed ${workspaceIndex.totalFiles} workspace files (.gitignore aware) in ${workspaceRoot}${colors.reset}\n`);
 
-  // System prompt with tool documentation
+  // System prompt with tool & skill documentation
+  const availableSkillsOverview = skillManager.listSkills().length > 0
+    ? `\nDiscovered Skills:\n` + skillManager.listSkills().map((s) => `- ${s.metadata.name} (${s.id}): ${s.metadata.description}`).join("\n")
+    : "";
+
   const systemPrompt = [
     "You are Inflynx Agent, an expert AI coding assistant running in the user's terminal.",
     "You have access to tools: read_file, patch_file, write_file, list_directory, search_files, web_search, fetch_url, execute_shell.",
@@ -170,10 +186,11 @@ async function main() {
     "PREFER patch_file OVER write_file for editing existing files. patch_file surgically replaces only the target code block.",
     "Use tools proactively to read code before editing, list directories to understand structure, and run tests to verify changes.",
     "Support @filename mentions for auto-attached context.",
+    availableSkillsOverview,
     "Be concise. When you use a tool, explain why briefly before calling it.",
     "After every patch_file, write_file, or execute_shell, summarize what changed and what to do next.",
     `Current workspace: ${workspaceRoot}`,
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 
   const conversationHistory: Message[] = [
     { role: "system", content: systemPrompt },
@@ -188,7 +205,12 @@ async function main() {
     if (inputStr.startsWith("/")) {
       const firstWord = inputStr.slice(1).trim().split(/\s+/)[0]?.toLowerCase() ?? "";
 
-      if (!KNOWN_COMMANDS.has(firstWord) || inputStr.trim() === "/") {
+      if (!KNOWN_COMMANDS.has(firstWord) && inputStr.trim() !== "/") {
+        console.log(`${colors.red}Unknown command: /${firstWord}${colors.reset}. Type /help.\n`);
+        continue;
+      }
+
+      if (inputStr.trim() === "/") {
         try {
           const picked = await selectSlashCommand(inputStr);
           if (picked) inputStr = picked;
@@ -223,9 +245,102 @@ async function main() {
         console.log(`\n${colors.bold}Available Agent Tools:${colors.reset}`);
         for (const t of registry.list()) {
           const perm = t.permissionLevel === "shell" ? colors.red : t.permissionLevel === "readwrite" ? colors.yellow : colors.brightGreen;
-          console.log(`  ${colors.cyan}${t.name.padEnd(20)}${colors.reset} ${perm}[${t.permissionLevel}]${colors.reset}  ${colors.gray}${t.description}${colors.reset}`);
+          const originTag = t.origin === "mcp" ? `${colors.brightMagenta}[MCP:${t.serverName}]${colors.reset} ` : "";
+          console.log(`  ${colors.cyan}${t.name.padEnd(30)}${colors.reset} ${originTag}${perm}[${t.permissionLevel}]${colors.reset}  ${colors.gray}${t.description}${colors.reset}`);
         }
         console.log();
+        continue;
+      }
+
+      if (cmd === "mcp") {
+        const subCmd = parts[1]?.toLowerCase();
+        const query = parts.slice(2).join(" ");
+
+        if (subCmd === "add" && query) {
+          console.log(`\n${colors.brightCyan}⚡ Auto-discovering MCP Server for: "${query}"...${colors.reset}`);
+          inputStr = [
+            `The user wants to add an MCP (Model Context Protocol) server for: "${query}".`,
+            `Please follow these steps:`,
+            `1. Use web_search to find the official/popular npm package or command for the "${query}" MCP server (e.g. @modelcontextprotocol/server-github, @figma/mcp-server, etc.).`,
+            `2. Read the configuration requirements (command, args, env vars).`,
+            `3. Use patch_file or write_file to add this new server configuration to .inflynx/mcp.json under "mcpServers".`,
+            `4. Inform the user what was added and ask them to restart or run /mcp list.`,
+          ].join("\n");
+          // Proceed into LLM execution loop below instead of slash command continue!
+        } else {
+          console.log(`\n${colors.bold}${colors.brightMagenta}🔌 Model Context Protocol (MCP) Connectors:${colors.reset}`);
+          const servers = mcpManager.listServers();
+          if (servers.length === 0) {
+            console.log(`  ${colors.gray}No MCP servers configured in .inflynx/mcp.json${colors.reset}\n`);
+          } else {
+            for (const s of servers) {
+              const statusColor = s.status === "connected" ? colors.brightGreen : s.status === "disabled" ? colors.yellow : colors.red;
+              console.log(`  ${colors.cyan}• ${s.config.id}${colors.reset} [${statusColor}${s.status}${colors.reset}] — ${s.config.transport.toUpperCase()} ${s.config.command || s.config.url || ""}`);
+              if (s.tools.length > 0) {
+                console.log(`    ${colors.gray}Tools (${s.tools.length}): ${s.tools.map((t) => t.name).join(", ")}${colors.reset}`);
+              }
+              if (s.error) {
+                console.log(`    ${colors.red}Error: ${s.error}${colors.reset}`);
+              }
+            }
+            console.log();
+          }
+          console.log(`${colors.gray}Tip: Type '/mcp add figma' or '/mcp add github' to auto-find and configure new MCP servers!${colors.reset}\n`);
+          continue;
+        }
+      }
+
+      if (cmd === "skills") {
+        const subCmd = parts[1]?.toLowerCase();
+        const query = parts.slice(2).join(" ");
+
+        if (subCmd === "add" && query) {
+          console.log(`\n${colors.brightCyan}⚡ Auto-researching & Generating Skill for: "${query}"...${colors.reset}`);
+          inputStr = [
+            `The user wants to create a new agent skill for: "${query}".`,
+            `Please follow these steps:`,
+            `1. Use web_search to find best practices, guidelines, rules, and prompt techniques for "${query}".`,
+            `2. Synthesize the findings into structured SKILL.md format with YAML frontmatter (name, description, tags).`,
+            `3. Use write_file to create the new skill file at: .inflynx/skills/${query.toLowerCase().replace(/[^a-z0-9_-]/g, "-")}/SKILL.md`,
+            `4. Inform the user that the skill has been created and saved!`,
+          ].join("\n");
+          // Proceed to LLM execution loop
+        } else {
+          console.log(`\n${colors.bold}${colors.brightMagenta}🧠 Discovered Agent Skills:${colors.reset}`);
+          const skillsList = skillManager.listSkills();
+          if (skillsList.length === 0) {
+            console.log(`  ${colors.gray}No skills found in .inflynx/skills or skills/${colors.reset}`);
+            console.log(`  ${colors.gray}Type '/skills add <requirement>' to auto-create a new skill!${colors.reset}\n`);
+          } else {
+            for (const s of skillsList) {
+              console.log(`  ${colors.cyan}• ${s.metadata.name}${colors.reset} ${colors.gray}(${s.id})${colors.reset}`);
+              console.log(`    ${colors.gray}${s.metadata.description}${colors.reset}`);
+              console.log(`    ${colors.dim}Location: ${s.filePath}${colors.reset}`);
+            }
+            console.log();
+          }
+          console.log(`${colors.gray}Tip: Type '/skills add remove ai content and plag' to auto-generate a new skill!${colors.reset}\n`);
+          continue;
+        }
+      }
+
+      if (cmd === "create-skill") {
+        console.log(`\n${colors.bold}${colors.brightCyan}⚡ Create New Agent Skill:${colors.reset}`);
+        const nameInput = await askUserPrompt(`${colors.yellow}Skill Name (e.g. Jira Ticket Sync):${colors.reset} `);
+        if (!nameInput.trim()) continue;
+
+        const descInput = await askUserPrompt(`${colors.yellow}Skill Description:${colors.reset} `);
+        const instructionsInput = await askUserPrompt(`${colors.yellow}Step-by-step Instructions for the Agent:${colors.reset} `);
+
+        const skillDef = skillManager.createSkill(
+          nameInput.toLowerCase().replace(/\s+/g, "-"),
+          { name: nameInput.trim(), description: descInput.trim() },
+          instructionsInput.trim(),
+          workspaceRoot
+        );
+
+        console.log(`\n${colors.brightGreen}✓ Skill Created Successfully!${colors.reset}`);
+        console.log(`  Saved to: ${colors.cyan}${skillDef.filePath}${colors.reset}\n`);
         continue;
       }
 
@@ -286,12 +401,18 @@ async function main() {
       }
 
       if (cmd === "exit" || cmd === "quit") {
+        mcpManager.disconnectAll();
         console.log(`\n${colors.cyan}Goodbye! 👋${colors.reset}\n`);
         process.exit(0);
       }
 
-      console.log(`${colors.red}Unknown command: /${cmd}${colors.reset}. Type /help.\n`);
-      continue;
+      // If command was /mcp add or /skills add, break out of slash command branch to let LLM process the prompt!
+      if ((cmd === "mcp" || cmd === "skills") && parts[1]?.toLowerCase() === "add") {
+        // Continue to prompt execution below
+      } else {
+        console.log(`${colors.red}Unknown command: /${cmd}${colors.reset}. Type /help.\n`);
+        continue;
+      }
     }
 
     // ─── Check API Key ─────────────────────────────────────────────────────────
@@ -323,6 +444,14 @@ async function main() {
         const topMatches = relevantFiles.map((r) => r.file.relativePath).join(", ");
         console.log(`${colors.gray}🔍 Auto-matched context: ${topMatches}${colors.reset}`);
       }
+    }
+
+    // Auto-match discovered skills
+    const matchedSkills = skillManager.matchSkills(inputStr, 2);
+    if (matchedSkills.length > 0) {
+      console.log(`${colors.brightMagenta}🧠 Matched Skills:${colors.reset} ${matchedSkills.map((s) => s.metadata.name).join(", ")}`);
+      const skillBlocks = matchedSkills.map((s) => `<skill name="${s.metadata.name}">\n${s.instructions}\n</skill>`).join("\n\n");
+      finalPromptContent += `\n\n=== Relevant Active Skills ===\n${skillBlocks}`;
     }
 
     // ─── Agentic Loop ─────────────────────────────────────────────────────────

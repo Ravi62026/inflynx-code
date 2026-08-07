@@ -168,3 +168,103 @@ export function redactSecrets(text: string): string {
     .replace(/(sk-[a-zA-Z0-9_-]{20,})/g, "[REDACTED_API_KEY]")
     .replace(/(AIzaSy[a-zA-Z0-9_-]{33})/g, "[REDACTED_API_KEY]");
 }
+
+// ─── MCP Configuration Loader ────────────────────────────────────────────────
+
+export interface McpServerConfig {
+  id: string;
+  name?: string;
+  transport: "stdio" | "sse";
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  disabled?: boolean;
+}
+
+export interface McpConfigFile {
+  mcpServers?: Record<string, {
+    command?: string;
+    args?: string[];
+    env?: Record<string, string>;
+    url?: string;
+    disabled?: boolean;
+    transport?: "stdio" | "sse";
+  }>;
+}
+
+export function loadMcpConfig(startDir: string = process.cwd()): McpServerConfig[] {
+  const rootDir = findWorkspaceRoot(startDir);
+  const configPaths = [
+    path.join(os.homedir(), ".inflynx", "mcp.json"),
+    path.join(rootDir, ".inflynx", "mcp.json"),
+    path.join(rootDir, "mcp.json"),
+  ];
+
+  const serversMap = new Map<string, McpServerConfig>();
+
+  for (const cfgPath of configPaths) {
+    if (fs.existsSync(cfgPath)) {
+      try {
+        const raw = fs.readFileSync(cfgPath, "utf-8");
+        const parsed = JSON.parse(raw) as McpConfigFile;
+        if (parsed.mcpServers) {
+          for (const [id, cfg] of Object.entries(parsed.mcpServers)) {
+            serversMap.set(id, {
+              id,
+              name: id,
+              transport: cfg.transport || (cfg.url ? "sse" : "stdio"),
+              command: cfg.command,
+              args: cfg.args,
+              env: cfg.env,
+              url: cfg.url,
+              disabled: cfg.disabled ?? false,
+            });
+          }
+        }
+      } catch {
+        // ignore malformed config files
+      }
+    }
+  }
+
+  return Array.from(serversMap.values());
+}
+
+export function saveMcpServerConfig(
+  serverConfig: McpServerConfig,
+  startDir: string = process.cwd()
+): void {
+  const rootDir = findWorkspaceRoot(startDir);
+  const inflynxDir = path.join(rootDir, ".inflynx");
+  if (!fs.existsSync(inflynxDir)) {
+    fs.mkdirSync(inflynxDir, { recursive: true });
+  }
+
+  const cfgPath = path.join(inflynxDir, "mcp.json");
+  let currentConfig: McpConfigFile = { mcpServers: {} };
+
+  if (fs.existsSync(cfgPath)) {
+    try {
+      currentConfig = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
+    } catch {
+      currentConfig = { mcpServers: {} };
+    }
+  }
+
+  if (!currentConfig.mcpServers) {
+    currentConfig.mcpServers = {};
+  }
+
+  currentConfig.mcpServers[serverConfig.id] = {
+    command: serverConfig.command,
+    args: serverConfig.args,
+    env: serverConfig.env,
+    url: serverConfig.url,
+    transport: serverConfig.transport,
+    disabled: serverConfig.disabled,
+  };
+
+  fs.writeFileSync(cfgPath, JSON.stringify(currentConfig, null, 2), "utf-8");
+}
+

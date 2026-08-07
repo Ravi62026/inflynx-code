@@ -23,6 +23,9 @@ importers:
       '@inflynx/config':
         specifier: workspace:*
         version: link:../../packages/config
+      '@inflynx/mcp-runtime':
+        specifier: workspace:*
+        version: link:../../packages/mcp-runtime
       '@inflynx/model-gateway':
         specifier: workspace:*
         version: link:../../packages/model-gateway
@@ -35,6 +38,9 @@ importers:
       '@inflynx/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
+      '@inflynx/skill-runtime':
+        specifier: workspace:*
+        version: link:../../packages/skill-runtime
       '@inflynx/tool-runtime':
         specifier: workspace:*
         version: link:../../packages/tool-runtime
@@ -132,6 +138,25 @@ importers:
 
   packages/config: {}
 
+  packages/mcp-runtime:
+    dependencies:
+      '@inflynx/config':
+        specifier: workspace:*
+        version: link:../config
+      '@inflynx/tool-runtime':
+        specifier: workspace:*
+        version: link:../tool-runtime
+    devDependencies:
+      '@types/node':
+        specifier: ^25.5.0
+        version: 25.9.5
+      rimraf:
+        specifier: ^5.0.5
+        version: 5.0.10
+      typescript:
+        specifier: ^6.0.2
+        version: 6.0.3
+
   packages/model-gateway: {}
 
   packages/patch-engine: {}
@@ -143,6 +168,22 @@ importers:
   packages/protocol: {}
 
   packages/session-store: {}
+
+  packages/skill-runtime:
+    dependencies:
+      '@inflynx/config':
+        specifier: workspace:*
+        version: link:../config
+    devDependencies:
+      '@types/node':
+        specifier: ^25.5.0
+        version: 25.9.5
+      rimraf:
+        specifier: ^5.0.5
+        version: 5.0.10
+      typescript:
+        specifier: ^6.0.2
+        version: 6.0.3
 
   packages/telemetry: {}
 
