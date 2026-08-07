@@ -19,6 +19,48 @@ function resolveWorkspacePath(targetPath: string): string {
   return path.isAbsolute(targetPath) ? targetPath : path.join(root, targetPath);
 }
 
+// ─── JSON Tool Argument Parser & Repair Helper ────────────────────────────────
+
+export function safeParseJsonArgs(raw: unknown): Record<string, unknown> {
+  if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
+    const obj = raw as Record<string, unknown>;
+    if (typeof obj.raw === "string" && Object.keys(obj).length === 1) {
+      return safeParseJsonArgs(obj.raw);
+    }
+    return obj;
+  }
+  if (typeof raw !== "string") return {};
+
+  const trimmed = raw.trim();
+  if (!trimmed) return {};
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    try {
+      const sanitized = trimmed.replace(/"([^"\\]*(\\.[^"\\]*)*)"/g, (match) => {
+        return match
+          .replace(/\n/g, "\\n")
+          .replace(/\r/g, "\\r")
+          .replace(/\t/g, "\\t");
+      });
+      return JSON.parse(sanitized);
+    } catch {
+      try {
+        const pathMatch = trimmed.match(/"path"\s*:\s*"([^"]+)"/);
+        const contentMatch = trimmed.match(/"content"\s*:\s*"([\s\S]*)"/);
+        if (pathMatch) {
+          return {
+            path: pathMatch[1],
+            content: contentMatch ? contentMatch[1] : "",
+          };
+        }
+      } catch { /* ignore */ }
+      return { raw: trimmed };
+    }
+  }
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface ToolCall {
@@ -556,8 +598,10 @@ export async function executeTool(
     };
   }
 
+  const parsedArgs = safeParseJsonArgs(call.args);
+
   try {
-    const output = await tool.execute(call.args, signal);
+    const output = await tool.execute(parsedArgs, signal);
     return {
       toolCallId: call.id,
       toolName: call.name,

@@ -197,7 +197,35 @@ export async function* streamOpenAiCompatible(request: ModelRequest, signal?: Ab
     body.tool_choice = "auto";
   }
 
-  const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal });
+  let response: Response | undefined;
+  let lastFetchError: Error | undefined;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal });
+      if (response.ok) break;
+      // If 5xx server error or rate-limited (429), retry after delay
+      if (response.status === 429 || response.status >= 500) {
+        if (attempt < 3) {
+          await new Promise((r) => setTimeout(r, attempt * 1000));
+          continue;
+        }
+      }
+      break;
+    } catch (err: any) {
+      lastFetchError = err;
+      if (attempt < 3 && !signal?.aborted) {
+        await new Promise((r) => setTimeout(r, attempt * 1000));
+      }
+    }
+  }
+
+  if (!response) {
+    throw new Error(
+      `${provider.toUpperCase()} network connection failed: ${lastFetchError?.message || "fetch failed"}. ` +
+      `Please check your internet connection or network proxy status and try again.`
+    );
+  }
 
   if (!response.ok) {
     const errorText = await response.text();
@@ -218,11 +246,21 @@ export async function* streamOpenAiCompatible(request: ModelRequest, signal?: Ab
     toolCallsFlushed = true;
     for (const [, tc] of Object.entries(toolCallAccumulator)) {
       if (!tc.id && !tc.name) continue;
+      const rawStr = (tc.args || "{}").trim();
+      let parsedArgs: Record<string, unknown>;
       try {
-        yield { type: "tool_call", id: tc.id, name: tc.name, args: JSON.parse(tc.args || "{}") };
+        parsedArgs = JSON.parse(rawStr);
       } catch {
-        yield { type: "tool_call", id: tc.id, name: tc.name, args: { raw: tc.args } };
+        try {
+          const sanitized = rawStr.replace(/"([^"\\]*(\\.[^"\\]*)*)"/g, (match) => {
+            return match.replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t");
+          });
+          parsedArgs = JSON.parse(sanitized);
+        } catch {
+          parsedArgs = { raw: rawStr };
+        }
       }
+      yield { type: "tool_call", id: tc.id, name: tc.name, args: parsedArgs };
     }
   }
 

@@ -287,6 +287,14 @@ export class EditTransactionManager {
     const absPath = path.isAbsolute(filePath) ? filePath : path.join(root, filePath);
     const relPath = path.relative(root, absPath);
 
+    // Guard: if path exists but is a directory, raise clear error
+    if (fs.existsSync(absPath) && fs.statSync(absPath).isDirectory()) {
+      throw new Error(
+        `Cannot write file: "${absPath}" is an existing directory. ` +
+        `Check the path — you may have passed a directory path instead of a file path.`
+      );
+    }
+
     const oldContent = fs.existsSync(absPath) ? fs.readFileSync(absPath, "utf-8") : "";
     const filePatch: FilePatch = {
       filePath: relPath,

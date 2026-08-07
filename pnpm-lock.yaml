@@ -134,7 +134,11 @@ importers:
         specifier: ^5.3.3
         version: 5.9.3
 
-  packages/agent-core: {}
+  packages/agent-core:
+    dependencies:
+      '@inflynx/workspace-runtime':
+        specifier: workspace:*
+        version: link:../workspace-runtime
 
   packages/config: {}
 

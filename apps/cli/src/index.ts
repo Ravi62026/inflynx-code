@@ -9,7 +9,8 @@ import path from "path";
 import { select, password, search, confirm } from "@inquirer/prompts";
 import { loadEnv, saveKeyToEnv, redactSecrets, findWorkspaceRoot, TOP_PROVIDERS, type ProviderInfo } from "@inflynx/config";
 import { streamModel, type Message } from "@inflynx/model-gateway";
-import { ToolRegistry, executeTool, CORE_TOOLS, type ToolCall } from "@inflynx/tool-runtime";
+import { ToolRegistry, executeTool, CORE_TOOLS, safeParseJsonArgs, type ToolCall } from "@inflynx/tool-runtime";
+import { type AgentMode, MODE_CONFIGS, filterToolsForMode, PlanEngine, DebugEngine, GraphEngine } from "@inflynx/agent-core";
 import { applySurgicalPatch, computeUnifiedDiff } from "@inflynx/patch-engine";
 import { McpClientManager } from "@inflynx/mcp-runtime";
 import { SkillManager } from "@inflynx/skill-runtime";
@@ -31,16 +32,21 @@ import {
 // ─── Slash Command Palette ─────────────────────────────────────────────────────
 
 const SLASH_COMMANDS = [
+  { name: "/mode",         value: "/mode",         description: "Switch execution mode: ask | plan | agent | debug" },
+  { name: "/graph",        value: "/graph",        description: "Generate codebase mind map, Mermaid diagram, SVG/PNG images & interactive HTML map" },
+  { name: "/debug",        value: "/debug",        description: "CodeRabbit-style automated review, fault localization & report generation" },
+  { name: "/plan",         value: "/plan",         description: "Generate structured .inflynx/PLAN.md for a task" },
+  { name: "/execute-plan", value: "/execute-plan", description: "Approve & execute the current .inflynx/PLAN.md" },
   { name: "/provider",     value: "/provider",     description: "Select AI Provider & configure API key" },
   { name: "/model",        value: "/model",        description: "Select AI Model across providers" },
-  { name: "/tools",       value: "/tools",        description: "List available agent tools" },
-  { name: "/mcp",         value: "/mcp",          description: "Manage & list Model Context Protocol (MCP) connectors" },
-  { name: "/skills",      value: "/skills",       description: "List & view discovered agent skills (.inflynx/skills)" },
-  { name: "/create-skill",value: "/create-skill", description: "Interactively create a new reusable agent skill" },
-  { name: "/index",       value: "/index",        description: "View workspace index summary & relevant files" },
-  { name: "/clear",       value: "/clear",        description: "Clear terminal screen & conversation" },
-  { name: "/help",        value: "/help",         description: "Show all available commands" },
-  { name: "/exit",        value: "/exit",         description: "Exit Inflynx Code CLI agent" },
+  { name: "/tools",        value: "/tools",        description: "List available agent tools (filtered by active mode)" },
+  { name: "/mcp",          value: "/mcp",          description: "Manage & list Model Context Protocol (MCP) connectors" },
+  { name: "/skills",       value: "/skills",       description: "List & view discovered agent skills (.inflynx/skills)" },
+  { name: "/create-skill", value: "/create-skill", description: "Interactively create a new reusable agent skill" },
+  { name: "/index",        value: "/index",        description: "View workspace index summary & relevant files" },
+  { name: "/clear",        value: "/clear",        description: "Clear terminal screen & conversation" },
+  { name: "/help",         value: "/help",         description: "Show all available commands" },
+  { name: "/exit",         value: "/exit",         description: "Exit Inflynx Code CLI agent" },
 ];
 
 const KNOWN_COMMANDS = new Set(SLASH_COMMANDS.map((c) => c.value.slice(1)));
@@ -141,7 +147,7 @@ async function main() {
   const workspaceRoot = findWorkspaceRoot(process.cwd());
   process.env.INFLYNX_WORKSPACE_ROOT = workspaceRoot;
 
-  // Init tool registry, MCP client manager, Skill manager & workspace indexer
+  // Init tool registry, MCP client manager, Skill manager, Plan engine & workspace indexer
   const registry = new ToolRegistry(CORE_TOOLS);
   const mcpManager = new McpClientManager();
   const mcpServers = await mcpManager.connectAll(workspaceRoot);
@@ -150,7 +156,56 @@ async function main() {
   const skillManager = new SkillManager();
   const discoveredSkills = skillManager.discoverSkills(workspaceRoot);
 
+  const planEngine = new PlanEngine(workspaceRoot);
+  const debugEngine = new DebugEngine(workspaceRoot);
+  const graphEngine = new GraphEngine(workspaceRoot);
+
   let workspaceIndex: WorkspaceIndex = buildWorkspaceIndex(workspaceRoot);
+
+  // ─── Execution Mode ──────────────────────────────────────────────────────────
+  let activeMode: AgentMode = "agent"; // Default: full agent mode
+
+  const MODE_BADGE_COLORS: Record<AgentMode, string> = {
+    ask: colors.blue,
+    plan: colors.yellow,
+    agent: colors.brightCyan,
+    debug: colors.red,
+  };
+
+  function buildModeSystemPrompt(mode: AgentMode): string {
+    const modeFile = path.join(workspaceRoot, MODE_CONFIGS[mode].systemPromptFile);
+    const modePrompt = fs.existsSync(modeFile)
+      ? fs.readFileSync(modeFile, "utf-8")
+      : `You are Inflynx Agent in ${mode.toUpperCase()} MODE.`;
+
+    const skillsBlock = skillManager.listSkills().length > 0
+      ? `\n\nDiscovered Skills:\n` + skillManager.listSkills().map((s) => `- ${s.metadata.name} (${s.id}): ${s.metadata.description}`).join("\n")
+      : "";
+
+    // For agent mode, check if an active plan exists and inject it
+    let planBlock = "";
+    if (mode === "agent") {
+      const activePlan = planEngine.loadActivePlan();
+      if (activePlan && (activePlan.status === "IN_PROGRESS" || activePlan.status === "PENDING_APPROVAL")) {
+        const pending = activePlan.steps.filter((s) => s.status === "pending");
+        if (pending.length > 0) {
+          planBlock = `\n\nACTIVE PLAN (.inflynx/PLAN.md):\nGoal: ${activePlan.goal}\nStatus: ${activePlan.status}\nNext steps pending:\n` +
+            pending.map((s) => `  Step ${s.id}: ${s.description}${s.targetFile ? ` (${s.targetFile})` : ""}`).join("\n");
+        }
+      }
+    }
+
+    // For debug mode, check if an active debug report exists
+    let debugBlock = "";
+    if (mode === "debug") {
+      const activeReport = debugEngine.loadActiveReport();
+      if (activeReport) {
+        debugBlock = `\n\nLAST DEBUG REPORT (.inflynx/DEBUG_REPORT.md):\nHealth Score: ${activeReport.healthScore}/100\nTotal Issues: ${activeReport.totalIssues} (Critical: ${activeReport.criticalCount}, Security: ${activeReport.securityCount}, Performance: ${activeReport.performanceCount}, Minor: ${activeReport.minorCount})\n`;
+      }
+    }
+
+    return [modePrompt, skillsBlock, planBlock, debugBlock, `\nCurrent workspace: ${workspaceRoot}`].filter(Boolean).join("");
+  }
 
   // Determine active provider
   let activeProvider: ProviderInfo = TOP_PROVIDERS[0];
@@ -167,6 +222,7 @@ async function main() {
   let activeApiKey = getApiKeyForProvider(activeProvider.id);
 
   displayWelcomeBanner(activeModel, activeProvider.id, workspaceRoot);
+  console.log(`${colors.gray}Mode: ${MODE_BADGE_COLORS[activeMode]}[${activeMode}]${colors.reset}${colors.gray} — Type /mode to switch${colors.reset}`);
 
   if (!activeApiKey) {
     console.log(`${colors.yellow}⚠ Warning: No API key for [${activeProvider.name}]. Use /provider to configure.${colors.reset}\n`);
@@ -174,31 +230,15 @@ async function main() {
 
   console.log(`${colors.gray}⚡ Indexed ${workspaceIndex.totalFiles} workspace files (.gitignore aware) in ${workspaceRoot}${colors.reset}\n`);
 
-  // System prompt with tool & skill documentation
-  const availableSkillsOverview = skillManager.listSkills().length > 0
-    ? `\nDiscovered Skills:\n` + skillManager.listSkills().map((s) => `- ${s.metadata.name} (${s.id}): ${s.metadata.description}`).join("\n")
-    : "";
-
-  const systemPrompt = [
-    "You are Inflynx Agent, an expert AI coding assistant running in the user's terminal.",
-    "You have access to tools: read_file, patch_file, write_file, list_directory, search_files, web_search, fetch_url, execute_shell.",
-    "Use web_search and fetch_url when asked to search Google/internet or read online documentation.",
-    "PREFER patch_file OVER write_file for editing existing files. patch_file surgically replaces only the target code block.",
-    "Use tools proactively to read code before editing, list directories to understand structure, and run tests to verify changes.",
-    "Support @filename mentions for auto-attached context.",
-    availableSkillsOverview,
-    "Be concise. When you use a tool, explain why briefly before calling it.",
-    "After every patch_file, write_file, or execute_shell, summarize what changed and what to do next.",
-    `Current workspace: ${workspaceRoot}`,
-  ].filter(Boolean).join("\n");
-
   const conversationHistory: Message[] = [
-    { role: "system", content: systemPrompt },
+    { role: "system", content: buildModeSystemPrompt(activeMode) },
   ];
 
   // ─── REPL Loop ──────────────────────────────────────────────────────────────
   while (true) {
-    let inputStr = await askUserPrompt(formatPrompt(workspaceRoot));
+    // Mode-colored prompt badge
+    const modeBadge = `${MODE_BADGE_COLORS[activeMode]}[${activeMode}]${colors.reset}`;
+    let inputStr = await askUserPrompt(formatPrompt(workspaceRoot, modeBadge));
     if (!inputStr) continue;
 
     // ─── Slash Command Handling ────────────────────────────────────────────────
@@ -225,10 +265,228 @@ async function main() {
       if (cmd === "help") {
         console.log(`\n${colors.bold}Available slash commands:${colors.reset}`);
         for (const c of SLASH_COMMANDS) {
-          console.log(`  ${colors.cyan}${c.name.padEnd(12)}${colors.reset} ${colors.gray}— ${c.description}${colors.reset}`);
+          console.log(`  ${colors.cyan}${c.name.padEnd(16)}${colors.reset} ${colors.gray}— ${c.description}${colors.reset}`);
         }
-        console.log();
+        console.log(`\nActive Mode: ${MODE_BADGE_COLORS[activeMode]}[${activeMode}]${colors.reset} — Use /mode to switch\n`);
         continue;
+      }
+
+      // ─── /mode Command ────────────────────────────────────────────────────────
+      if (cmd === "mode") {
+        const requestedMode = parts[1]?.toLowerCase() as AgentMode | undefined;
+
+        if (requestedMode && ["ask", "plan", "agent", "debug"].includes(requestedMode)) {
+          // Direct switch
+          activeMode = requestedMode;
+        } else {
+          // Interactive dropdown
+          try {
+            const picked = await select({
+              message: "Select Execution Mode:",
+              choices: [
+                { name: `💬 ask   — Read-only advisory & code explanation (no mutations)`, value: "ask" },
+                { name: `📋 plan  — Research codebase & generate structured .inflynx/PLAN.md`, value: "plan" },
+                { name: `⚡ agent — Full autonomous coding (patch, shell, MCP tools)`, value: "agent" },
+                { name: `🐞 debug — CodeRabbit-style automated review, fault localization & report generation`, value: "debug" },
+              ],
+              default: activeMode,
+            });
+            activeMode = picked as AgentMode;
+          } catch { console.log(); continue; }
+        }
+
+        // Rebuild system prompt for new mode
+        conversationHistory[0] = { role: "system", content: buildModeSystemPrompt(activeMode) };
+
+        const modeDescriptions: Record<AgentMode, string> = {
+          ask: "Read-only advisor — will explain & analyze code, no file changes.",
+          plan: "Architect mode — will research codebase & generate .inflynx/PLAN.md.",
+          agent: "Full execution mode — all tools enabled, autonomous coding.",
+          debug: "CodeRabbit debug mode — fault localization, surgical patches & .inflynx/DEBUG_REPORT.md generation.",
+        };
+        console.log(`\n${MODE_BADGE_COLORS[activeMode]}✓ Switched to [${activeMode}] mode${colors.reset}`);
+        console.log(`  ${colors.gray}${modeDescriptions[activeMode]}${colors.reset}\n`);
+        continue;
+      }
+
+      // ─── /debug Command ───────────────────────────────────────────────────────
+      if (cmd === "debug") {
+        const subCmd = parts[1]?.toLowerCase();
+
+        if (subCmd === "report") {
+          const report = debugEngine.loadActiveReport();
+          if (!report) {
+            console.log(`\n${colors.gray}No active debug report at .inflynx/DEBUG_REPORT.md. Run /debug <task> to generate one.${colors.reset}\n`);
+          } else {
+            console.log(`\n${colors.bold}🐞 Debug & Code Review Report:${colors.reset}`);
+            console.log(`  Health Score: ${colors.brightGreen}${report.healthScore}/100${colors.reset}`);
+            console.log(`  Total Issues: ${colors.cyan}${report.totalIssues}${colors.reset} (Critical: ${colors.red}${report.criticalCount}${colors.reset}, Security: ${colors.yellow}${report.securityCount}${colors.reset}, Performance: ${colors.brightCyan}${report.performanceCount}${colors.reset}, Minor: ${colors.gray}${report.minorCount}${colors.reset})`);
+            console.log(`  Report Path: ${colors.dim}${report.reportPath}${colors.reset}\n`);
+          }
+          continue;
+        }
+
+        if (subCmd === "history") {
+          const history = debugEngine.listHistory();
+          if (history.length === 0) {
+            console.log(`\n${colors.gray}No archived debug reports in .inflynx/reports/${colors.reset}\n`);
+          } else {
+            console.log(`\n${colors.bold}🐞 Archived Debug Reports:${colors.reset}`);
+            for (const [i, r] of history.entries()) {
+              console.log(`  ${colors.cyan}${i + 1}. ${r.filename}${colors.reset} ${colors.gray}(${r.mtime.toLocaleString()})${colors.reset}`);
+            }
+            console.log();
+          }
+          continue;
+        }
+
+        // Trigger debug mode for given command or task
+        const debugTask = parts.slice(1).join(" ");
+        activeMode = "debug";
+        conversationHistory[0] = { role: "system", content: buildModeSystemPrompt("debug") };
+        console.log(`\n${colors.red}🐞 Switched to [debug] mode${colors.reset}`);
+
+        if (debugTask) {
+          console.log(`${colors.gray}Executing CodeRabbit review & fault localization for: "${debugTask}"...${colors.reset}\n`);
+          inputStr = [
+            `Perform a deep CodeRabbit-style code review and debugging audit for: "${debugTask}".`,
+            `1. Run appropriate tools (e.g. execute_shell, search_files, read_file) to capture logs and locate issues.`,
+            `2. Analyze critical bugs, security risks, performance bottlenecks, and minor nits.`,
+            `3. Apply surgical patches where appropriate using patch_file.`,
+            `4. Re-verify fixes using execute_shell.`,
+            `5. Generate a comprehensive Markdown report saved to .inflynx/DEBUG_REPORT.md following the mandatory schema in your system prompt.`,
+          ].join("\n");
+        } else {
+          console.log(`${colors.gray}Type your debug goal, error log, or command to test (e.g. /debug pnpm build)...${colors.reset}\n`);
+          continue;
+        }
+      }
+
+      // ─── /graph Command ───────────────────────────────────────────────────────
+      if (cmd === "graph" || cmd === "mindmap") {
+        console.log(`\n${colors.brightCyan}⚡ Generating Codebase Mind Map & Architecture Knowledge Graph...${colors.reset}`);
+        try {
+          const res = await graphEngine.generateGraph();
+          console.log(`\n${colors.brightGreen}✓ Architecture Graph & Mind Map Generated!${colors.reset}`);
+          console.log(`  📄 Mermaid Source: ${colors.cyan}${res.graphMdPath}${colors.reset}`);
+          console.log(`  🖼  SVG Graphic:    ${colors.cyan}${res.svgPath}${colors.reset}`);
+          console.log(`  🖼  PNG Image:      ${colors.cyan}${path.join(workspaceRoot, ".inflynx", "graph.png")}${colors.reset}`);
+          console.log(`  🌐 Interactive Map: ${colors.brightMagenta}${res.htmlPath}${colors.reset}`);
+          console.log(`\n${colors.gray}Tip: Open .inflynx/graph.html in your browser for interactive zoom/pan visualizer!${colors.reset}\n`);
+        } catch (err: any) {
+          console.log(`${colors.red}✗ Failed to generate graph: ${err.message}${colors.reset}\n`);
+        }
+        continue;
+      }
+
+      // ─── /plan Command ────────────────────────────────────────────────────────
+      if (cmd === "plan") {
+        const subCmd = parts[1]?.toLowerCase();
+
+        if (subCmd === "history") {
+          const history = planEngine.listHistory();
+          if (history.length === 0) {
+            console.log(`\n${colors.gray}No archived plans found in .inflynx/plans/${colors.reset}\n`);
+          } else {
+            console.log(`\n${colors.bold}📋 Plan History:${colors.reset}`);
+            for (const [i, p] of history.entries()) {
+              console.log(`  ${colors.cyan}${i + 1}. ${p.filename}${colors.reset} ${colors.gray}(${p.mtime.toLocaleString()})${colors.reset}`);
+            }
+            console.log();
+          }
+          continue;
+        }
+
+        if (subCmd === "restore" && parts[2]) {
+          const filename = parts.slice(2).join(" ");
+          const ok = planEngine.restorePlan(filename);
+          if (ok) {
+            console.log(`\n${colors.brightGreen}✓ Plan restored: ${filename}${colors.reset}\n`);
+          } else {
+            console.log(`\n${colors.red}✗ Plan not found: ${filename}${colors.reset}\n`);
+          }
+          continue;
+        }
+
+        // /plan <task> — trigger plan mode with the task as input
+        const taskGoal = parts.slice(1).join(" ");
+        if (taskGoal) {
+          const prevMode = activeMode;
+          activeMode = "plan";
+          conversationHistory[0] = { role: "system", content: buildModeSystemPrompt("plan") };
+          console.log(`\n${colors.yellow}📋 Switched to [plan] mode for task: "${taskGoal}"${colors.reset}`);
+          console.log(`${colors.gray}Agent will research codebase and generate .inflynx/PLAN.md...${colors.reset}\n`);
+          inputStr = `Create a detailed implementation plan for the following task: "${taskGoal}".\nFollow all 5 planning phases defined in your system prompt. Write the final plan to .inflynx/PLAN.md.`;
+          // Proceed to LLM execution loop below
+        } else {
+          // Show current plan if it exists
+          const active = planEngine.loadActivePlan();
+          if (active) {
+            console.log(`\n${colors.bold}📋 Active Plan: ${active.goal}${colors.reset}`);
+            console.log(`  Status: ${colors.cyan}${active.status}${colors.reset}  Complexity: ${active.complexity}  Steps: ${active.steps.length}`);
+            const done = active.steps.filter((s) => s.status === "completed").length;
+            console.log(`  Progress: ${colors.brightGreen}${done}${colors.reset}/${active.steps.length} steps completed\n`);
+            for (const s of active.steps) {
+              const icon = { completed: "✅", in_progress: "⏳", pending: "⬜", failed: "❌", skipped: "⏭" }[s.status];
+              const riskColor = s.risk === "HIGH" ? colors.red : s.risk === "MEDIUM" ? colors.yellow : colors.gray;
+              console.log(`  ${icon} Step ${s.id}: ${s.description} ${riskColor}[${s.risk}]${colors.reset}`);
+            }
+            console.log(`\n${colors.gray}Run /execute-plan to start execution, or /plan history to see past plans.${colors.reset}\n`);
+          } else {
+            console.log(`\n${colors.gray}No active plan. Run \/plan <task description> to generate one.${colors.reset}\n`);
+          }
+          continue;
+        }
+      }
+
+      // ─── /execute-plan Command ────────────────────────────────────────────────
+      if (cmd === "execute-plan") {
+        const active = planEngine.loadActivePlan();
+        if (!active) {
+          console.log(`\n${colors.red}✗ No active plan found at .inflynx/PLAN.md${colors.reset}`);
+          console.log(`${colors.gray}Run /plan <task> to generate one first.${colors.reset}\n`);
+          continue;
+        }
+
+        const pending = active.steps.filter((s) => s.status === "pending");
+        if (pending.length === 0) {
+          console.log(`\n${colors.brightGreen}✓ Plan already completed — all ${active.steps.length} steps done!${colors.reset}\n`);
+          continue;
+        }
+
+        // Show approval HUD
+        console.log(`\n${colors.bold}╔══════════════════════════════════════════╗${colors.reset}`);
+        console.log(`${colors.bold}║  📋 Plan: ${active.goal.slice(0, 28).padEnd(29)} ║${colors.reset}`);
+        console.log(`${colors.bold}║  Complexity: ${active.complexity.padEnd(9)} Pending: ${String(pending.length).padEnd(12)} ║${colors.reset}`);
+        console.log(`${colors.bold}╠══════════════════════════════════════════╣${colors.reset}`);
+        console.log(`${colors.bold}║  ${colors.brightGreen}[Y]${colors.reset}${colors.bold} Approve & Execute in Agent Mode     ║${colors.reset}`);
+        console.log(`${colors.bold}║  ${colors.yellow}[N]${colors.reset}${colors.bold} Abort — do not execute               ║${colors.reset}`);
+        console.log(`${colors.bold}╚══════════════════════════════════════════╝${colors.reset}\n`);
+
+        try {
+          const approved = await confirm({ message: "Approve and execute plan?", default: true });
+          if (!approved) {
+            console.log(`${colors.yellow}⊘ Plan execution aborted.${colors.reset}\n`);
+            continue;
+          }
+        } catch { continue; }
+
+        // Switch to agent mode and inject plan execution directive
+        activeMode = "agent";
+        planEngine.updatePlanStatus("IN_PROGRESS");
+        conversationHistory[0] = { role: "system", content: buildModeSystemPrompt("agent") };
+        console.log(`\n${colors.brightCyan}⚡ Switched to [agent] mode — executing plan step by step...${colors.reset}\n`);
+
+        inputStr = [
+          `Execute the approved plan from .inflynx/PLAN.md step by step.`,
+          `Goal: "${active.goal}"`,
+          `The plan has ${pending.length} pending steps. Execute each step in order:`,
+          ...pending.map((s) => `- Step ${s.id}: ${s.description}${s.targetFile ? ` (target: ${s.targetFile})` : ""}`),
+          `After each step succeeds, run its verification command and mark it complete.`,
+          `Show progress as: ✅ Step N: [description] [DONE in Xs]`,
+          `If a step fails after 2 retries, report it and ask the user for guidance.`,
+        ].join("\n");
+        // Proceed to LLM execution loop
       }
 
       if (cmd === "index") {
@@ -242,11 +500,15 @@ async function main() {
       }
 
       if (cmd === "tools") {
-        console.log(`\n${colors.bold}Available Agent Tools:${colors.reset}`);
-        for (const t of registry.list()) {
+        const allTools = registry.list();
+        const filteredTools = filterToolsForMode(allTools, activeMode);
+        const blockedNames = new Set(allTools.filter(t => !filteredTools.some(f => f.name === t.name)).map(t => t.name));
+        console.log(`\n${colors.bold}Agent Tools — Mode: ${MODE_BADGE_COLORS[activeMode]}[${activeMode}]${colors.reset}${colors.bold} (${filteredTools.length}/${allTools.length} active):${colors.reset}`);
+        for (const t of allTools) {
           const perm = t.permissionLevel === "shell" ? colors.red : t.permissionLevel === "readwrite" ? colors.yellow : colors.brightGreen;
           const originTag = t.origin === "mcp" ? `${colors.brightMagenta}[MCP:${t.serverName}]${colors.reset} ` : "";
-          console.log(`  ${colors.cyan}${t.name.padEnd(30)}${colors.reset} ${originTag}${perm}[${t.permissionLevel}]${colors.reset}  ${colors.gray}${t.description}${colors.reset}`);
+          const blocked = blockedNames.has(t.name) ? `${colors.red}[BLOCKED in ${activeMode} mode]${colors.reset} ` : "";
+          console.log(`  ${blocked ? colors.dim : colors.cyan}${t.name.padEnd(30)}${colors.reset} ${originTag}${blocked}${perm}[${t.permissionLevel}]${colors.reset}  ${colors.gray}${t.description}${colors.reset}`);
         }
         console.log();
         continue;
@@ -406,10 +668,18 @@ async function main() {
         process.exit(0);
       }
 
-      // If command was /mcp add or /skills add, break out of slash command branch to let LLM process the prompt!
-      if ((cmd === "mcp" || cmd === "skills") && parts[1]?.toLowerCase() === "add") {
-        // Continue to prompt execution below
-      } else {
+      // If command was /mcp add, /skills add, /plan <task>, /execute-plan, or /debug <task>, break out and let LLM process!
+      const passthroughToLLM = (
+        (cmd === "mcp" || cmd === "skills") && parts[1]?.toLowerCase() === "add"
+      ) || (
+        cmd === "plan" && parts.length > 1 && parts[1]?.toLowerCase() !== "history" && parts[1]?.toLowerCase() !== "restore"
+      ) || (
+        cmd === "execute-plan"
+      ) || (
+        cmd === "debug" && parts.length > 1 && parts[1]?.toLowerCase() !== "report" && parts[1]?.toLowerCase() !== "history"
+      );
+
+      if (!passthroughToLLM) {
         console.log(`${colors.red}Unknown command: /${cmd}${colors.reset}. Type /help.\n`);
         continue;
       }
@@ -473,7 +743,22 @@ async function main() {
           model: activeModel,
           messages: conversationHistory,
           apiKey: activeApiKey,
-          tools: registry.toOpenAIFormat(),
+          tools: (() => {
+            const allTools = registry.list();
+            const allowedNames = new Set(
+              filterToolsForMode(allTools, activeMode).map((t) => t.name)
+            );
+            return allTools
+              .filter((t) => allowedNames.has(t.name))
+              .map((t) => ({
+                type: "function",
+                function: {
+                  name: t.name,
+                  description: t.description,
+                  parameters: t.parameters,
+                },
+              }));
+          })(),
         });
 
         for await (const event of stream) {
@@ -512,6 +797,7 @@ async function main() {
         // ─── Execute Tool Calls with User Approval ───────────────────────────
         if (pendingToolCalls.length > 0) {
           for (const tc of pendingToolCalls) {
+            tc.args = safeParseJsonArgs(tc.args);
             const toolDef = registry.get(tc.name);
             printToolApprovalHeader(tc.name, tc.args);
 
@@ -534,9 +820,18 @@ async function main() {
               const filePath = String(tc.args.path || "");
               const newContent = String(tc.args.content || "");
               const absPath = path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
-              const oldContent = fs.existsSync(absPath) ? fs.readFileSync(absPath, "utf-8") : "";
-              const diff = computeUnifiedDiff(filePath, oldContent, newContent);
-              renderColorDiff(filePath, diff);
+              try {
+                // Guard: skip diff preview if path is a directory (EISDIR protection)
+                if (fs.existsSync(absPath) && fs.statSync(absPath).isDirectory()) {
+                  console.log(`${colors.yellow}⚠ Preview skipped: "${filePath}" is a directory${colors.reset}`);
+                } else {
+                  const oldContent = fs.existsSync(absPath) ? fs.readFileSync(absPath, "utf-8") : "";
+                  const diff = computeUnifiedDiff(filePath, oldContent, newContent);
+                  renderColorDiff(filePath, diff);
+                }
+              } catch (diffErr: any) {
+                console.log(`${colors.yellow}⚠ Could not compute preview diff: ${diffErr.message}${colors.reset}`);
+              }
             }
 
             let approved = false;
@@ -594,6 +889,29 @@ async function main() {
 
       } catch (err: any) {
         console.error(`\n${colors.red}❌ Error:${colors.reset}`, err?.message || String(err), "\n");
+
+        // ─── CRITICAL: Recover conversation history integrity ──────────────────
+        // DeepSeek/OpenAI requires every tool_call_id in an assistant message
+        // to have a matching tool response. If we crashed mid-loop, inject stubs
+        // for any unresponded tool calls to prevent API 400 on the next turn.
+        const respondedIds = new Set(
+          conversationHistory
+            .filter((m) => m.role === "tool")
+            .map((m) => m.tool_call_id)
+        );
+        const lastAssistantMsg = [...conversationHistory].reverse().find((m) => m.role === "assistant");
+        if (lastAssistantMsg?.tool_calls) {
+          for (const tc of lastAssistantMsg.tool_calls) {
+            if (!respondedIds.has(tc.id)) {
+              conversationHistory.push({
+                role: "tool",
+                content: `Error: tool execution failed or was interrupted. Please try again.`,
+                tool_call_id: tc.id,
+              });
+              console.log(`${colors.dim}↩ Injected error stub for unresponded tool: ${tc.function?.name}${colors.reset}`);
+            }
+          }
+        }
       }
     }
   }
