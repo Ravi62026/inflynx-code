@@ -10,6 +10,8 @@ export interface TokenUsage {
   completionTokens: number;
   totalTokens: number;
   estimatedCostUsd?: number;
+  /** Tokens consumed by internal reasoning/thinking (e.g. Anthropic output_tokens_details.thinking_tokens, DeepSeek reasoning_tokens). */
+  reasoningTokens?: number;
 }
 
 export type ModelEvent =

@@ -1,0 +1,16 @@
+/* App-level overrides — intentionally minimal since design system is in index.css */
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+/* Fix Material Symbols in JSX */
+.material-symbols-outlined {
+  user-select: none;
+}
+
+/* Smooth page transitions */
+main > * {
+  animation: fadeIn 0.3s ease both;
+}
