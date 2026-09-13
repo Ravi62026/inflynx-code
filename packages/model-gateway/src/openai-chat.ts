@@ -58,10 +58,19 @@ export function formatOpenAiCompatibleMessages(messages: Message[]): Array<Recor
       if (message.reasoning_content) formatted.reasoning_content = message.reasoning_content;
       if (message.tool_calls?.length) formatted.tool_calls = message.tool_calls;
 
-      // OpenRouter returns opaque reasoning_details. They must be replayed
-      // unchanged on continuation calls and are never logged separately.
+      // OpenRouter returns opaque reasoning_details. Only replay valid, uncorrupted entries.
       const reasoningDetails = message.provider_metadata?.openrouterReasoningDetails;
-      if (reasoningDetails) formatted.reasoning_details = reasoningDetails;
+      if (Array.isArray(reasoningDetails)) {
+        const valid = reasoningDetails.filter((d: any) => {
+          if (d?.type === "reasoning.encrypted") {
+            if (typeof d.data !== "string" || d.data.includes("REDACTED")) {
+              return false;
+            }
+          }
+          return true;
+        });
+        if (valid.length > 0) formatted.reasoning_details = valid;
+      }
       return formatted;
     }
 
@@ -138,7 +147,30 @@ export async function* streamOpenAiCompatible(
   } catch (err: unknown) {
     throw networkError(provider, redactSecrets((err as Error).message));
   }
-  if (!response.ok) throw providerError(provider, response.status, await response.text());
+  if (!response.ok) {
+    const rawError = await response.text();
+    // If OpenRouter rejects encrypted reasoning tokens (session expired, key rotated, or invalid token),
+    // automatically strip reasoning_details from history messages and retry cleanly once.
+    if (provider === "openrouter" && response.status === 400 && rawError.includes("invalid_encrypted_content")) {
+      const sanitizedMessages = (body.messages as any[]).map((m: any) => {
+        const copy = { ...m };
+        delete copy.reasoning_details;
+        return copy;
+      });
+      const retryBody = { ...body, messages: sanitizedMessages };
+      response = await fetchWithRetry(
+        provider,
+        `${baseURL}/chat/completions`,
+        { method: "POST", headers, body: JSON.stringify(retryBody) },
+        signal
+      );
+      if (!response.ok) {
+        throw providerError(provider, response.status, await response.text());
+      }
+    } else {
+      throw providerError(provider, response.status, rawError);
+    }
+  }
 
   const toolCalls = new Map<number, { id: string; name: string; args: string }>();
   let toolCallsFlushed = false;
@@ -148,7 +180,8 @@ export async function* streamOpenAiCompatible(
   let outputTextLength = 0;
   let finishReason = "stop";
   let actualModel: string | undefined;
-  let openrouterReasoningDetails: unknown[] = [];
+  const reasoningSummaryMap = new Map<number, string>();
+  const openrouterReasoningDetailsMap = new Map<string, unknown>();
 
   const flushTools = function* (): Generator<ModelEvent> {
     if (toolCallsFlushed) return;
@@ -185,11 +218,34 @@ export async function* streamOpenAiCompatible(
     }
     if (delta?.reasoning_content) {
       yield { type: "thought_delta", thought: delta.reasoning_content };
+    } else if ((delta as any)?.reasoning) {
+      yield { type: "thought_delta", thought: (delta as any).reasoning };
+    } else if (delta?.reasoning_details) {
+      const details = Array.isArray(delta.reasoning_details) ? delta.reasoning_details : [delta.reasoning_details];
+      for (const item of details) {
+        if (item?.summary) {
+          const idx = item.index ?? 0;
+          const prev = reasoningSummaryMap.get(idx) || "";
+          let thoughtDelta = "";
+          if (item.summary.startsWith(prev)) {
+            thoughtDelta = item.summary.slice(prev.length);
+          } else {
+            thoughtDelta = item.summary;
+          }
+          reasoningSummaryMap.set(idx, item.summary);
+          if (thoughtDelta) {
+            yield { type: "thought_delta", thought: thoughtDelta };
+          }
+        }
+      }
     }
+
     if (delta?.reasoning_details) {
-      openrouterReasoningDetails.push(
-        ...(Array.isArray(delta.reasoning_details) ? delta.reasoning_details : [delta.reasoning_details])
-      );
+      const details = Array.isArray(delta.reasoning_details) ? delta.reasoning_details : [delta.reasoning_details];
+      for (const item of details) {
+        const key = item.id || `${item.type}_${item.index ?? 0}`;
+        openrouterReasoningDetailsMap.set(key, item);
+      }
     }
 
     for (const toolCall of delta?.tool_calls || []) {
@@ -217,6 +273,8 @@ export async function* streamOpenAiCompatible(
     usage,
     finishReason: normalizeFinishReason(finishReason),
     actualModel,
-    providerMetadata: openrouterReasoningDetails.length ? { openrouterReasoningDetails } : undefined,
+    providerMetadata: openrouterReasoningDetailsMap.size
+      ? { openrouterReasoningDetails: Array.from(openrouterReasoningDetailsMap.values()) }
+      : undefined,
   };
 }

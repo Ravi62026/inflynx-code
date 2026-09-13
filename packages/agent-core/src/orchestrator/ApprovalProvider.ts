@@ -1,6 +1,7 @@
 import type { ToolDefinition } from "@inflynx/tool-runtime";
 
 export interface ToolApprovalRequest {
+  toolCallId?: string;
   toolName: string;
   permissionLevel: "readonly" | "readwrite" | "shell";
   args: Record<string, unknown>;

@@ -48,3 +48,6 @@ Thumbs.db
 coverage/
 .nyc_output/
 
+# VS Code Extension Packaging
+*.vsix
+

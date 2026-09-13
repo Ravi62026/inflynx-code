@@ -36,6 +36,7 @@ const unitTestFiles = [
   "tests/unit/vector-store.test.ts",
   "tests/security/security-fixtures.test.ts",
   "tests/evals/bug-eval.test.ts",
+  "apps/vscode/tests/index.ts",
 ];
 
 const integrationTestFiles = [

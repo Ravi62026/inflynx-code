@@ -351,7 +351,23 @@ export class AgentOrchestrator {
         } catch { /* ignore */ }
       }
       if (msg.providerMetadataJson) {
-        try { msgObj.provider_metadata = JSON.parse(msg.providerMetadataJson); } catch { /* ignore */ }
+        try {
+          const meta = JSON.parse(msg.providerMetadataJson);
+          // Strip `reasoning.encrypted` entries — these are OpenRouter session-bound
+          // encrypted tokens that cannot be replayed across sessions or API key rotations.
+          // Only `reasoning.summary` entries are safe to keep as context.
+          if (meta?.openrouterReasoningDetails && Array.isArray(meta.openrouterReasoningDetails)) {
+            const safe = meta.openrouterReasoningDetails.filter(
+              (d: any) => d?.type !== "reasoning.encrypted"
+            );
+            if (safe.length > 0) {
+              msgObj.provider_metadata = { ...meta, openrouterReasoningDetails: safe };
+            }
+            // If only encrypted entries existed, drop providerMetadata entirely
+          } else {
+            msgObj.provider_metadata = meta;
+          }
+        } catch { /* ignore */ }
       }
       orchestrator.context.addMessage(msgObj);
     }
@@ -498,13 +514,21 @@ export class AgentOrchestrator {
         }
         this.context.addMessage(assistantMsg);
 
+        let savedReasoning = assistantReasoning;
+        if (!savedReasoning && (providerMetadata as any)?.openrouterReasoningDetails) {
+          const details = (providerMetadata as any).openrouterReasoningDetails;
+          if (Array.isArray(details)) {
+            savedReasoning = details.map((d: any) => d?.summary || "").filter(Boolean).join("");
+          }
+        }
+
         // Persist assistant message to SessionStore
         await this.sessionStore.saveMessage(this.context.sessionId, {
           role: "assistant",
           content: redactSecrets(assistantText),
-          reasoningContent: assistantReasoning ? redactSecrets(assistantReasoning) : undefined,
+          reasoningContent: savedReasoning ? redactSecrets(savedReasoning) : undefined,
           toolCallsJson: pendingToolCalls.length > 0 ? JSON.stringify(pendingToolCalls) : undefined,
-          providerMetadataJson: providerMetadata ? redactSecrets(JSON.stringify(providerMetadata)) : undefined,
+          providerMetadataJson: providerMetadata ? JSON.stringify(providerMetadata) : undefined,
         });
 
         // Execute tool calls if any
@@ -527,6 +551,7 @@ export class AgentOrchestrator {
 
             // Approval check
             const approved = await this.approvalProvider.requestApproval({
+              toolCallId: tc.id,
               toolName: tc.name,
               permissionLevel,
               args: tc.args,

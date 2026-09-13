@@ -1,0 +1,387 @@
+{
+  "name": "inflynx-code",
+  "displayName": "Inflynx Code",
+  "description": "Production-grade autonomous AI coding agent directly inside VS Code",
+  "version": "1.0.0",
+  "publisher": "inflynx",
+  "author": "Inflynx",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Ravi62026/inflynx-code.git"
+  },
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages",
+    "Snippets"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "autonomous",
+    "inflynx",
+    "copilot",
+    "chat",
+    "refactor",
+    "debug"
+  ],
+  "main": "./dist/extension.js",
+  "icon": "resources/icon.png",
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:inflynx.chatView",
+    "onView:inflynx.sessionsView",
+    "onView:inflynx.planView",
+    "onView:inflynx.toolsView"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "inflynx-sidebar",
+          "title": "Inflynx Code",
+          "icon": "resources/inflynx.svg"
+        }
+      ]
+    },
+    "views": {
+      "inflynx-sidebar": [
+        {
+          "type": "webview",
+          "id": "inflynx.chatView",
+          "name": "Agent Chat"
+        },
+        {
+          "type": "tree",
+          "id": "inflynx.sessionsView",
+          "name": "Sessions"
+        },
+        {
+          "type": "tree",
+          "id": "inflynx.planView",
+          "name": "Active Plan"
+        },
+        {
+          "type": "tree",
+          "id": "inflynx.toolsView",
+          "name": "Tool Registry"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "inflynx.newChat",
+        "title": "New Chat Session",
+        "category": "Inflynx",
+        "icon": "$(add)"
+      },
+      {
+        "command": "inflynx.switchMode",
+        "title": "Switch Agent Mode",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.switchModel",
+        "title": "Switch Model",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.switchBudget",
+        "title": "Set Budget Level",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.setEffort",
+        "title": "Set Reasoning Effort",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.abort",
+        "title": "Abort Current Turn",
+        "category": "Inflynx",
+        "icon": "$(stop-circle)"
+      },
+      {
+        "command": "inflynx.explainSelection",
+        "title": "Explain Selected Code",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.fixError",
+        "title": "Fix Error at Cursor",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.refactorSelection",
+        "title": "Refactor Selected Code",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.addTestForFunction",
+        "title": "Generate Tests for Selection",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.showPlan",
+        "title": "Show Active Plan",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.executePlan",
+        "title": "Execute Active Plan",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.runDebug",
+        "title": "Run Debug Analysis",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.showTokens",
+        "title": "Show Token & Budget Usage",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.showFindings",
+        "title": "Show Debug Findings",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.resumeSession",
+        "title": "Resume Session",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.refreshSessions",
+        "title": "Refresh Sessions",
+        "category": "Inflynx",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "inflynx.clearChat",
+        "title": "Clear Chat History",
+        "category": "Inflynx",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "inflynx.startServer",
+        "title": "Start Backend Server",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.stopServer",
+        "title": "Stop Backend Server",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.restartServer",
+        "title": "Restart Backend Server",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.openSettings",
+        "title": "Open Inflynx Settings",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.toggleInline",
+        "title": "Toggle Inline Completions",
+        "category": "Inflynx"
+      },
+      {
+        "command": "inflynx.reloadChat",
+        "title": "Reload Chat View",
+        "category": "Inflynx",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "inflynx.explainSelection",
+          "when": "editorHasSelection",
+          "group": "inflynx@1"
+        },
+        {
+          "command": "inflynx.refactorSelection",
+          "when": "editorHasSelection",
+          "group": "inflynx@2"
+        },
+        {
+          "command": "inflynx.addTestForFunction",
+          "when": "editorHasSelection",
+          "group": "inflynx@3"
+        },
+        {
+          "command": "inflynx.fixError",
+          "when": "editorHasSelection || editorHasCodeActionsProvider",
+          "group": "inflynx@4"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "inflynx.newChat",
+          "when": "view == inflynx.chatView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "inflynx.abort",
+          "when": "view == inflynx.chatView",
+          "group": "navigation@2"
+        },
+        {
+          "command": "inflynx.reloadChat",
+          "when": "view == inflynx.chatView",
+          "group": "navigation@3"
+        },
+        {
+          "command": "inflynx.refreshSessions",
+          "when": "view == inflynx.sessionsView",
+          "group": "navigation@1"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "inflynx.newChat",
+        "key": "ctrl+shift+i",
+        "mac": "cmd+shift+i"
+      },
+      {
+        "command": "inflynx.switchMode",
+        "key": "ctrl+shift+m",
+        "mac": "cmd+shift+m"
+      },
+      {
+        "command": "inflynx.abort",
+        "key": "ctrl+shift+.",
+        "mac": "cmd+shift+."
+      }
+    ],
+    "configuration": {
+      "title": "Inflynx Code",
+      "properties": {
+        "inflynx.serverUrl": {
+          "type": "string",
+          "default": "http://localhost:4000",
+          "description": "URL of the Inflynx Code backend HTTP/SSE server."
+        },
+        "inflynx.autoStartServer": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start the Inflynx backend server if not currently running."
+        },
+        "inflynx.defaultMode": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "plan",
+            "agent",
+            "debug"
+          ],
+          "default": "agent",
+          "description": "Default operational mode for new sessions."
+        },
+        "inflynx.defaultBudget": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "default": "medium",
+          "description": "Default execution budget level for turns."
+        },
+        "inflynx.defaultModel": {
+          "type": "string",
+          "default": "",
+          "description": "Default model ID (e.g. openai/gpt-5.6-luna or anthropic/claude-3-5-sonnet). Empty uses server default."
+        },
+        "inflynx.defaultProvider": {
+          "type": "string",
+          "default": "",
+          "description": "Default model provider (e.g. openrouter, anthropic, openai)."
+        },
+        "inflynx.reasoningEffort": {
+          "type": "string",
+          "enum": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "default": "none",
+          "description": "Reasoning effort level for supported models."
+        },
+        "inflynx.autoApproveReadonly": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically approve read-only tools without user confirmation."
+        },
+        "inflynx.autoApproveAll": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically approve all tool calls including file edits and shell commands (use with caution)."
+        },
+        "inflynx.inlineCompletions.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable AI ghost text inline completions while typing."
+        },
+        "inflynx.inlineCompletions.debounceMs": {
+          "type": "number",
+          "default": 500,
+          "description": "Debounce delay in milliseconds before requesting inline suggestions."
+        },
+        "inflynx.theme": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "dark",
+            "light"
+          ],
+          "default": "auto",
+          "description": "Visual theme for the chat webview."
+        },
+        "inflynx.showThinking": {
+          "type": "boolean",
+          "default": true,
+          "description": "Display reasoning thoughts collapsible block during model generation."
+        },
+        "inflynx.maxSessionsInSidebar": {
+          "type": "number",
+          "default": 20,
+          "description": "Maximum number of previous sessions shown in the sidebar tree view."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "pnpm run build",
+    "build": "node esbuild.config.mjs",
+    "dev": "node esbuild.config.mjs --watch",
+    "test": "tsx tests/index.ts",
+    "typecheck": "tsc --noEmit",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/vscode": "^1.95.0",
+    "@vscode/vsce": "^3.2.1",
+    "esbuild": "^0.25.0",
+    "highlight.js": "^11.11.1",
+    "marked": "^15.0.7",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}

@@ -14,6 +14,7 @@ export type AgentEventType =
   | "model.thought_delta"
   | "model.text_delta"
   | "tool.proposed"
+  | "tool.approval_required"
   | "tool.approved"
   | "tool.started"
   | "tool.output"
