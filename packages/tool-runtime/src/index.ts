@@ -5,8 +5,10 @@
 
 import fs from "fs";
 import path from "path";
-import { exec } from "child_process";
+import { validatePublicUrl, CanonicalPathGuard, CommandPolicy } from "@inflynx/policy-engine";
 import { applySurgicalPatch, computeUnifiedDiff, EditTransactionManager } from "@inflynx/patch-engine";
+
+export { ToolExecutionGateway, type GatewayExecutionOptions } from "./ToolExecutionGateway.js";
 
 // ─── Workspace Helper ─────────────────────────────────────────────────────────
 
@@ -15,8 +17,8 @@ function getWorkspaceRoot(): string {
 }
 
 function resolveWorkspacePath(targetPath: string): string {
-  const root = getWorkspaceRoot();
-  return path.isAbsolute(targetPath) ? targetPath : path.join(root, targetPath);
+  const guard = new CanonicalPathGuard(getWorkspaceRoot());
+  return guard.validateAndResolve(targetPath);
 }
 
 // ─── JSON Tool Argument Parser & Repair Helper ────────────────────────────────
@@ -93,39 +95,7 @@ export interface ToolResult {
   durationMs: number;
 }
 
-// ─── Blocked Shell Patterns ───────────────────────────────────────────────────
-
-const BLOCKED_COMMANDS = [
-  /rm\s+-rf\s*\/[^/]/,
-  /sudo\s+rm/,
-  /mkfs/,
-  /dd\s+if=/,
-  /chmod\s+777\s+\//,
-  /:\/\//,          // fork bombs
-  />\s*\/dev\/sda/,
-];
-
-function isBlockedCommand(cmd: string): boolean {
-  return BLOCKED_COMMANDS.some((pattern) => pattern.test(cmd));
-}
-
 // ─── Core Tool Implementations ────────────────────────────────────────────────
-
-async function execShellTimed(cmd: string, timeoutMs: number, signal?: AbortSignal): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const proc = exec(cmd, { timeout: timeoutMs }, (err, stdout, stderr) => {
-      if (err) {
-        reject(new Error(stderr || err.message));
-      } else {
-        resolve(stdout + (stderr ? `\nstderr: ${stderr}` : ""));
-      }
-    });
-    signal?.addEventListener("abort", () => {
-      proc.kill("SIGTERM");
-      reject(new Error("Command cancelled by user."));
-    });
-  });
-}
 
 function stripHtmlTags(html: string): string {
   return html
@@ -269,7 +239,11 @@ export const CORE_TOOLS: ToolDefinition[] = [
         for (const entry of entries) {
           if (IGNORED.has(entry) || entry.startsWith(".")) continue;
           const fullPath = path.join(dir, entry);
-          const stat = fs.statSync(fullPath);
+          const stat = fs.lstatSync(fullPath);
+          if (stat.isSymbolicLink()) {
+            lines.push(`${indent}🔗 ${entry} (symlink skipped)`);
+            continue;
+          }
           if (stat.isDirectory()) {
             lines.push(`${indent}📁 ${entry}/`);
             walk(fullPath, indent + "  ", currentDepth + 1);
@@ -309,39 +283,38 @@ export const CORE_TOOLS: ToolDefinition[] = [
       } = args as { pattern: string; path?: string; file_glob?: string; case_insensitive?: boolean };
 
       const absPath = resolveWorkspacePath(searchPath);
-      const rgArgs = [
-        "rg",
+
+      // Safe argument array execution for rg (ripgrep)
+      const rgArgs: string[] = [
         "--line-number",
         "--no-heading",
-        "--max-count", "50",
-        "--glob", '"!node_modules/**"',
-        "--glob", '"!.git/**"',
-        "--glob", '"!dist/**"',
-        case_insensitive ? "-i" : "",
-        file_glob ? `--glob "${file_glob}"` : "",
-        `"${pattern}"`,
-        `"${absPath}"`,
-      ].filter(Boolean).join(" ");
+        "--max-count=50",
+        "--glob=!node_modules/**",
+        "--glob=!.git/**",
+        "--glob=!dist/**",
+      ];
+      if (case_insensitive) rgArgs.push("-i");
+      if (file_glob) rgArgs.push("--glob", file_glob);
+      rgArgs.push("--", pattern, absPath);
 
-      const grepArgs = [
-        "grep",
+      // Safe argument array execution for grep fallback
+      const grepArgs: string[] = [
         "-rn",
         "--max-count=50",
         "--exclude-dir=node_modules",
         "--exclude-dir=.git",
         "--exclude-dir=dist",
-        case_insensitive ? "-i" : "",
-        file_glob ? `--include="${file_glob}"` : "",
-        `"${pattern}"`,
-        `"${absPath}"`,
-      ].filter(Boolean).join(" ");
+      ];
+      if (case_insensitive) grepArgs.push("-i");
+      if (file_glob) grepArgs.push(`--include=${file_glob}`);
+      grepArgs.push("--", pattern, absPath);
 
       try {
-        const out = await execShellTimed(rgArgs, 10_000, signal);
+        const out = await CommandPolicy.execProcessDirect("rg", rgArgs, absPath, 10_000, signal);
         return out.trim() || `No matches found for: ${pattern}`;
       } catch {
         try {
-          const out = await execShellTimed(grepArgs, 10_000, signal);
+          const out = await CommandPolicy.execProcessDirect("grep", grepArgs, absPath, 10_000, signal);
           return out.trim() || `No matches found for: ${pattern}`;
         } catch {
           return `No matches found for: ${pattern}`;
@@ -391,8 +364,18 @@ export const CORE_TOOLS: ToolDefinition[] = [
       if (results.length === 0) {
         try {
           const encoded = encodeURIComponent(query);
-          const cmd = `curl -sL -m 8 "https://html.duckduckgo.com/html/?q=${encoded}" -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"`;
-          const html = await execShellTimed(cmd, 10_000, signal);
+          const html = await CommandPolicy.execProcessDirect(
+            "curl",
+            [
+              "-sL",
+              "-m", "8",
+              `https://html.duckduckgo.com/html/?q=${encoded}`,
+              "-A", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            ],
+            process.cwd(),
+            10_000,
+            signal
+          );
 
           const linkRegex = /<a\s+[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
           let match: RegExpExecArray | null;
@@ -471,12 +454,17 @@ export const CORE_TOOLS: ToolDefinition[] = [
     execute: async (args) => {
       const { url } = args as { url: string };
       try {
-        const response = await fetch(url, {
+        const publicUrl = await validatePublicUrl(url);
+        const response = await fetch(publicUrl, {
           headers: {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
           },
+          redirect: "manual",
         });
 
+        if (response.status >= 300 && response.status < 400) {
+          throw new Error("Redirects are disabled by SSRF protection; validate the redirect target explicitly.");
+        }
         if (!response.ok) {
           throw new Error(`HTTP Error ${response.status}: ${response.statusText}`);
         }
@@ -485,7 +473,7 @@ export const CORE_TOOLS: ToolDefinition[] = [
         const text = stripHtmlTags(html);
         const truncated = text.length > 12_000 ? text.slice(0, 12_000) + "\n\n... (truncated for context length)" : text;
 
-        return `Content from ${url}:\n\n${truncated}`;
+        return `Content from ${publicUrl.toString()}:\n\n${truncated}`;
       } catch (err: any) {
         return `Failed to fetch URL ${url}: ${err?.message || String(err)}`;
       }
@@ -513,13 +501,9 @@ export const CORE_TOOLS: ToolDefinition[] = [
         timeout_ms = 30_000,
       } = args as { command: string; cwd?: string; timeout_ms?: number };
 
-      if (isBlockedCommand(command)) {
-        throw new Error(`Command blocked by Inflynx policy: "${command}"\nReason: Potentially destructive operation.`);
-      }
-
+      CommandPolicy.validateShellCommand(command);
       const absCwd = resolveWorkspacePath(cmdCwd);
-      const fullCmd = `cd "${absCwd}" && ${command}`;
-      return await execShellTimed(fullCmd, timeout_ms, signal);
+      return await CommandPolicy.execShellTimed(command, absCwd, timeout_ms, signal);
     },
   },
 ];

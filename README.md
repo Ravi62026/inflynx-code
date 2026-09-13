@@ -6,7 +6,6 @@ Production-grade, open-source agentic coding platform with multi-model provider 
 ### Monorepo Packages
 
 - `apps/cli`: Inflynx CLI Agent (`inflynx-agent`)
-- `apps/tui`: Terminal UI Adapter
 - `apps/server`: Local API & WebSocket Server
 - `packages/agent-core`: State Machine & Orchestrator
 - `packages/model-gateway`: Unified Streaming Provider Gateway & Cost Router

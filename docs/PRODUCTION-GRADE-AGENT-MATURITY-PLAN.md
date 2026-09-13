@@ -1,1087 +1,794 @@
 # Inflynx Code — Production-Grade Agent Maturity Plan
 
-> Status: Proposed implementation roadmap  
-> Date: 2026-08-10  
-> Scope: Mature the current CLI/TUI agent toward a reliable, evidence-first coding agent inspired by Claude Code and Codex workflows.  
-> Non-goal: Claim that the agent can detect every production bug. The system must communicate uncertainty and require evidence for high-severity findings.
+> **Status**: Approved Architecture & Implementation Roadmap  
+> **Date**: 2026-08-11  
+> **Scope**: mature the current Inflynx monorepo CLI, TUI, Desktop, and Server agents toward a production-grade, evidence-first, deterministic coding runtime inspired by Claude Code and Codex workflows.  
+> **Non-goal**: Pretend that LLM intuition alone can replace deterministic verification, or claim that an agent can detect production bugs without evidence.
 
 ---
 
 ## 1. Executive Summary
 
-Inflynx currently has a usable foundation:
+Inflynx Code currently possesses a functional, high-velocity monorepo foundation:
 
-- A CLI agent loop with streaming model responses and tool calls.
-- An Ink-based TUI with a separate streaming/tool loop.
-- Provider routing for Anthropic and OpenAI-compatible providers.
-- Initial thinking-effort configuration (`low`, `medium`, `high`).
-- A tool registry with file, search, web, shell, and edit tools.
-- Basic mode filtering (`ask`, `plan`, `agent`, `debug`).
-- Surgical patching and temporary-file based file commits.
-- Basic workspace indexing, relevance ranking, plans, debug reports, MCP, and skills.
+- **CLI Agent (`apps/cli`)**: Full streaming agentic loop with provider selection (DeepSeek, Gemini, OpenRouter, OpenAI, Anthropic), surgical code patching, inline diff previews, `@mention` context resolution, skill auto-matching, and interactive slash commands (`/mode`, `/plan`, `/execute-plan`, `/debug`, `/graph`, `/mcp`, `/skills`).
+- **Ink TUI (`apps/tui`)**: Interactive React/Ink dashboard featuring header HUD telemetry, tool execution logs, markdown rendering, and tabbed workspace file drawer.
+- **Surgical Patch Engine (`@inflynx/patch-engine`)**: Exact and whitespace-tolerant snippet targeting, line-by-line unified diff generator, and two-phase atomic multi-file edit transaction manager with SHA256 checksum verification.
+- **Workspace Intelligence (`@inflynx/workspace-runtime`)**: BM25-like file relevance ranking, `.gitignore`-aware file indexer, `@mention` resolver, and Mermaid/SVG/HTML architecture mind-map generator (`GraphEngine`).
+- **Extensible Integrations**: Stdio/SSE Model Context Protocol (`@inflynx/mcp-runtime`) auto-discovery and SKILL.md YAML frontmatter discovery engine (`@inflynx/skill-runtime`).
 
-The current implementation is still primarily a model/tool loop. Production-grade maturity requires a centralized orchestration runtime that can:
-
-1. Classify task risk and intent.
-2. Build and execute a structured plan.
-3. Collect evidence before making claims.
-4. Enforce policy independently of model instructions.
-5. Track effort, turns, tools, retries, verification, time, and token budgets.
-6. Apply minimal reversible changes.
-7. Run verification gates after modifications.
-8. Recover from provider, tool, build, and test failures.
-9. Produce findings with evidence, confidence, impact, and verification status.
-10. Persist audit history and learn from repeated failures.
-
-The implementation should be incremental. Safety, orchestration, verification, and observability come before advanced AST indexing or model-cost optimization.
+However, the codebase currently operates primarily as an **uncoupled tool/model loop embedded inside individual applications**. Production-grade maturity requires a **centralized, stateful orchestration runtime** that enforces policy in code, collects empirical evidence before reporting findings, tracks strict token and wall-clock budgets, executes verification gates after every mutation, and unifies CLI, TUI, Desktop, and Web applications over a single event bus.
 
 ---
 
-## 2. Product Principles
+## 2. Core Product & Safety Principles
 
-### 2.1 Evidence before confidence
+### 2.1 Evidence Before Confidence
 
-The agent must not present a critical or high-confidence bug finding based only on model intuition. A finding should include one or more of:
-
-- A reproducible command or test.
-- A stack trace or runtime log.
-- An exact source path and line range.
-- A deterministic input/output mismatch.
-- A verified data-flow or call-path explanation.
-- A security proof-of-concept in a controlled workspace.
-- A failing regression test.
-
-Findings without direct evidence must be marked as hypotheses.
-
-### 2.2 Model instructions are not security boundaries
-
-Prompts can guide behavior, but permissions must be enforced in code. Every tool execution must pass through centralized policy checks for:
-
-- Workspace boundary.
-- Symlink escape.
-- Sandbox profile.
-- Read/write/shell permission.
-- Network access.
-- Confirmation requirements.
-- Resource limits.
-
-### 2.3 Thinking effort and execution effort are separate
-
-The user-facing effort selector must control two distinct layers:
+The agent must **never** report a critical bug, security vulnerability, or successful patch based solely on model intuition. Every finding and completion report must contain concrete, reproducible evidence:
 
 ```text
-ThinkingConfig
-  Provider/model-level reasoning controls for one model request.
-
-EffortProfile
-  Agent-level turns, tool calls, retries, verification depth, and time budget.
-
-BudgetState
-  Runtime counters and hard-stop enforcement for the complete task.
+Finding Claim ──► Evidence Requirement
+─────────────────────────────────────────────────────────────────────────────
+Bug / Defect     ──► Reproducible command/test OR stack trace OR exact line range
+Patch Success    ──► Passing typecheck/build OR passing unit test stdout
+Security Risk    ──► Deterministic input/output payload mismatch OR call-path trace
+Data Loss / Race ──► Verification failure log OR transactional atomic assertion
 ```
 
-Thinking does not happen only once at the start. Each model request may reason again after tool results. Therefore the system must track both per-request reasoning usage and aggregate task usage.
+Any finding or claim lacking empirical verification must be explicitly flagged with `confidence < 0.70` and categorized as a **Hypothesis**.
 
-### 2.4 Minimal, reversible changes
+### 2.2 Model Instructions Are Not Security Boundaries
 
-Changes should be patch-first, diff-visible, transaction-aware, and rollback-capable. The agent should never silently overwrite unrelated user edits.
+Prompts guide model behavior, but system security and boundary limits must be **enforced strictly in code**. Every tool invocation—regardless of origin (model, slash command, MCP, or plugin)—must pass through centralized policy validation checking:
 
-### 2.5 Verification is a gate, not a suggestion
+1. **Canonical Path Guard**: Symlink-safe workspace boundary enforcement via `fs.realpathSync`.
+2. **Command Policy**: Shell execution restricted to validated argument arrays (eliminating shell injection hazards).
+3. **Permission Profiles**: `read-only`, `workspace-write`, and `full-access` execution scoping.
+4. **Output Limits**: Truncation and streaming controls preventing memory exhaustion.
 
-A successful patch is not a successful task. Verification must be explicit and stateful:
+### 2.3 Separate Thinking Effort from Execution Profile
+
+User-configured reasoning effort must control two distinct runtime dimensions:
 
 ```text
-patch applied → focused verification → package verification → repository verification → review
+┌───────────────────────────────────────────────────────────────────────────┐
+│ ThinkingConfig (Model Gateway)                                           │
+│ Controls provider-level reasoning tokens (e.g. Anthropic thinking budget, │
+│ DeepSeek R1 reasoning_content). Evaluated per model request turn.         │
+└─────────────────────────────────────┬─────────────────────────────────────┘
+                                      │
+                                      ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│ EffortProfile (Agent Core Orchestrator)                                   │
+│ Controls total model turns, tool call depth, retry attempts,              │
+│ verification depth, exploration scope, and wall-clock timeout.            │
+└─────────────────────────────────────┬─────────────────────────────────────┘
+                                      │
+                                      ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│ BudgetState (Runtime Counters)                                            │
+│ Enforces deterministic hard-stop thresholds for prompt tokens, completion │
+│ tokens, reasoning tokens, tool executions, wall-clock time, and cost.     │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.6 Stop safely
+### 2.4 Minimal, Reversible, Transactional Mutations
 
-When confidence is low, budgets are exhausted, policy denies an action, or verification remains red, the agent must stop with an actionable report instead of continuing blindly.
+Code modifications must be **patch-first, diff-visible, transaction-aware, and rollback-capable**. The system must never overwrite concurrent user edits or leave a workspace in a partially mutated state upon failure.
+
+### 2.5 Verification Is a Gate, Not a Suggestion
+
+A patch application does not constitute task completion. Task completion requires passing through a stateful verification pipeline:
+
+$$\text{Patch Applied} \longrightarrow \text{Focused Verification} \longrightarrow \text{Package Verification} \longrightarrow \text{Repository Gate} \longrightarrow \text{Completion Report}$$
+
+### 2.6 Safe Stop & Graceful Recovery
+
+When confidence is low, budgets are exhausted, policy denies an action, or verification fails repeatedly, the agent must **stop safely**, output an actionable diagnostic report, and offer a clear recovery path rather than continuing blindly.
 
 ---
 
-## 3. Current Baseline and Gaps
+## 3. Comprehensive Codebase Audit & Gap Analysis
 
-### 3.1 Current runtime path
+A comprehensive line-by-line audit of all 14 packages and 4 applications in the repository reveals the current operational baseline and exact maturity gaps:
 
-The main CLI path is concentrated in `apps/cli/src/index.ts`:
+### 3.1 Package & Application Audit Summary
 
-```text
-load environment
-  → discover workspace
-  → initialize registry/MCP/skills/plans/debug/graph
-  → collect user prompt
-  → add context and skills
-  → stream model response
-  → approve and execute tools
-  → append tool results
-  → repeat until no tool calls
-```
-
-The TUI in `apps/tui/src/index.tsx` implements a separate, simpler loop. This duplication will eventually cause behavior differences unless both frontends use the same core orchestrator.
-
-### 3.2 Current maturity gaps
-
-| Area | Current state | Required direction |
-|---|---|---|
-| Orchestration | Loop embedded in CLI/TUI | Shared `AgentOrchestrator` |
-| States | Types and mode filters exist | Enforced state machine and transitions |
-| Thinking | Per-request provider mapping | Add task-level effort profiles and aggregate budgets |
-| Tool scheduling | Sequential calls | Dependency-aware scheduling with safe read parallelism |
-| Verification | Ad hoc shell calls | Structured verification engine and repair loop |
-| Debugging | Prompt-driven audit/report | Evidence-backed findings and reproduction workflow |
-| Security | Basic blocked shell patterns | Central policy enforcement and sandbox boundary checks |
-| Paths | Absolute/relative resolution | Canonical path and symlink-safe workspace guard |
-| Editing | Surgical text patch and file transaction | Conflict detection, rollback, AST adapters |
-| Workspace intelligence | File index and package graph | Symbol graph, call graph, test mapping, incremental index |
-| Sessions | Interface only | Concrete persistence and resume/fork |
-| Telemetry | Console JSON logging | Redacted structured events, correlation IDs, metrics |
-| Protocol | Event type definitions | Event bus and frontend-neutral runtime events |
-| Plugins | Interfaces only | Validated plugin loading and capability sandbox |
-| Tests | No visible test suite | Unit, integration, security, fixture, and evaluation suites |
-
-### 3.3 Known implementation hazards to resolve early
-
-- `resolveWorkspacePath()` accepts absolute paths without a centralized boundary check.
-- `validateWorkspaceBoundary()` uses string-prefix logic and is not symlink-safe.
-- Shell execution relies on command strings and shell semantics.
-- The shell blacklist is not a sufficient security policy.
-- Search commands interpolate user/model strings into shell command strings.
-- Tool permission filtering is performed before execution but not enforced centrally inside `executeTool()`.
-- The CLI and TUI duplicate model/tool history handling.
-- Provider usage events currently report zero token usage.
-- Anthropic native content blocks need robust accumulation and replay handling.
-- Provider support is not uniform; unsupported thinking controls must be explicit in UI and telemetry.
-- `pnpm build` could not be run in the current environment because `pnpm` was unavailable; CI must become authoritative.
+| Package / App | Path | Current Line Count | Primary Function | Production Maturity State | Key Gaps to Resolve |
+|---|---|---:|---|---|---|
+| `apps/cli` | `apps/cli/src/index.ts` | 921 | CLI Agent REPL & Slash Commands | **Functional Prototype** | Owns its own `while(true)` loop; history & budget tracking not centralized. |
+| `apps/tui` | `apps/tui/src/index.tsx` | 315 | Ink Terminal Dashboard | **Functional Prototype** | Duplicates agent loop (`handleSubmit`); lacks `/mode`, `/debug`, `/plan`, `@mentions`. |
+| `apps/desktop` | `apps/desktop/src` | - | Electron Desktop Shell | **Skeleton** | Missing core orchestrator bridge & IPC event wiring. |
+| `apps/server` | `apps/server/src` | - | Local Agent WebSocket Server | **Skeleton** | Missing WebSocket protocol adapter for `PublicAgentEvent`. |
+| `@inflynx/agent-core` | `packages/agent-core` | 313 | Mode Configs, Graph, Plan, Debug | **Partial Engines** | **Missing `AgentOrchestrator`, `StateMachine`, `BudgetManager`, `ExecutionContext`.** |
+| `@inflynx/policy-engine` | `packages/policy-engine` | 19 | Workspace Boundary Guard | **High Hazard** | `startsWith` check is not symlink-safe; missing centralized tool gateway. |
+| `@inflynx/tool-runtime` | `packages/tool-runtime` | 622 | Core Tools & Registry | **Functional Baseline** | Regex shell blacklist bypassable; `search_files` shell string interpolation risk; no DAG. |
+| `@inflynx/patch-engine` | `packages/patch-engine` | 370 | Surgical Patching & Diffing | **Production Ready** | 2-phase atomic commit implemented; lacks AST operations and target staleness hash. |
+| `@inflynx/model-gateway` | `packages/model-gateway` | 335 | Anthropic & OpenAI Streaming | **Functional Baseline** | **Returns 0 usage tokens in streams;** missing native Gemini thinking adapter. |
+| `@inflynx/workspace-runtime` | `packages/workspace-runtime` | 486 | Indexer, BM25 Ranker, MindMap | **Production Ready** | Missing incremental FS watcher (`chokidar`) and symbol call-graph query engine. |
+| `@inflynx/session-store` | `packages/session-store` | 21 | Persistence Interfaces | **Interface Only** | Missing concrete SQLite session database and turn persistence. |
+| `@inflynx/protocol` | `packages/protocol` | 28 | Agent Event Schemas | **Interface Only** | Missing runtime event bus and event validator. |
+| `@inflynx/telemetry` | `packages/telemetry` | 10 | Console Logger | **Stub** | `logEvent` only calls `console.log`; missing secret redaction and metrics aggregator. |
+| `@inflynx/mcp-runtime` | `packages/mcp-runtime` | 302 | Stdio/SSE MCP Connectors | **Production Ready** | Stdio JSON-RPC fully functional; SSE transport is currently a mock probe. |
+| `@inflynx/skill-runtime` | `packages/skill-runtime` | 244 | SKILL.md Frontmatter Engine | **Production Ready** | Fully functional discovery, frontmatter parser, and prompt matcher. |
+| `@inflynx/config` | `packages/config` | 271 | Env, MCP & Provider Configs | **Production Ready** | Monorepo root finder, env loader, and provider specs operational. |
+| `tests/` | `tests/` | 0 | Unit, Security & Integration Suites | **Empty** | Directory structures exist (`unit/`, `security/`, `evals/`) but **0 test files exist**. |
 
 ---
 
-## 4. Target Architecture
+### 3.2 CLI vs. TUI Architectural Divergence
+
+Currently, `apps/cli` and `apps/tui` re-implement the model-tool interaction loop independently:
 
 ```text
-apps/cli ───────────────┐
-                         │
-apps/tui ────────────────┼──► @inflynx/agent-core
-                         │       │
-future server/IDE ──────┘       ├── Task classifier
-                                 ├── Plan engine
-                                 ├── State machine
-                                 ├── Budget manager
-                                 ├── Context manager
-                                 ├── Tool scheduler
-                                 ├── Verification engine
-                                 ├── Repair loop
-                                 ├── Review/finding engine
-                                 └── Event emitter
-                                          │
-                    ┌─────────────────────┼─────────────────────┐
-                    ▼                     ▼                     ▼
-          @inflynx/model-gateway  @inflynx/tool-runtime  @inflynx/session-store
-                    │                     │                     │
-                    ▼                     ▼                     ▼
-             Provider adapters       Policy gateway       SQLite/project history
-                                          │
-                                          ▼
-                                @inflynx/policy-engine
-                                          │
-                ┌─────────────────────────┼─────────────────────────┐
-                ▼                         ▼                         ▼
-      @inflynx/workspace-runtime  @inflynx/patch-engine     @inflynx/protocol
+CLI Execution Loop (apps/cli/src/index.ts):
+User Prompt ──► Parse Mentions ──► Match Skills ──► LLM Stream ──► Tool Approval HUD ──► executeTool() ──► Error Recover Stub ──► Repeat
+
+TUI Execution Loop (apps/tui/src/index.tsx):
+User Prompt ──► State Update ──► LLM Stream ──► executeTool() ──► Hardcoded Token Math ──► Repeat (Max 8)
 ```
 
-### 4.1 Shared core principle
-
-The frontends should render events and collect approvals. They should not own orchestration logic. The core should emit events such as:
-
-- `session.started`
-- `state.changed`
-- `plan.created`
-- `model.started`
-- `model.delta`
-- `thought.delta`
-- `tool.proposed`
-- `tool.approved`
-- `tool.started`
-- `tool.output`
-- `verification.started`
-- `verification.finished`
-- `finding.created`
-- `budget.warning`
-- `session.completed`
-- `session.failed`
+**Consequences of Divergence**:
+1. **Feature Asymmetry**: Slash commands (`/mode`, `/debug`, `/plan`, `/execute-plan`, `/graph`, `/mcp`, `/skills`), `@mention` resolution, and skill injection work in the CLI but are completely missing in the TUI.
+2. **Inconsistent Error Handling**: The CLI includes deep-level recovery stubs for unresponded `tool_call_id`s to prevent DeepSeek/OpenAI API 400 crashes; the TUI lacks this recovery logic.
+3. **Telemetric Inconsistency**: The TUI estimates token count using a crude heuristic `(input + output) / 4`, whereas the CLI does not track token costs.
 
 ---
 
-## 5. Effort Profiles and Budget Model
+### 3.3 Known Implementation Hazards to Resolve Immediately
 
-### 5.1 Configuration model
+1. **Symlink Escape in `validateWorkspaceBoundary` (`@inflynx/policy-engine`)**:
+   ```ts
+   // CURRENT INSECURE IMPLEMENTATION (Line 16):
+   export function validateWorkspaceBoundary(targetPath: string, workspaceRoot: string): boolean {
+     return targetPath.startsWith(workspaceRoot) && !targetPath.includes("..");
+   }
+   ```
+   *Hazard*: Path string comparison does not resolve symlinks via `fs.realpathSync`. A symlink inside the workspace pointing to `/etc/passwd` or `~/.ssh` evaluates as valid because its virtual path starts with `workspaceRoot`.
 
-Create a shared effort profile in `@inflynx/agent-core` or a small shared config module:
+2. **Shell Command Interpolation Injection (`@inflynx/tool-runtime`)**:
+   ```ts
+   // CURRENT INSECURE IMPLEMENTATION (Line 322 in search_files):
+   const rgArgs = [ ... `"${pattern}"`, `"${absPath}"` ].join(" ");
+   ```
+   *Hazard*: Interpolating untrusted string arguments into shell command strings enables command injection if `pattern` contains quotes, backticks, or subshell directives (e.g. `pattern = 'foo" $(rm -rf /) "'`).
+
+3. **Zero Token Telemetry Bug (`@inflynx/model-gateway`)**:
+   ```ts
+   // CURRENT BUG (Line 124 in streamAnthropic & Line 282 in streamOpenAiCompatible):
+   yield { type: "done", usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, finishReason: "stop" };
+   ```
+   *Hazard*: Stream completion events return zero tokens, rendering cost tracking and token budget enforcement non-functional.
+
+---
+
+## 4. Target Architecture & Shared Core Event Bus
+
+```text
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│    apps/cli     │    │    apps/tui     │    │  apps/desktop   │    │   apps/server   │
+└────────┬────────┘    └────────┬────────┘    └────────┬────────┘    └────────┬────────┘
+         │                      │                      │                      │
+         └──────────────────────┴──────────┬───────────┴──────────────────────┘
+                                           │  Subscribes to PublicAgentEvent Stream
+                                           ▼
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                                  @inflynx/agent-core                                  │
+│                                                                                        │
+│  ┌───────────────────────┐  ┌───────────────────────┐  ┌────────────────────────────┐  │
+│  │   TaskClassifier      │  │     PlanEngine        │  │     AgentOrchestrator      │  │
+│  └───────────────────────┘  └───────────────────────┘  └─────────────┬──────────────┘  │
+│  ┌───────────────────────┐  ┌───────────────────────┐                │                 │
+│  │   ContextManager      │  │   VerificationEngine  │  ┌─────────────▼────────────┐  │
+│  └───────────────────────┘  └───────────────────────┘  │    AgentStateMachine       │  │
+│  ┌───────────────────────┐  ┌───────────────────────┐  └─────────────┬──────────────┘  │
+│  │     BudgetManager     │  │     RepairLoop        │                │                 │
+│  └───────────────────────┘  └───────────────────────┘                │                 │
+└──────────────────────────────────────────┬───────────────────────────┼─────────────────┘
+                                           │                           │
+                   ┌───────────────────────┴───────────────┐           │ Emits Events
+                   ▼                                       ▼           ▼
+┌──────────────────────────────────────┐     ┌───────────────────────────────────────────┐
+│        @inflynx/model-gateway        │     │          @inflynx/protocol            │
+│  (Anthropic, DeepSeek, Gemini, etc.) │     │   (Typed Public Event Bus System)         │
+└──────────────────────────────────────┘     └─────────────────────┬─────────────────────┘
+                                                                   │
+                                                                   ▼
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                                   Security & Storage                                   │
+│  ┌───────────────────────────┐ ┌───────────────────────────┐ ┌──────────────────────┐  │
+│  │  @inflynx/policy-engine   │ │  @inflynx/tool-runtime    │ │@inflynx/session-store│  │
+│  │ (CanonicalPathGuard)      │ │(ToolExecutionGateway)     │ │   (SQLite Driver)    │  │
+│  └───────────────────────────┘ └───────────────────────────┘ └──────────────────────┘  │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.1 Typed Event Protocol Contract (`@inflynx/protocol`)
+
+All frontends are thin presentation layers that subscribe to `PublicAgentEvent` emissions:
+
+```ts
+export type AgentEventType =
+  | "session.started"          // Session initialized with CWD & config
+  | "state.changed"            // State machine state transition
+  | "plan.created"             // Structured plan generated
+  | "plan.step_updated"        // Individual step status change
+  | "model.turn_started"       // Model request loop turn initiated
+  | "model.thought_delta"      // Reasoning stream chunk (DeepSeek R1 / Anthropic thinking)
+  | "model.text_delta"         // Text response stream chunk
+  | "tool.proposed"            // Model proposed tool call
+  | "tool.approved"            // User or auto-approval granted
+  | "tool.started"             // Execution started
+  | "tool.output"              // Execution finished with output snippet
+  | "verification.started"     // Verification suite triggered
+  | "verification.finished"    // Verification completed (pass/fail status)
+  | "repair.attempted"         // Bounded repair loop triggered
+  | "finding.created"          // Critical defect or review finding recorded
+  | "budget.warning"           // Budget counter reached warning threshold (70%, 85%)
+  | "session.completed"        // Task finished successfully
+  | "session.failed";          // Task stopped due to error/budget limit
+
+export interface PublicAgentEvent<TPayload = Record<string, unknown>> {
+  id: string;
+  type: AgentEventType;
+  sessionId: string;
+  timestamp: number;
+  payload: TPayload;
+}
+```
+
+---
+
+## 5. Centralized Policy Gateway & Hardened Security Architecture
+
+### 5.1 Symlink-Safe Canonical Path Guard (`@inflynx/policy-engine`)
+
+Replace string-prefix validation with canonical path resolution capable of handling existing files, new files, and symlinks:
+
+```ts
+import fs from "fs";
+import path from "path";
+
+export class CanonicalPathGuard {
+  private canonicalWorkspaceRoot: string;
+
+  constructor(workspaceRoot: string) {
+    this.canonicalWorkspaceRoot = fs.realpathSync(path.resolve(workspaceRoot));
+  }
+
+  /**
+   * Resolves target path to canonical absolute path and enforces workspace boundary.
+   * Throws Error if path escapes workspace via traversal or symlink.
+   */
+  validateAndResolve(targetPath: string): string {
+    const absoluteTarget = path.isAbsolute(targetPath)
+      ? path.normalize(targetPath)
+      : path.normalize(path.join(this.canonicalWorkspaceRoot, targetPath));
+
+    let canonicalTarget: string;
+
+    if (fs.existsSync(absoluteTarget)) {
+      canonicalTarget = fs.realpathSync(absoluteTarget);
+    } else {
+      // For new files, resolve parent directory realpath
+      const parentDir = path.dirname(absoluteTarget);
+      if (!fs.existsSync(parentDir)) {
+        throw new Error(`Directory does not exist: "${parentDir}"`);
+      }
+      const canonicalParent = fs.realpathSync(parentDir);
+      canonicalTarget = path.join(canonicalParent, path.basename(absoluteTarget));
+    }
+
+    // Strict boundary check against canonical workspace root
+    if (
+      canonicalTarget !== this.canonicalWorkspaceRoot &&
+      !canonicalTarget.startsWith(this.canonicalWorkspaceRoot + path.sep)
+    ) {
+      throw new Error(
+        `Security Policy Violation: Path "${targetPath}" resolves to "${canonicalTarget}", ` +
+        `which lies outside workspace root "${this.canonicalWorkspaceRoot}".`
+      );
+    }
+
+    return canonicalTarget;
+  }
+}
+```
+
+### 5.2 Command Execution Policy & Anti-Injection Engine (`@inflynx/policy-engine`)
+
+Replace command string concatenation with argument array execution:
+
+```ts
+import { execFile } from "child_process";
+
+export interface ValidatedCommand {
+  executable: string;
+  args: string[];
+}
+
+export class CommandPolicy {
+  private static DANGEROUS_PATTERNS = [
+    /rm\s+-rf\s+[\/\~]/,
+    /sudo/,
+    /mkfs/,
+    /dd\s+if=/,
+    /: >/,
+    />\s*\/dev\/sd/,
+  ];
+
+  static validateShellCommand(commandString: string): void {
+    for (const pattern of this.DANGEROUS_PATTERNS) {
+      if (pattern.test(commandString)) {
+        throw new Error(`Command blocked by security policy: Matches pattern ${pattern}`);
+      }
+    }
+  }
+
+  /**
+   * Safely executes process without shell string interpolation using argument arrays.
+   */
+  static async execProcessDirect(
+    executable: string,
+    args: string[],
+    cwd: string,
+    timeoutMs: number,
+    signal?: AbortSignal
+  ): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const proc = execFile(executable, args, { cwd, timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err) {
+          reject(new Error(stderr.trim() || err.message));
+        } else {
+          resolve(stdout + (stderr ? `\n[stderr]: ${stderr}` : ""));
+        }
+      });
+
+      signal?.addEventListener("abort", () => {
+        proc.kill("SIGTERM");
+        reject(new Error("Process execution aborted by user signal."));
+      });
+    });
+  }
+}
+```
+
+### 5.3 Centralized Tool Execution Gateway (`@inflynx/tool-runtime`)
+
+All tool executions must route through `ToolExecutionGateway`:
+
+```ts
+export class ToolExecutionGateway {
+  constructor(
+    private pathGuard: CanonicalPathGuard,
+    private modeConfig: ModeConfig,
+    private eventBus: (event: PublicAgentEvent) => void
+  ) {}
+
+  async executeGuardedTool(
+    tool: ToolDefinition,
+    rawArgs: Record<string, unknown>,
+    signal?: AbortSignal
+  ): Promise<ToolResult> {
+    // 1. Centralized Mode Permission Check
+    if (tool.permissionLevel === "shell" && !this.modeConfig.allowShell) {
+      throw new Error(`Tool "${tool.name}" requires shell permission, which is disabled in [${this.modeConfig.mode}] mode.`);
+    }
+
+    if (tool.isMutating && !this.modeConfig.allowMutating) {
+      throw new Error(`Tool "${tool.name}" is mutating, which is disabled in [${this.modeConfig.mode}] mode.`);
+    }
+
+    // 2. Path Boundary Validation for Filesystem Tools
+    if (typeof rawArgs.path === "string") {
+      rawArgs.path = this.pathGuard.validateAndResolve(rawArgs.path);
+    }
+
+    // 3. Execution with Timeout & Abort Signal
+    const startMs = Date.now();
+    const result = await tool.execute(rawArgs, signal);
+    const durationMs = Date.now() - startMs;
+
+    return {
+      toolCallId: (rawArgs._id as string) || "call",
+      toolName: tool.name,
+      output: result,
+      durationMs,
+    };
+  }
+}
+```
+
+---
+
+## 6. Shared Agent Orchestrator & Enforced State Machine
+
+### 6.1 State Machine Transition Matrix (`@inflynx/agent-core`)
+
+The agent runtime must enforce a deterministic state machine:
+
+```text
+                       ┌────────────────────────────────────────────────────────┐
+                       ▼                                                        │
+┌──────┐      ┌─────────────────┐      ┌──────────────┐      ┌───────────────┐  │
+│ idle │ ────►│   classifying   │ ────►│   planning   │ ────►│   exploring   │──┘
+└──────┘      └─────────────────┘      └──────────────┘      └───────┬───────┘
+                                                                     │
+┌──────────────┐      ┌───────────────┐      ┌──────────────┐        │
+│  completed   │ ◄────│   reviewing   │ ◄────│  verifying   │ ◄──────┤
+└──────────────┘      └───────┬───────┘      └───────▲──────┘        │
+                              │                      │               ▼
+                      ┌───────▼───────┐      ┌───────┴──────┐┌───────────────┐
+                      │  repairing    │ ────►│ implementing ││ hypothesizing │
+                      └───────────────┘      └──────────────┘└───────────────┘
+```
+
+```ts
+export type AgentState =
+  | "idle"                  // Initial state
+  | "classifying"           // Task classification & strategy selection
+  | "planning"              // Structured plan generation
+  | "exploring"             // Codebase research & symbol navigation
+  | "hypothesizing"         // Debug hypothesis formation
+  | "implementing"          // Code mutation via patch_file / write_file
+  | "verifying"             // Verification gate execution (typecheck, tests)
+  | "repairing"             // Bounded failure recovery loop
+  | "reviewing"             // Final report generation & finding synthesis
+  | "waiting_for_approval"  // Paused for user approval
+  | "completed"             // Task completed successfully with verification
+  | "failed"                // Hard stop due to budget or fatal error
+  | "cancelled";            // Aborted by user signal
+
+export const LEGAL_STATE_TRANSITIONS: Record<AgentState, AgentState[]> = {
+  idle: ["classifying"],
+  classifying: ["planning", "exploring", "failed"],
+  planning: ["exploring", "waiting_for_approval", "implementing", "failed"],
+  exploring: ["planning", "hypothesizing", "implementing", "failed"],
+  hypothesizing: ["exploring", "implementing", "verifying", "failed"],
+  implementing: ["verifying", "failed"],
+  verifying: ["reviewing", "repairing", "completed", "failed"],
+  repairing: ["implementing", "verifying", "failed"],
+  reviewing: ["completed", "failed"],
+  waiting_for_approval: ["implementing", "cancelled", "planning"],
+  completed: ["idle"],
+  failed: ["idle"],
+  cancelled: ["idle"],
+};
+```
+
+### 6.2 Effort Profiles & `BudgetManager` (`@inflynx/agent-core`)
 
 ```ts
 export type EffortLevel = "low" | "medium" | "high";
 
 export interface EffortProfile {
   level: EffortLevel;
-  thinkingBudgetTokens: number;
-  maxModelTurns: number;
-  maxToolCalls: number;
-  maxRetries: number;
-  maxVerificationRuns: number;
-  maxWallClockMs: number;
-  maxTotalReasoningTokens: number;
+  thinkingBudgetTokens: number;      // Per-request model reasoning budget
+  maxModelTurns: number;             // Hard turn limit
+  maxToolCalls: number;              // Total tool call budget
+  maxRetries: number;                // Max tool/build repair attempts
+  maxVerificationRuns: number;       // Max verification iterations
+  maxWallClockMs: number;            // Total wall-clock time limit
+  maxTotalReasoningTokens: number;   // Aggregate task reasoning limit
   verificationDepth: "basic" | "standard" | "deep";
-  explorationDepth: "focused" | "related" | "architecture";
   runFullRegressionSuite: boolean;
-  allowParallelReadonlyTools: boolean;
 }
+
+export const DEFAULT_EFFORT_PROFILES: Record<EffortLevel, EffortProfile> = {
+  low: {
+    level: "low",
+    thinkingBudgetTokens: 1024,
+    maxModelTurns: 5,
+    maxToolCalls: 10,
+    maxRetries: 1,
+    maxVerificationRuns: 2,
+    maxWallClockMs: 2 * 60 * 1000,   // 2 minutes
+    maxTotalReasoningTokens: 8192,
+    verificationDepth: "basic",
+    runFullRegressionSuite: false,
+  },
+  medium: {
+    level: "medium",
+    thinkingBudgetTokens: 4096,
+    maxModelTurns: 15,
+    maxToolCalls: 30,
+    maxRetries: 3,
+    maxVerificationRuns: 5,
+    maxWallClockMs: 8 * 60 * 1000,   // 8 minutes
+    maxTotalReasoningTokens: 32768,
+    verificationDepth: "standard",
+    runFullRegressionSuite: true,
+  },
+  high: {
+    level: "high",
+    thinkingBudgetTokens: 8192,
+    maxModelTurns: 30,
+    maxToolCalls: 75,
+    maxRetries: 5,
+    maxVerificationRuns: 10,
+    maxWallClockMs: 20 * 60 * 1000,  // 20 minutes
+    maxTotalReasoningTokens: 131072,
+    verificationDepth: "deep",
+    runFullRegressionSuite: true,
+  },
+};
 ```
 
-Recommended initial defaults:
+---
 
-| Setting | Low | Medium | High |
-|---|---:|---:|---:|
-| Thinking budget/request | 1,024 | 4,096 | 8,192 |
-| Max model turns | 3 | 8 | 16 |
-| Max tool calls | 8 | 20 | 50 |
-| Max retries | 1 | 2 | 3 |
-| Max verification runs | 2 | 5 | 10 |
-| Max wall-clock time | 60 seconds | 5 minutes | 15 minutes |
-| Max total reasoning tokens | 4,096 | 32,768 | 131,072 |
-| Exploration | Focused | Related | Architecture |
-| Verification | Basic | Standard | Deep |
-| Full regression suite | No | Yes | Yes |
-| Parallel read-only tools | Yes | Yes | Yes |
+## 7. Context Manager & Structured Planning Engine
 
-These are policy defaults, not provider guarantees. Actual providers may consume fewer or more tokens.
-
-### 5.2 Runtime budget state
+### 7.1 Task Classifier & Execution Strategy
 
 ```ts
-export interface BudgetState {
-  level: EffortLevel;
-  startedAt: number;
-  modelTurns: number;
-  toolCalls: number;
-  readonlyToolCalls: number;
-  mutatingToolCalls: number;
-  shellCalls: number;
-  retries: number;
-  verificationRuns: number;
-  reasoningTokens: number;
-  promptTokens: number;
-  completionTokens: number;
-  estimatedCostUsd: number;
+export type TaskCategory =
+  | "question"          // Read-only query / explanation
+  | "implementation"    // New feature or refactor
+  | "bug_fix"           // Targeted defect repair
+  | "security_audit"    // Code vulnerability assessment
+  | "performance";      // Optimization & benchmark task
+
+export interface TaskClassification {
+  category: TaskCategory;
+  recommendedMode: AgentMode;
+  recommendedEffort: EffortLevel;
+  targetComponents: string[];
+  requiredVerification: string[];
 }
 ```
 
-Every counter must be updated by the orchestrator, not by prompts. Hard limits must stop execution deterministically. Warnings should be emitted at 70%, 85%, and 100% of each relevant budget.
+### 7.2 Structured Plan Schema vs. Human Markdown Projection
 
-### 5.3 Repeated thinking behavior
+Plans exist as structured JSON objects in memory and persist as both `.inflynx/plan.json` and human-readable `.inflynx/PLAN.md`:
 
-A task may contain many model turns:
+```ts
+export interface StructuredPlanStep {
+  id: number;
+  title: string;
+  description: string;
+  targetFiles: string[];
+  verificationCommand?: string;
+  risk: "LOW" | "MEDIUM" | "HIGH";
+  dependencies: number[];
+  status: "pending" | "in_progress" | "completed" | "failed" | "skipped";
+  outputEvidence?: string;
+}
 
-```text
-user prompt
-  → model reasoning
-  → read/search tools
-  → model reasoning over evidence
-  → patch tool
-  → model reasoning over patch result
-  → build/test tools
-  → model reasoning over failures
-  → final answer
+export interface StructuredPlan {
+  id: string;
+  goal: string;
+  category: TaskCategory;
+  steps: StructuredPlanStep[];
+  createdTimestamp: number;
+  status: "draft" | "approved" | "executing" | "completed" | "failed";
+}
 ```
 
-The UI should show:
-
-- Current effort.
-- Current state.
-- Model turn number.
-- Tool call count.
-- Verification count.
-- Reasoning-token usage when available.
-- Remaining budget.
-
 ---
 
-## 6. Phased Implementation Roadmap
+## 8. Verification Engine & Failure-Driven Repair Loop
 
-## Phase 0 — Baseline, Contracts, and CI
+### 8.1 Automated Project Check Registry (`@inflynx/agent-core`)
 
-### Goals
+The `VerificationEngine` inspects workspace metadata and automatically configures relevant check commands:
 
-Establish a reproducible baseline before changing orchestration behavior.
+```ts
+export interface VerificationCheck {
+  id: string;
+  name: string;
+  type: "typecheck" | "test" | "lint" | "build" | "custom";
+  command: string;
+  args: string[];
+  timeoutMs: number;
+  isGate: boolean; // Must pass before completing task
+}
 
-### Work items
+export interface VerificationResult {
+  checkId: string;
+  passed: boolean;
+  durationMs: number;
+  stdout: string;
+  stderr: string;
+  parsedErrors: DiagnosticError[];
+}
 
-1. Add CI for Windows and Linux at minimum.
-2. Install and pin the package manager through documented setup or Corepack.
-3. Run `pnpm install`, `pnpm build`, and all available tests in CI.
-4. Add strict TypeScript checks for every package.
-5. Add a test harness with mocked model streams and temporary workspaces.
-6. Add a compatibility matrix for providers and thinking capabilities.
-7. Document unsupported providers/features instead of silently pretending support.
-
-### Files/packages
-
-- Root `package.json`
-- `pnpm-workspace.yaml`
-- New `.github/workflows/ci.yml`
-- New `tests/fixtures/`
-- Package-level `tsconfig.json` files
-- `packages/model-gateway`
-
-### Acceptance criteria
-
-- Clean install works in CI.
-- Build failures are visible and reproducible.
-- Model streaming can be tested without network/API keys.
-- Changed behavior has regression coverage.
-
----
-
-## Phase 1 — Central Policy and Safe Tool Gateway
-
-### Goals
-
-Make every tool execution pass through enforceable security and resource policy.
-
-### Work items
-
-1. Replace string-prefix path checks with canonical path validation.
-2. Resolve and validate real paths using `realpath` where applicable.
-3. Reject traversal, workspace escapes, and symlink escapes.
-4. Define policy profiles:
-   - `read-only`
-   - `workspace-write`
-   - `full-access`
-5. Enforce policy inside `executeTool()` and not only at prompt/tool-list level.
-6. Add per-tool capabilities:
-   - filesystem read
-   - filesystem write
-   - shell
-   - network
-   - external process
-7. Replace shell blacklist-only logic with command execution policy.
-8. Validate shell working directory through the same path gateway.
-9. Add maximum output size and timeout handling.
-10. Kill process trees on cancellation, including Windows process handling.
-11. Ensure search tools do not interpolate untrusted strings into shell command strings. Prefer direct process arguments or in-process search.
-12. Add audit events for denied and approved actions.
-
-### Files/packages
-
-- `packages/policy-engine/src/index.ts`
-- `packages/tool-runtime/src/index.ts`
-- `packages/patch-engine/src/index.ts`
-- New `packages/policy-engine/src/path-guard.ts`
-- New `packages/policy-engine/src/command-policy.ts`
-- New `packages/tool-runtime/src/ToolExecutionGateway.ts`
-
-### Acceptance criteria
-
-- Attempts to read/write outside workspace are denied.
-- Symlink escapes are denied.
-- Ask/plan mode restrictions are enforced even if called directly.
-- Shell cancellation does not leave child processes running.
-- Security tests cover traversal, symlink, injection, SSRF, and output-limit cases.
-
----
-
-## Phase 2 — Shared Agent Orchestrator and State Machine
-
-### Goals
-
-Move loop control out of the CLI/TUI and into `@inflynx/agent-core`.
-
-### Work items
-
-1. Create `AgentOrchestrator` with dependency injection for:
-   - model gateway
-   - tool runtime
-   - policy gateway
-   - workspace index
-   - verifier
-   - session store
-   - event emitter
-   - approval provider
-2. Implement states:
-
-```text
-idle
-classifying
-planning
-exploring
-hypothesizing
-implementing
-verifying
-repairing
-reviewing
-waiting_for_approval
-completed
-failed
-cancelled
+export interface DiagnosticError {
+  filePath?: string;
+  line?: number;
+  column?: number;
+  code?: string;
+  message: string;
+  severity: "error" | "warning";
+}
 ```
 
-3. Define legal transitions and transition reasons.
-4. Add cancellation through `AbortSignal`.
-5. Add state-entry and state-exit events.
-6. Enforce effort profile budgets in one place.
-7. Add tool-call deduplication and repeated-failure detection.
-8. Preserve provider-specific assistant/tool history correctly.
-9. Make CLI and TUI thin adapters over the same orchestrator.
-10. Add a bounded continuation policy so a model cannot loop indefinitely.
+### 8.2 Anti-Pattern Rules in Bounded Repair Loop
 
-### Suggested files
+When verification fails, the orchestrator triggers `RepairLoop`. The repair engine strictly rejects fake fixes:
 
 ```text
-packages/agent-core/src/orchestrator/AgentOrchestrator.ts
-packages/agent-core/src/orchestrator/StateMachine.ts
-packages/agent-core/src/orchestrator/ExecutionContext.ts
-packages/agent-core/src/orchestrator/BudgetManager.ts
-packages/agent-core/src/orchestrator/RetryPolicy.ts
-packages/agent-core/src/orchestrator/ApprovalProvider.ts
-packages/agent-core/src/orchestrator/index.ts
+Anti-Pattern Rejection Guard:
+1. Rejects deletion or commenting out of failing test cases.
+2. Rejects adding @ts-ignore or eslint-disable without explicit user authorization.
+3. Rejects swallowing errors with empty catch blocks.
+4. Rejects modifying assertion expected values to match buggy output.
 ```
 
-### Acceptance criteria
-
-- CLI and TUI produce equivalent tool/model behavior.
-- Every model request and tool call increments a central budget counter.
-- Max turns/tools/time/retries are hard limits.
-- Cancellation works while streaming and while executing tools.
-- Orchestrator unit tests cover normal, denied, failed, cancelled, and budget-exhausted flows.
+If a patch fails verification after `maxRetries` attempts, the orchestrator automatically rolls back staged changes and yields control to the user.
 
 ---
 
-## Phase 3 — Structured Planning and Context Management
+## 9. Evidence-First Debugging & Critical Bug Detection
 
-### Goals
-
-Make exploration deliberate, relevant, and bounded.
-
-### Work items
-
-1. Add a task classifier:
-   - question
-   - explanation
-   - implementation
-   - bug fix
-   - security audit
-   - performance investigation
-   - refactor
-2. Build structured plans with step dependencies, target files, risks, and verification commands.
-3. Add plan state independent of Markdown rendering.
-4. Keep `.inflynx/PLAN.md` as a human-readable projection of structured state.
-5. Add context items with priority and source metadata.
-6. Add token-aware context selection and compaction.
-7. Deduplicate file reads, search results, and repeated tool output.
-8. Add active-file and git-diff relevance boosts.
-9. Add task-specific exploration depth from effort profile.
-10. Detect when evidence is insufficient and request logs, reproduction steps, or environment details.
-
-### Suggested files
-
-- `packages/agent-core/src/planning/TaskClassifier.ts`
-- `packages/agent-core/src/planning/StructuredPlan.ts`
-- `packages/agent-core/src/context/ContextManager.ts`
-- `packages/agent-core/src/context/ContextCompactor.ts`
-- Existing `PlanEngine.ts`
-- `packages/workspace-runtime/src/index.ts`
-
-### Acceptance criteria
-
-- A complex task creates a structured plan before mutation.
-- Context stays within configured limits.
-- Plans survive process restart.
-- The agent can explain why each file was included.
-
----
-
-## Phase 4 — Verification Engine and Repair Loop
-
-### Goals
-
-Make verification systematic and failure-driven.
-
-### Work items
-
-1. Create a verification registry for commands and checks.
-2. Detect project commands from package metadata and configuration.
-3. Support check types:
-   - typecheck/build
-   - unit tests
-   - integration tests
-   - lint/format
-   - security scan
-   - dependency audit
-   - diff validation
-   - custom user checks
-4. Parse stdout/stderr into structured failures.
-5. Map failures to files, lines, categories, and probable causes.
-6. Add focused verification first, then broader verification based on effort profile.
-7. Add repair loop with bounded retries.
-8. Save failure signatures and resolutions to a failure journal.
-9. Prevent fake fixes:
-   - no disabling tests
-   - no deleting assertions
-   - no swallowing errors
-   - no unrelated changes to hide failures
-10. Re-run failed checks after every repair.
-11. Produce a verification summary in the final response and report.
-
-### Suggested files
-
-```text
-packages/agent-core/src/verification/VerificationEngine.ts
-packages/agent-core/src/verification/CheckRegistry.ts
-packages/agent-core/src/verification/FailureParser.ts
-packages/agent-core/src/verification/RepairLoop.ts
-packages/agent-core/src/verification/FailureJournal.ts
-```
-
-### Acceptance criteria
-
-- A patch cannot be marked complete without configured verification results.
-- Failures are preserved as evidence.
-- Repair attempts stop at profile limits.
-- The final report distinguishes fixed, unresolved, skipped, and unverified checks.
-
----
-
-## Phase 5 — Evidence-First Debugging and Critical Bug Detection
-
-### Goals
-
-Turn debug mode into a disciplined investigation system rather than a generic code-review prompt.
-
-### Finding schema
+### 9.1 Evidence-Backed Bug Finding Schema (`BugFinding`)
 
 ```ts
 export interface BugFinding {
   id: string;
   severity: "critical" | "high" | "medium" | "low" | "info";
   category:
-    | "security"
     | "correctness"
-    | "data-loss"
-    | "race-condition"
-    | "reliability"
+    | "security"
+    | "data_integrity"
+    | "race_condition"
     | "performance"
-    | "observability";
+    | "reliability";
   title: string;
-  file: string;
+  targetFile: string;
   lineStart?: number;
   lineEnd?: number;
-  evidence: string[];
-  reproduction?: string;
+  evidence: {
+    reproductionCommand?: string;
+    stackTrace?: string;
+    codeSnippet?: string;
+    verifiedDataFlow?: string;
+  };
   impact: string;
   rootCause: string;
-  confidence: number;
-  verificationStatus: "hypothesis" | "reproduced" | "fixed" | "regression-tested" | "unresolved";
+  confidenceScore: number; // Must be >= 0.70 to mark as defect; else hypothesis
+  verificationStatus: "hypothesis" | "reproduced" | "fixed" | "unverified";
   suggestedFix?: string;
 }
 ```
 
-### Audit passes
+Findings are synthesized directly into `.inflynx/DEBUG_REPORT.md` following a standardized CodeRabbit-style markdown template.
 
-#### Correctness and crash pass
+---
 
-- Null/undefined paths.
-- Incorrect branching and state transitions.
-- Async error and cancellation handling.
-- Partial writes and transaction errors.
-- Retry duplication and idempotency.
-- Resource leaks and unhandled promises.
+## 10. Real Token Telemetry & Provider Usage Extraction
 
-#### Security pass
+### 10.1 Fixing Token Extraction in `@inflynx/model-gateway`
 
-- Path traversal and symlink escape.
-- Command injection and shell quoting.
-- SSRF and unrestricted network access.
-- Secret leakage in logs, prompts, diffs, and session persistence.
-- Authorization and permission confusion.
-- Unsafe deserialization and prototype pollution.
-- Temporary-file and permission issues.
+Update stream readers to extract real token metrics:
 
-#### Data integrity pass
+```ts
+// 1. Anthropic Usage Extractor (v1/messages):
+if (parsed.type === "message_start") {
+  accumulatedUsage.promptTokens = parsed.message.usage.input_tokens;
+} else if (parsed.type === "message_delta") {
+  accumulatedUsage.completionTokens = parsed.usage.output_tokens;
+}
 
-- Atomicity and rollback.
-- Lost updates.
-- Duplicate events.
-- Concurrent writes.
-- Corrupt session/tool history.
-- Inconsistent cache/index invalidation.
-
-#### Performance pass
-
-- Blocking filesystem/process operations.
-- Unbounded output/context growth.
-- Repeated scans and duplicate reads.
-- N+1 tool calls.
-- Excessive model turns.
-- Missing timeouts and cancellation.
-
-#### Regression pass
-
-- Public API compatibility.
-- Test coverage of changed behavior.
-- Configuration migration needs.
-- Cross-platform behavior.
-- Build/lint/typecheck status.
-
-### Investigation workflow
-
-```text
-collect baseline
-  → reproduce or establish evidence
-  → inspect source and call paths
-  → generate hypotheses
-  → run targeted checks
-  → rank findings by severity/confidence
-  → patch only verified root causes
-  → run regression checks
-  → write report
+// 2. OpenAI / DeepSeek Usage Extractor (chat/completions):
+// Pass stream_options: { include_usage: true } in body
+if (parsed.usage) {
+  accumulatedUsage.promptTokens = parsed.usage.prompt_tokens;
+  accumulatedUsage.completionTokens = parsed.usage.completion_tokens;
+  accumulatedUsage.reasoningTokens = parsed.usage.completion_tokens_details?.reasoning_tokens || 0;
+}
 ```
 
-### Acceptance criteria
-
-- Critical findings include reproducible evidence or are explicitly marked hypotheses.
-- Debug reports include exact paths, categories, impact, root cause, and verification state.
-- The engine can stop and request missing reproduction information.
-- Security audit output is separate from style/code-quality nits.
-
 ---
 
-## Phase 6 — Workspace Intelligence and Incremental Semantic Graph
-
-### Goals
-
-Improve investigation quality for large repositories.
-
-### Work items
-
-1. Add incremental filesystem watching.
-2. Persist `.inflynx/project-map.json` or equivalent index metadata.
-3. Parse TypeScript/JavaScript symbols with the TypeScript compiler API initially.
-4. Add definitions, imports, exports, references, and basic call edges.
-5. Add test-to-source mapping.
-6. Add changed-file and dependency-impact analysis.
-7. Add graph queries:
-   - callers/callees
-   - importers/imports
-   - affected tests
-   - public API consumers
-   - dependency distance
-8. Avoid loading entire large files into context; use focused symbol/line slices.
-9. Add cache invalidation on file changes.
-10. Add indexing diagnostics and stale-index detection.
-
-### Suggested files
-
-- `packages/workspace-runtime/src/index.ts`
-- New `packages/workspace-runtime/src/indexer/`
-- New `packages/workspace-runtime/src/symbol-graph/`
-- New `packages/workspace-runtime/src/watch/`
-
-### Acceptance criteria
-
-- Large repositories can be indexed incrementally.
-- A changed file returns affected symbols and tests.
-- The agent can trace a finding across callers and dependencies.
-- Stale index state is detected rather than trusted silently.
-
----
-
-## Phase 7 — Transactional Editing, Conflicts, and AST Support
-
-### Goals
-
-Make multi-file changes safer and more structurally reliable.
-
-### Work items
-
-1. Add precondition hashes to patches.
-2. Refuse to apply a patch if the target changed since it was read.
-3. Add transaction rollback that restores all previously committed files if a later commit fails.
-4. Add user-visible combined diff and affected-file risk summary.
-5. Add conflict resolution workflow.
-6. Add TypeScript AST transformations for selected operations:
-   - import insertion/removal
-   - symbol rename preparation
-   - function replacement
-   - interface/property changes
-7. Preserve comments and formatting where possible.
-8. Keep textual patch fallback for unsupported languages.
-9. Add post-edit parse validation before verification.
-
-### Suggested files
-
-- `packages/patch-engine/src/index.ts`
-- New `packages/patch-engine/src/ast/TypeScriptAstAdapter.ts`
-- New `packages/patch-engine/src/transactions/ConflictDetector.ts`
-- New `packages/patch-engine/src/transactions/RollbackManager.ts`
-
-### Acceptance criteria
-
-- Concurrent user edits are never silently overwritten.
-- A failed multi-file commit leaves the workspace consistent.
-- AST operations have parser and formatting regression tests.
-
----
-
-## Phase 8 — Sessions, Failure Memory, and Observability
-
-### Goals
-
-Make sessions resumable, auditable, and diagnosable.
-
-### Work items
-
-1. Implement concrete SQLite session store.
-2. Persist sessions, turns, messages, tool calls, approvals, budgets, findings, and verification results.
-3. Add resume, fork, and rollback session operations.
-4. Store redacted tool output and provider metadata.
-5. Implement failure journal keyed by normalized error signatures.
-6. Add structured telemetry with correlation IDs.
-7. Redact credentials, authorization headers, cookies, tokens, and secret-like values before persistence/logging.
-8. Add metrics:
-   - task completion rate
-   - verification pass rate
-   - repair success rate
-   - average tool calls
-   - average model turns
-   - budget exhaustion rate
-   - false-positive finding rate
-   - provider error rate
-9. Add privacy controls and retention settings.
-
-### Suggested files
-
-- `packages/session-store/src/index.ts`
-- New `packages/session-store/src/sqlite/`
-- `packages/telemetry/src/index.ts`
-- `packages/config/src/index.ts`
-- `packages/protocol/src/index.ts`
-
-### Acceptance criteria
-
-- A session can be resumed after process restart.
-- Logs and persisted sessions contain no raw API keys.
-- Every task has a traceable event timeline.
-- Failure patterns can improve future diagnosis without exposing secrets.
-
----
-
-## Phase 9 — Provider Reliability, Cost, and Capability Routing
-
-### Goals
-
-Make model behavior predictable across providers.
-
-### Work items
-
-1. Normalize provider capability discovery.
-2. Add native Gemini thinking adapter instead of relying only on the OpenAI-compatible endpoint.
-3. Parse actual usage from each provider.
-4. Normalize reasoning-token usage where available.
-5. Handle provider-native content blocks without lossy reconstruction.
-6. Add retry classification:
-   - safe transient retry
-   - rate-limit retry
-   - invalid request no-retry
-   - authentication no-retry
-   - cancellation no-retry
-7. Add request idempotency where supported.
-8. Add model fallback only when policy permits.
-9. Add model escalation based on task classification and evidence quality.
-10. Estimate cost from actual usage and configured price tables.
-11. Do not send unsupported thinking fields.
-12. Display capability warnings in CLI/TUI.
-
-### Suggested files
-
-- `packages/model-gateway/src/index.ts`
-- New `packages/model-gateway/src/providers/`
-- New `packages/model-gateway/src/capabilities/`
-- New `packages/model-gateway/src/usage/`
-- New `packages/model-gateway/src/retry/`
-
-### Acceptance criteria
-
-- Each provider has contract tests with mocked streams.
-- Unsupported features are visible and deterministic.
-- Usage and cost are not reported as zero when the provider supplies data.
-- Retry behavior does not duplicate mutations.
-
----
-
-## Phase 10 — Tool DAG, Parallelism, and Large-Repository Optimization
-
-### Goals
-
-Improve speed without sacrificing ordering and safety.
-
-### Work items
-
-1. Build a dependency graph for tool calls.
-2. Execute independent read-only operations in parallel.
-3. Serialize mutations and commands that depend on updated state.
-4. Add maximum concurrency and per-tool resource limits.
-5. Cancel dependent nodes after a fatal prerequisite failure.
-6. Cache immutable read results during a turn.
-7. Invalidate cache after mutations.
-8. Summarize large search results and raw logs before adding them to context.
-9. Use adaptive exploration:
-   - start focused
-   - expand only when evidence requires it
-10. Add tool-call batching for compatible read operations.
-
-### Suggested files
-
-- `packages/tool-runtime/src/dag/ToolDagScheduler.ts`
-- `packages/tool-runtime/src/dag/DependencyResolver.ts`
-- `packages/tool-runtime/src/cache/ToolResultCache.ts`
-- `packages/agent-core/src/context/ContextCompactor.ts`
-
-### Acceptance criteria
-
-- Independent reads run concurrently.
-- Mutations never race.
-- Cache invalidation is tested.
-- Large-repository tasks use less context without losing relevant evidence.
-
----
-
-## Phase 11 — Plugin and Protocol Maturity
-
-### Goals
-
-Expose a stable runtime to future server, desktop, and IDE clients.
-
-### Work items
-
-1. Define versioned public protocol schemas.
-2. Add runtime event validation.
-3. Add local server/WebSocket adapter.
-4. Add plugin manifest validation.
-5. Add plugin capability and permission declarations.
-6. Load plugins in isolated or restricted contexts.
-7. Add plugin lifecycle and error isolation.
-8. Prevent plugins from bypassing policy gateway.
-9. Add protocol compatibility tests.
-
-### Suggested files
-
-- `packages/protocol/src/index.ts`
-- `packages/plugin-sdk/src/index.ts`
-- New `apps/server/`
-- New plugin loader under `packages/agent-core` or `packages/plugin-sdk`
-
-### Acceptance criteria
-
-- TUI, CLI, and future server consume the same event contract.
-- Plugin tools use the same policy and budget enforcement.
-- Plugin failures do not crash the host agent.
-
----
-
-## 7. Verification and Evaluation Strategy
-
-### 7.1 Unit tests
-
-Cover:
-
-- Thinking budget validation.
-- Provider capability mapping.
-- Message/content-block replay.
-- Effort profile resolution.
-- Budget enforcement.
-- State transition legality.
-- Retry classification.
-- Path boundary and symlink checks.
-- Shell policy.
-- Patch uniqueness and conflict detection.
-- Diff generation.
-- Plan parsing.
-- Failure parsing.
-- Secret redaction.
-
-### 7.2 Integration tests
-
-Use a fake model gateway and temporary workspace to test:
-
-1. Read-only question.
-2. Plan generation.
-3. Approved patch.
-4. Denied patch.
-5. Tool failure and retry.
-6. Build failure and repair.
-7. Cancellation during model stream.
-8. Cancellation during shell execution.
-9. Budget exhaustion.
-10. Provider tool-call history replay.
-11. Multi-file transaction rollback.
-12. Session resume.
-
-### 7.3 Security tests
-
-- `..` traversal.
-- Absolute path outside root.
-- Symlink outside root.
-- Shell metacharacters.
-- Command substitution.
-- Malicious search patterns.
-- SSRF to local/private addresses.
-- Secret values in tool output and logs.
-- Malicious MCP configuration.
-- Plugin capability escalation.
-
-### 7.4 Bug-finding evaluation corpus
-
-Create fixture repositories containing known defects:
-
-- Null dereference.
-- Authorization bypass.
-- SQL/command injection pattern.
-- Race condition.
-- Retry duplication.
-- Lost update.
-- Incorrect cache invalidation.
-- Memory leak.
-- Unhandled promise rejection.
-- Path traversal.
-- Insecure secret logging.
-- Incorrect transaction rollback.
-
-Measure:
-
-- Detection rate.
-- Reproduction rate.
-- False-positive rate.
-- Root-cause accuracy.
-- Fix success rate.
-- Regression rate.
-- Average model turns/tools.
-- Cost and wall-clock time by effort profile.
-
-No single benchmark proves production readiness; evaluation must be treated as a feedback loop.
-
----
-
-## 8. Recommended Implementation Order
-
-The fastest safe order is:
+## 11. Desktop, Server & Web Application Architecture
 
 ```text
-0. Baseline + CI + tests
-1. Policy and safe tool gateway
-2. Shared orchestrator/state machine
-3. Effort profiles and budget manager
-4. Verification engine and bounded repair loop
-5. Evidence-first findings/debug mode
-6. Context manager and structured planning
-7. Transaction conflicts and rollback
-8. Session store and redacted telemetry
-9. Semantic index and test mapping
-10. Provider reliability and usage
-11. Tool DAG and parallel reads
-12. AST editing
-13. Plugins/server/protocol expansion
+           ┌──────────────────────────────────────────────────────────┐
+           │                      fe/ (Vite React Web UI)             │
+           └────────────────────────────┬─────────────────────────────┘
+                                        │ WebSocket JSON-RPC Connection
+                                        ▼
+           ┌──────────────────────────────────────────────────────────┐
+           │                  apps/server (Node/Fastify)              │
+           └────────────────────────────┬─────────────────────────────┘
+                                        │ IPC / Process Stream
+                                        ▼
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                                  @inflynx/agent-core                                  │
+│                (Shared Event Bus & AgentOrchestrator Instance)                        │
+└────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Do not start with a larger context window or a larger thinking budget. Without verification and policy enforcement, more model thinking mainly makes the agent slower and can increase the amount of unverified work.
+The React Web application (`fe/`) and Desktop app (`apps/desktop`) consume the identical event stream emitted by `@inflynx/agent-core`, ensuring 100% feature parity between CLI, TUI, Desktop, and Web frontends.
 
 ---
 
-## 9. Definition of Done for a Mature Agent v1
+## 12. Concrete Test Suite & Evaluation Corpus Specification
 
-The agent is ready for a serious internal beta when it can:
-
-1. Run through one shared orchestrator from CLI and TUI.
-2. Enforce workspace and shell policy in code.
-3. Track effort profile, model turns, tool calls, retries, verification runs, time, and token usage.
-4. Create a structured plan for complex tasks.
-5. Collect evidence before reporting critical findings.
-6. Apply conflict-aware reversible patches.
-7. Run focused and full verification gates.
-8. Retry failures within explicit limits.
-9. Stop safely when evidence or budgets are insufficient.
-10. Persist redacted sessions and verification history.
-11. Produce a final report containing:
-    - changed files
-    - evidence collected
-    - commands run
-    - verification results
-    - unresolved risks
-    - budget/cost summary
-    - confidence level
-12. Pass the security and fixture evaluation suites.
-
----
-
-## 10. First Implementation Sprint
-
-The first sprint should not attempt the entire roadmap. Implement these vertical slices:
-
-### Sprint A — Contracts
-
-- Add `EffortProfile` and `BudgetState`.
-- Add structured `AgentEvent` types.
-- Add `BugFinding` and `VerificationResult` types.
-- Add provider capability and usage contract tests.
-
-### Sprint B — Orchestrator
-
-- Implement `AgentOrchestrator` for one model/tool loop.
-- Move the CLI loop behind the orchestrator.
-- Preserve existing approvals and provider history.
-- Add hard model/tool/time limits.
-
-### Sprint C — Policy
-
-- Implement canonical path guard.
-- Enforce policy inside `executeTool()`.
-- Add shell timeout/cancellation and safe argument handling.
-- Add security fixtures.
-
-### Sprint D — Verification
-
-- Add `VerificationEngine` with build/typecheck/test checks.
-- Add bounded repair loop.
-- Add final verification summary.
-
-### Sprint E — Debug evidence
-
-- Add finding extraction schema.
-- Require evidence and confidence.
-- Generate `.inflynx/DEBUG_REPORT.md` from structured findings.
-- Add known-bug fixture tests.
-
-### Sprint A–E exit criteria
-
-A complex task should be able to move through:
+Establish a comprehensive test suite in `tests/` using **Vitest**:
 
 ```text
-planning → exploring → implementing → verifying → repairing → reviewing → completed
+tests/
+├── unit/
+│   ├── policy-engine/
+│   │   ├── path-guard.test.ts          # Symlink escape & boundary tests
+│   │   └── command-policy.test.ts       # Shell injection prevention tests
+│   ├── patch-engine/
+│   │   ├── surgical-patch.test.ts       # Substring & line-trimmed patch tests
+│   │   └── atomic-transaction.test.ts   # 2-phase commit & rollback tests
+│   └── agent-core/
+│       ├── state-machine.test.ts        # State transition legality tests
+│       └── budget-manager.test.ts       # Hard-stop limit enforcement tests
+├── security/
+│   ├── path-traversal.test.ts           # Traversal attack payload fixtures
+│   └── shell-injection.test.ts          # Command substitution attack fixtures
+├── integration/
+│   ├── orchestrator-loop.test.ts        # Full loop test with mocked model gateway
+│   └── verification-repair.test.ts      # Automated build failure repair tests
+└── evals/
+    ├── corpus/
+    │   ├── repo-null-deref/             # Known defect fixture repository
+    │   ├── repo-cmd-injection/          # Vulnerability fixture repository
+    │   └── repo-race-condition/         # Concurrency defect repository
+    └── bug-finding-eval.test.ts         # Detection, reproduction, & fix evaluation
 ```
-
-with every transition, tool call, approval, failure, and verification result visible in the event stream.
 
 ---
 
-## 11. Final Guidance
-
-Claude Code/Codex-like maturity is not achieved by increasing thinking tokens alone. The differentiator is a controlled engineering loop:
+## 13. Recommended Implementation Roadmap & 8-Phase Priority Matrix
 
 ```text
-better evidence
-+ better orchestration
-+ safer tools
-+ stronger verification
-+ bounded recovery
-+ persistent observability
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│ P0 (Critical Foundation & Safety)                                                │
+│   Phase 1: Security Policy & Tool Execution Gateway                              │
+│   Phase 2: Real Token Telemetry & Model Gateway Usage                            │
+│   Phase 3: Shared Core Orchestrator, State Machine & Event Bus                   │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│ P1 (Verification, Quality & Intelligence)                                        │
+│   Phase 4: Verification Engine & Bounded Repair Loop                             │
+│   Phase 5: Evidence-First Debugging & Finding Engine                             │
+│   Phase 6: Context Manager & Structured Planning Engine                          │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│ P2 (Persistence, Testing & Multi-App Scale)                                      │
+│   Phase 7: Test Suite & Security Evaluation Corpus                               │
+│   Phase 8: SQLite Session Persistence & Monorepo App Bridge (Server/Desktop/Web)  │
+└──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Thinking effort should influence reasoning budget and agent execution profile, but it must never disable safety gates or allow unverified critical-bug claims. High effort should mean deeper investigation and verification, not merely a longer model response.
+### Phase Summary & Deliverables
+
+- **Phase 1 [P0] — Security Policy & Tool Execution Gateway**:
+  `CanonicalPathGuard` (`fs.realpathSync`), `CommandPolicy` (argument arrays), and `ToolExecutionGateway` in `@inflynx/tool-runtime`.
+- **Phase 2 [P0] — Real Token Telemetry & Model Gateway Usage**:
+  Extract prompt, completion, and DeepSeek/Anthropic reasoning tokens in `@inflynx/model-gateway`. Real-time cost estimation.
+- **Phase 3 [P0] — Shared Core Orchestrator & State Machine**:
+  `AgentOrchestrator`, `StateMachine`, `BudgetManager`, `ExecutionContext`, and typed `PublicAgentEvent` bus. Unify CLI and TUI.
+- **Phase 4 [P1] — Verification Engine & Bounded Repair Loop**:
+  Automated build/test checks, failure parser diagnostics, and repair loop anti-pattern guards.
+- **Phase 5 [P1] — Evidence-First Debugging & Finding Engine**:
+  `BugFinding` schema with mandatory reproduction evidence and `.inflynx/DEBUG_REPORT.md` synthesis.
+- **Phase 6 [P1] — Context Selection & Structured Planning Engine**:
+  `TaskClassifier`, BM25 + recency context compactor, and dependency-aware plan steps.
+- **Phase 7 [P2] — Test Suite & Security Evaluation Corpus**:
+  Vitest test runner setup, package unit tests, security attack payload fixtures, and bug-finding benchmark repos.
+- **Phase 8A [P2] — Relational Database Store (SQLite + PostgreSQL Dual Adapter)**:
+  SQLite embedded driver (`SqliteSessionStore`) for offline CLI/TUI and PostgreSQL driver (`PostgresSessionStore`) for `apps/server` multi-tenant server deployments. Stores sessions, turns, messages, tool execution logs, bug findings, and token telemetry.
+- **Phase 8B [P2] — Vector DB & Semantic Code Search Engine (`@inflynx/vector-store`)**:
+  Embedded `HnswVectorStore` (local) and `PgVectorStore` (PostgreSQL) for semantic code search, AST chunk indexing, and episodic agent memory.
+- **Phase 8C [P2] — Monorepo Multi-App WebSocket Server & Desktop Shell Bridge**:
+  Fastify WebSocket JSON-RPC server in `apps/server` broadcasting `@inflynx/protocol` events to `apps/desktop` and Vite React Web frontend (`fe/`).
+
+---
+
+## 14. Definition of Done for Production-Grade Maturity v1.0
+
+The Inflynx Agent runtime achieves Production-Grade Maturity v1.0 when:
+
+1. Both `apps/cli` and `apps/tui` run over the single `AgentOrchestrator` in `@inflynx/agent-core`.
+2. Every tool invocation passes through code-enforced canonical path guards and command policies.
+3. Every prompt, completion, and reasoning token is tracked accurately with real cost metrics.
+4. Complex multi-file tasks generate a structured plan and execute via two-phase atomic transactions.
+5. All code modifications undergo automated verification gates before completion reporting.
+6. Bug findings contain mandatory empirical evidence (reproduction commands, logs, line ranges).
+7. The monorepo test suite in `tests/` passes with 100% green status in CI.

@@ -1,0 +1,22 @@
+{
+  "name": "inflynx-server",
+  "version": "1.0.0",
+  "description": "Local HTTP and SSE streaming server for Inflynx Code",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@inflynx/agent-core": "workspace:*",
+    "@inflynx/cache": "workspace:*",
+    "@inflynx/config": "workspace:*",
+    "@inflynx/model-gateway": "workspace:*",
+    "@inflynx/policy-engine": "workspace:*",
+    "@inflynx/protocol": "workspace:*",
+    "@inflynx/session-store": "workspace:*",
+    "@inflynx/tool-runtime": "workspace:*"
+  }
+}
+

@@ -2,11 +2,12 @@ import { Link } from 'react-router-dom'
 
 export default function Footer() {
   const footerLinks = [
-    { label: 'Privacy', to: '#' },
-    { label: 'Terms', to: '#' },
-    { label: 'Security', to: '/#security' },
-    { label: 'Status', to: '#' },
-    { label: 'Contact', to: '#' },
+    { label: 'Architecture', to: '/architecture' },
+    { label: 'Security', to: '/security' },
+    { label: 'Status', to: '/status' },
+    { label: 'Privacy', to: '/privacy' },
+    { label: 'Terms', to: '/terms' },
+    { label: 'Contact', to: '/contact' },
   ]
 
   return (
@@ -94,13 +95,19 @@ export default function Footer() {
               color: 'var(--color-on-surface-variant)',
             }}
           >
-            © 2024 Inflynx Code. All rights reserved.
+            © 2026 Inflynx Code. All rights reserved.
           </span>
           <div style={{ display: 'flex', gap: 16 }}>
-            {['github', 'twitter', 'discord'].map(platform => (
+            {[
+              { id: 'github', label: 'GH', url: 'https://github.com' },
+              { id: 'twitter', label: 'TW', url: 'https://twitter.com' },
+              { id: 'discord', label: 'DC', url: 'https://discord.com' },
+            ].map(({ id, label, url }) => (
               <a
-                key={platform}
-                href="#"
+                key={id}
+                href={url}
+                target="_blank"
+                rel="noopener noreferrer"
                 style={{
                   width: 32,
                   height: 32,
@@ -128,7 +135,7 @@ export default function Footer() {
                   e.currentTarget.style.transform = 'translateY(0)'
                 }}
               >
-                {platform === 'github' ? 'GH' : platform === 'twitter' ? 'TW' : 'DC'}
+                {label}
               </a>
             ))}
           </div>

@@ -9,16 +9,16 @@ import HomePage from './pages/HomePage'
 import DashboardPage from './pages/DashboardPage'
 import PricingPage from './pages/PricingPage'
 import FeaturesPage from './pages/FeaturesPage'
+import ArchitecturePage from './pages/ArchitecturePage'
+import SecurityPage from './pages/SecurityPage'
+import StatusPage from './pages/StatusPage'
+import PrivacyPage from './pages/PrivacyPage'
+import TermsPage from './pages/TermsPage'
+import ContactPage from './pages/ContactPage'
 import SignUpPage from './pages/SignUpPage'
 import SignInPage from './pages/SignInPage'
 import OnboardingPage from './pages/OnboardingPage'
 import DocsPage from './pages/DocsPage'
-
-/* Pages that use the marketing layout (Navbar + Footer) */
-const MARKETING_ROUTES = ['/', '/features', '/pricing', '/docs']
-
-/* Pages that are fullscreen (no Navbar/Footer) */
-const FULLSCREEN_ROUTES = ['/signup', '/signin', '/onboarding', '/dashboard']
 
 function ScrollToTop() {
   const { pathname } = useLocation()
@@ -48,11 +48,7 @@ function NotFoundPage() {
   )
 }
 
-
-
 export default function App() {
-  const location = useLocation()
-
   return (
     <>
       <ScrollToTop />
@@ -75,6 +71,22 @@ export default function App() {
           }
         />
         <Route
+          path="/architecture"
+          element={
+            <MarketingLayout>
+              <ArchitecturePage />
+            </MarketingLayout>
+          }
+        />
+        <Route
+          path="/security"
+          element={
+            <MarketingLayout>
+              <SecurityPage />
+            </MarketingLayout>
+          }
+        />
+        <Route
           path="/pricing"
           element={
             <MarketingLayout>
@@ -87,6 +99,38 @@ export default function App() {
           element={
             <MarketingLayout>
               <DocsPage />
+            </MarketingLayout>
+          }
+        />
+        <Route
+          path="/status"
+          element={
+            <MarketingLayout>
+              <StatusPage />
+            </MarketingLayout>
+          }
+        />
+        <Route
+          path="/privacy"
+          element={
+            <MarketingLayout>
+              <PrivacyPage />
+            </MarketingLayout>
+          }
+        />
+        <Route
+          path="/terms"
+          element={
+            <MarketingLayout>
+              <TermsPage />
+            </MarketingLayout>
+          }
+        />
+        <Route
+          path="/contact"
+          element={
+            <MarketingLayout>
+              <ContactPage />
             </MarketingLayout>
           }
         />

@@ -29,11 +29,11 @@ const steps = [
 ]
 
 const providers = [
-  { id: 'deepseek', name: 'DeepSeek Coder V2', tag: 'Fast · Cheap', color: 'var(--color-tertiary)', selected: true },
-  { id: 'gemini', name: 'Gemini 2.5 Pro', tag: 'Massive context', color: 'var(--color-primary)', selected: true },
-  { id: 'claude', name: 'Claude 3.5 Sonnet', tag: 'Best for planning', color: 'var(--color-secondary)', selected: false },
-  { id: 'openai', name: 'GPT-4o', tag: 'Versatile', color: '#10a37f', selected: false },
-  { id: 'openrouter', name: 'OpenRouter', tag: 'All models', color: '#666', selected: false },
+  { id: 'claude', name: 'Claude Opus 5 / Sonnet 5', tag: 'Flagship planning & coding', color: 'var(--color-secondary)', selected: true },
+  { id: 'gemini', name: 'Gemini 3.8 Flash', tag: '1M+ context & native thinking', color: 'var(--color-primary)', selected: true },
+  { id: 'openai', name: 'GPT-6 Astra / GPT-5.6 Sol', tag: 'Frontier reasoning & computer use', color: '#10a37f', selected: true },
+  { id: 'deepseek', name: 'DeepSeek V4 Flash', tag: 'Ultra-fast MoE coding', color: 'var(--color-tertiary)', selected: true },
+  { id: 'openrouter', name: 'OpenRouter / Local', tag: 'Universal gateway & air-gapped BYOK', color: '#666', selected: false },
 ]
 
 export default function OnboardingPage() {
@@ -41,7 +41,7 @@ export default function OnboardingPage() {
   const [currentStep, setCurrentStep] = useState(0)
   const [workspace, setWorkspace] = useState('')
   const [repoUrl, setRepoUrl] = useState('')
-  const [enabledProviders, setEnabledProviders] = useState(new Set(['deepseek', 'gemini']))
+  const [enabledProviders, setEnabledProviders] = useState(new Set(['claude', 'gemini', 'openai', 'deepseek']))
   const [indexing, setIndexing] = useState(false)
   const [indexed, setIndexed] = useState(false)
 

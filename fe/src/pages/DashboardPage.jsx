@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 
 /* ── Sidebar link component ── */
 function SideLink({ icon, label, active, onClick }) {
@@ -7,7 +7,7 @@ function SideLink({ icon, label, active, onClick }) {
     <button
       onClick={onClick}
       className="sidebar-link"
-      style={{ width: '100%', background: 'none', border: 'none', fontFamily: 'var(--font-inter)', fontSize: 14, fontWeight: active ? 600 : 500, color: active ? 'var(--color-on-primary-container)' : 'var(--color-on-surface-variant)', background: active ? 'var(--color-primary-container)' : 'transparent', cursor: 'pointer' }}
+      style={{ width: '100%', border: 'none', fontFamily: 'var(--font-inter)', fontSize: 14, fontWeight: active ? 600 : 500, color: active ? 'var(--color-on-primary-container)' : 'var(--color-on-surface-variant)', background: active ? 'var(--color-primary-container)' : 'transparent', cursor: 'pointer' }}
     >
       <span className={`material-symbols-outlined ${active ? 'icon-fill' : ''}`} style={{ fontSize: 22 }}>{icon}</span>
       {label}
@@ -69,10 +69,10 @@ export default function DashboardPage() {
   ]
 
   const sessions = [
-    { icon: 'terminal', color: 'var(--color-tertiary)', bg: 'rgba(0,96,86,0.08)', title: 'Fix token refresh race condition', repo: 'core-auth-service', time: '2h ago', status: 'Completed' },
-    { icon: 'shield_lock', color: 'var(--color-secondary)', bg: 'rgba(99,70,200,0.08)', title: 'Audit shell security boundaries', repo: 'infrastructure-as-code', time: '5h ago', status: 'Completed' },
-    { icon: 'bug_report', color: 'var(--color-error)', bg: 'rgba(186,26,26,0.08)', title: 'Debug API rate limiter regression', repo: 'gateway-service', time: 'Yesterday', status: 'In Review' },
-    { icon: 'memory', color: 'var(--color-primary)', bg: 'rgba(0,74,198,0.08)', title: 'Optimize memory allocations in parser', repo: 'core-compiler', time: '2d ago', status: 'Completed' },
+    { icon: 'terminal', color: 'var(--color-tertiary)', bg: 'rgba(0,96,86,0.08)', title: 'Fix token refresh race condition', model: 'Claude Opus 5', repo: 'core-auth-service', time: '2h ago', status: 'Completed' },
+    { icon: 'shield_lock', color: 'var(--color-secondary)', bg: 'rgba(99,70,200,0.08)', title: 'Audit shell security boundaries', model: 'GPT-6 Astra', repo: 'infrastructure-as-code', time: '5h ago', status: 'Completed' },
+    { icon: 'bug_report', color: 'var(--color-error)', bg: 'rgba(186,26,26,0.08)', title: 'Debug API rate limiter regression', model: 'Gemini 3.8 Flash', repo: 'gateway-service', time: 'Yesterday', status: 'In Review' },
+    { icon: 'memory', color: 'var(--color-primary)', bg: 'rgba(0,74,198,0.08)', title: 'Optimize memory allocations in parser', model: 'DeepSeek V4 Flash', repo: 'core-compiler', time: '2d ago', status: 'Completed' },
   ]
 
   return (
@@ -301,11 +301,14 @@ export default function DashboardPage() {
           <section className="card animate-fade-in-up" style={{ overflow: 'hidden', animationDelay: '0.5s' }}>
             <div style={{ padding: '16px 24px', borderBottom: '1px solid var(--color-outline-variant)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(226,239,254,0.4)' }}>
               <h3 style={{ fontFamily: 'var(--font-geist)', fontWeight: 600, fontSize: 18, color: 'var(--color-on-surface)' }}>Recent Sessions</h3>
-              <Link to="#" style={{ fontFamily: 'var(--font-inter)', fontSize: 13, color: 'var(--color-primary)', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 4 }}>
+              <button
+                onClick={() => setActiveNav('sessions')}
+                style={{ background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'var(--font-inter)', fontSize: 13, color: 'var(--color-primary)', display: 'flex', alignItems: 'center', gap: 4 }}
+              >
                 View all <span className="material-symbols-outlined" style={{ fontSize: 16 }}>arrow_forward</span>
-              </Link>
+              </button>
             </div>
-            {sessions.map(({ icon, color, bg, title, repo, time, status }, i) => (
+            {sessions.map(({ icon, color, bg, title, model, repo, time, status }, i) => (
               <div
                 key={i}
                 style={{
@@ -326,7 +329,11 @@ export default function DashboardPage() {
                   </div>
                   <div>
                     <div style={{ fontFamily: 'var(--font-inter)', fontWeight: 600, fontSize: 14, color: 'var(--color-on-surface)', marginBottom: 2 }}>{title}</div>
-                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--color-on-surface-variant)' }}>repository: {repo}</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--color-on-surface-variant)' }}>
+                      <span>repo: {repo}</span>
+                      <span>•</span>
+                      <span style={{ color: 'var(--color-primary)', fontWeight: 600 }}>{model}</span>
+                    </div>
                   </div>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>

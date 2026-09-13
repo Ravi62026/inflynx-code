@@ -3,7 +3,6 @@ import { Link, useNavigate } from 'react-router-dom'
 
 export default function SignUpPage() {
   const navigate = useNavigate()
-  const [step, setStep] = useState(1) // 1: form, 2: verify
   const [formData, setFormData] = useState({ name: '', email: '', password: '', plan: 'pro' })
   const [loading, setLoading] = useState(false)
   const [showPass, setShowPass] = useState(false)
@@ -88,9 +87,9 @@ export default function SignUpPage() {
           <ul style={{ listStyle: 'none', display: 'flex', flexDirection: 'column', gap: 16 }}>
             {[
               { icon: 'account_tree', text: 'Dependency graph across your entire repo' },
-              { icon: 'compress', text: '200k context window with smart compression' },
+              { icon: 'compress', text: '1M+ context window with smart ZSTD compression' },
               { icon: 'view_in_ar', text: 'Docker-sandboxed execution — no host access' },
-              { icon: 'route', text: 'Multi-provider routing: Claude, Gemini, DeepSeek' },
+              { icon: 'route', text: 'Frontier multi-provider routing: Claude Opus 5, GPT-6 Astra, Gemini 3.8 Flash' },
               { icon: 'shield', text: 'Automatic secret redaction before any LLM call' },
             ].map(({ icon, text }) => (
               <li key={text} style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -281,9 +280,9 @@ export default function SignUpPage() {
 
             <p style={{ fontFamily: 'var(--font-inter)', fontSize: 12, color: 'var(--color-on-surface-variant)', textAlign: 'center', lineHeight: 1.5 }}>
               By continuing you agree to our{' '}
-              <Link to="#" style={{ color: 'var(--color-primary)', textDecoration: 'none' }}>Terms</Link>
+              <Link to="/terms" style={{ color: 'var(--color-primary)', textDecoration: 'none' }}>Terms</Link>
               {' '}and{' '}
-              <Link to="#" style={{ color: 'var(--color-primary)', textDecoration: 'none' }}>Privacy Policy</Link>.
+              <Link to="/privacy" style={{ color: 'var(--color-primary)', textDecoration: 'none' }}>Privacy Policy</Link>.
             </p>
           </form>
         </div>

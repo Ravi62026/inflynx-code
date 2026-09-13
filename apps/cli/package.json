@@ -22,9 +22,11 @@
     "@inflynx/patch-engine": "workspace:*",
     "@inflynx/policy-engine": "workspace:*",
     "@inflynx/protocol": "workspace:*",
+    "@inflynx/session-store": "workspace:*",
     "@inflynx/skill-runtime": "workspace:*",
     "@inflynx/tool-runtime": "workspace:*",
     "@inflynx/ui-components": "workspace:*",
+    "@inflynx/vector-store": "workspace:*",
     "@inflynx/workspace-runtime": "workspace:*",
     "inquirer": "^13.3.2"
   },

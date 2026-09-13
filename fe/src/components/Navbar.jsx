@@ -14,8 +14,8 @@ export default function Navbar() {
 
   const links = [
     { to: '/features', label: 'Product' },
-    { to: '/#architecture', label: 'Architecture' },
-    { to: '/#security', label: 'Security' },
+    { to: '/architecture', label: 'Architecture' },
+    { to: '/security', label: 'Security' },
     { to: '/pricing', label: 'Pricing' },
     { to: '/docs', label: 'Docs' },
   ]
@@ -32,10 +32,10 @@ export default function Navbar() {
     >
       {/* Announcement Banner */}
       <div className="announcement-banner text-sm">
-        <a
-          href="#"
+        <Link
+          to="/features"
           className="flex items-center gap-2 text-[var(--color-on-surface)] hover:text-[var(--color-primary)] transition-colors"
-          style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}
+          style={{ fontFamily: 'var(--font-mono)', fontSize: 13, textDecoration: 'none' }}
         >
           <span
             style={{
@@ -51,9 +51,9 @@ export default function Navbar() {
           >
             v2.4.0
           </span>
-          New: Multi-Provider Routing (Claude 3.5 Sonnet + Gemini 1.5 Pro)
+          New: Frontier Multi-Provider Engine — Claude Opus 5 · GPT-6 Astra · Gemini 3.8 Flash
           <span className="material-symbols-outlined" style={{ fontSize: 16 }}>arrow_forward</span>
-        </a>
+        </Link>
       </div>
 
       {/* Main Navbar */}

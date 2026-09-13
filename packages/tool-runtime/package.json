@@ -10,6 +10,8 @@
     "clean": "rimraf dist"
   },
   "dependencies": {
-    "@inflynx/patch-engine": "workspace:*"
+    "@inflynx/cache": "workspace:*",
+    "@inflynx/patch-engine": "workspace:*",
+    "@inflynx/policy-engine": "workspace:*"
   }
 }

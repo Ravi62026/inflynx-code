@@ -27,7 +27,7 @@ const features = [
     title: 'Intelligent Context Packing',
     category: 'Context Engine',
     desc: 'The agent never blindly dumps files into context. Inflynx uses proximity scoring, semantic distance, and compression to serve exactly the right context at the right moment.',
-    details: ['ZSTD compression for distant deps', 'Pinned file priority system', 'Token budget enforcement', 'Auto-summarization of stale context'],
+    details: ['ZSTD stream compression for distant deps', '1M+ token budget enforcement', 'Pinned file priority system', 'Auto-summarization of stale context'],
     color: 'var(--color-secondary)',
     mockup: 'context',
   },
@@ -44,8 +44,8 @@ const features = [
     icon: 'route',
     title: 'Multi-Provider Routing',
     category: 'Model Gateway',
-    desc: 'Send different subtasks to different models within a single agentic session. Planning to Claude, search to Gemini, implementation to DeepSeek — all with one command.',
-    details: ['Per-task model selection', 'Provider fallback chains', 'Cost-aware routing heuristics', 'BYOK for all providers'],
+    desc: 'Send different subtasks to different models within a single agentic session. Planning to Claude Opus 5, reasoning to GPT-6 Astra, symbol tracing to Gemini 3.8 Flash, and implementation to DeepSeek V4 Flash — all with one command.',
+    details: ['Per-task frontier model selection', 'Provider fallback chains', 'Cost-aware routing heuristics', 'Universal BYOK for all frontier providers'],
     color: 'var(--color-primary)',
     mockup: 'routing',
   },
@@ -132,9 +132,10 @@ const mockups = {
   routing: (
     <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
       {[
-        { tag: '@claude-plan', task: 'Architectural refactor', color: 'var(--color-secondary)' },
-        { tag: '@gemini-search', task: 'Cross-repo symbol search', color: 'var(--color-primary)' },
-        { tag: '@deepseek-impl', task: 'Isolated fn implementation', color: 'var(--color-tertiary)' },
+        { tag: '@claude-opus', task: 'Architectural refactor & planning', color: 'var(--color-secondary)' },
+        { tag: '@gpt-6-astra', task: 'Frontier multi-step reasoning', color: '#10a37f' },
+        { tag: '@gemini-trace', task: '1M+ context symbol tracing', color: 'var(--color-primary)' },
+        { tag: '@deepseek-v4', task: 'Isolated fn & unit test synthesis', color: 'var(--color-tertiary)' },
       ].map(({ tag, task, color }) => (
         <div key={tag} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', background: 'var(--color-surface-container)', borderRadius: 8, fontFamily: 'var(--font-mono)', fontSize: 12 }}>
           <span style={{ color: 'var(--color-on-surface-variant)' }}>{task}</span>

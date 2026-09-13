@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@inflynx/config": "workspace:*",
+    "@inflynx/policy-engine": "workspace:*",
     "@inflynx/tool-runtime": "workspace:*"
   },
   "devDependencies": {

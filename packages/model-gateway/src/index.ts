@@ -1,334 +1,70 @@
 /**
  * @inflynx/model-gateway
- * Unified streaming model gateway interface & cost optimization router.
+ * Provider-correct, normalized streaming model gateway.
+ *
+ * Each adapter converts its native request/response protocol into the common
+ * ModelEvent stream consumed by AgentOrchestrator. Provider continuation
+ * metadata is carried separately on Message.provider_metadata so tool loops
+ * can replay opaque reasoning/signature state without exposing credentials.
  */
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+export {
+  type CustomModelCapabilities,
+  type FinishReason,
+  type Message,
+  type ModelAdapter,
+  type ModelEvent,
+  type ModelRequest,
+  type ProviderId,
+  type ProviderMetadata,
+  type ReasoningEffort,
+  type TokenUsage,
+  type ToolCallMessage,
+} from "./types.js";
+import type { ModelEvent, ModelRequest } from "./types.js";
+import { streamAnthropic } from "./anthropic.js";
+import { streamGemini } from "./gemini.js";
+import { streamOpenAiCompatible } from "./openai-chat.js";
+import { streamOpenAiResponses } from "./openai-responses.js";
 
-export interface TokenUsage {
-  promptTokens: number;
-  completionTokens: number;
-  totalTokens: number;
-  estimatedCostUsd?: number;
-  /** Tokens consumed by internal reasoning/thinking (e.g. Anthropic output_tokens_details.thinking_tokens, DeepSeek reasoning_tokens). */
-  reasoningTokens?: number;
-}
+export { estimateTokenUsageCost, PROVIDER_PRICING_TABLE, type ModelPricing } from "./usage-tracker.js";
+export { formatAnthropicMessages, formatAnthropicTools, streamAnthropic } from "./anthropic.js";
+export { formatGeminiContents, streamGemini } from "./gemini.js";
+export { formatOpenAiCompatibleMessages, streamOpenAiCompatible } from "./openai-chat.js";
+export { formatOpenAiResponsesInput, streamOpenAiResponses } from "./openai-responses.js";
 
-export type ModelEvent =
-  | { type: "text_delta"; text: string }
-  | { type: "thought_delta"; thought: string }
-  | { type: "tool_call"; id: string; name: string; args: Record<string, unknown> }
-  | { type: "done"; usage: TokenUsage; finishReason: string };
-
-export interface Message {
-  role: "system" | "user" | "assistant" | "tool";
-  content: string;
-  reasoning_content?: string;
-  tool_call_id?: string;
-  tool_calls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>;
-}
-
-export interface ModelRequest {
-  provider: "google" | "openai" | "anthropic" | "deepseek" | "openrouter" | "ollama";
-  model: string;
-  messages: Message[];
-  tools?: object[];
-  temperature?: number;
-  maxTokens?: number;
-  thinkingBudget?: number;
-  apiKey?: string;
-  baseURL?: string;
-}
-
-// ─── Anthropic Native Messages API ───────────────────────────────────────────
-
-export async function* streamAnthropic(request: ModelRequest, signal?: AbortSignal): AsyncIterable<ModelEvent> {
-  const apiKey = request.apiKey || process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) throw new Error("Anthropic API key missing");
-
-  const systemMessage = request.messages.find((m) => m.role === "system")?.content || "You are Inflynx Agent.";
-  const conversationMessages = request.messages
-    .filter((m) => m.role !== "system")
-    .map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content }));
-
-  const body: Record<string, unknown> = {
-    model: request.model || "claude-3-5-sonnet-20241022",
-    system: systemMessage,
-    messages: conversationMessages,
-    max_tokens: request.maxTokens ?? 4096,
-    stream: true,
-  };
-
-  if (request.tools && request.tools.length > 0) {
-    body.tools = request.tools;
-  }
-
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify(body),
-    signal,
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`ANTHROPIC API error (${response.status}): ${errorText}`);
-  }
-
-  if (!response.body) throw new Error("No response body from Anthropic");
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let currentToolId = "";
-  let currentToolName = "";
-  let currentToolInput = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || !trimmed.startsWith("data: ")) continue;
-      try {
-        const parsed = JSON.parse(trimmed.slice(6));
-        if (parsed.type === "content_block_start" && parsed.content_block?.type === "tool_use") {
-          currentToolId = parsed.content_block.id;
-          currentToolName = parsed.content_block.name;
-          currentToolInput = "";
-        } else if (parsed.type === "content_block_delta") {
-          if (parsed.delta?.type === "text_delta") {
-            yield { type: "text_delta", text: parsed.delta.text };
-          } else if (parsed.delta?.type === "input_json_delta") {
-            currentToolInput += parsed.delta.partial_json;
-          }
-        } else if (parsed.type === "content_block_stop" && currentToolName) {
-          try {
-            const args = JSON.parse(currentToolInput || "{}");
-            yield { type: "tool_call", id: currentToolId, name: currentToolName, args };
-          } catch {
-            yield { type: "tool_call", id: currentToolId, name: currentToolName, args: { raw: currentToolInput } };
-          }
-          currentToolName = "";
-          currentToolInput = "";
-        } else if (parsed.type === "message_stop") {
-          yield { type: "done", usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, finishReason: "stop" };
-          return;
-        }
-      } catch { /* ignore partial chunk */ }
-    }
-  }
-
-  yield { type: "done", usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, finishReason: "stop" };
-}
-
-// ─── OpenAI-Compatible Streaming (DeepSeek, OpenRouter, OpenAI, Gemini) ──────
-
-export async function* streamOpenAiCompatible(request: ModelRequest, signal?: AbortSignal): AsyncIterable<ModelEvent> {
-  const provider = request.provider;
-  let baseURL = request.baseURL;
-  let apiKey = request.apiKey;
-
-  if (provider === "deepseek") {
-    baseURL = baseURL || "https://api.deepseek.com";
-    apiKey = apiKey || process.env.DEEPSEEK_API_KEY;
-  } else if (provider === "google") {
-    baseURL = baseURL || "https://generativelanguage.googleapis.com/v1beta/openai";
-    apiKey = apiKey || process.env.GOOGLE_API_KEY;
-  } else if (provider === "openrouter") {
-    baseURL = baseURL || "https://openrouter.ai/api/v1";
-    apiKey = apiKey || process.env.OPENROUTER_API_KEY;
-  } else if (provider === "openai") {
-    baseURL = baseURL || "https://api.openai.com/v1";
-    apiKey = apiKey || process.env.OPENAI_API_KEY;
-  }
-
-  if (!apiKey) throw new Error(`API key missing for provider: ${provider}`);
-
-  const url = `${(baseURL || "https://api.deepseek.com").replace(/\/+$/, "")}/chat/completions`;
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    "Authorization": `Bearer ${apiKey}`,
-  };
-
-  if (provider === "openrouter") {
-    headers["HTTP-Referer"] = "https://github.com/inflynx-cloud/inflynx-code";
-    headers["X-Title"] = "Inflynx Code Agent";
-  }
-
-  // Format messages for OpenAI: inject tool results and DeepSeek R1 reasoning_content
-  const formattedMessages = request.messages.map((m) => {
-    if (m.role === "tool") {
-      return { role: "tool", content: m.content, tool_call_id: m.tool_call_id || "tool" };
-    }
-    if (m.role === "assistant") {
-      const msgObj: Record<string, unknown> = {
-        role: "assistant",
-        content: m.content || null,
-      };
-      if (m.reasoning_content) {
-        msgObj.reasoning_content = m.reasoning_content;
-      }
-      if (m.tool_calls && m.tool_calls.length > 0) {
-        msgObj.tool_calls = m.tool_calls;
-      }
-      return msgObj;
-    }
-    return { role: m.role, content: m.content };
-  });
-
-  const body: Record<string, unknown> = {
-    model: request.model,
-    messages: formattedMessages,
-    stream: true,
-    temperature: request.temperature ?? 0,
-    max_tokens: request.maxTokens ?? 4096,
-  };
-
-  if (request.tools && request.tools.length > 0) {
-    body.tools = request.tools;
-    body.tool_choice = "auto";
-  }
-
-  let response: Response | undefined;
-  let lastFetchError: Error | undefined;
-
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal });
-      if (response.ok) break;
-      // If 5xx server error or rate-limited (429), retry after delay
-      if (response.status === 429 || response.status >= 500) {
-        if (attempt < 3) {
-          await new Promise((r) => setTimeout(r, attempt * 1000));
-          continue;
-        }
-      }
+export async function* streamModel(
+  request: ModelRequest,
+  signal?: AbortSignal
+): AsyncIterable<ModelEvent> {
+  switch (request.adapter) {
+    case "openai-responses":
+      yield* streamOpenAiResponses(request, signal);
+      return;
+    case "anthropic-messages":
+      yield* streamAnthropic(request, signal);
+      return;
+    case "gemini-generate-content":
+      yield* streamGemini(request, signal);
+      return;
+    case "openai-chat":
+      yield* streamOpenAiCompatible(request, signal);
+      return;
+    default:
       break;
-    } catch (err: any) {
-      lastFetchError = err;
-      if (attempt < 3 && !signal?.aborted) {
-        await new Promise((r) => setTimeout(r, attempt * 1000));
-      }
-    }
   }
 
-  if (!response) {
-    throw new Error(
-      `${provider.toUpperCase()} network connection failed: ${lastFetchError?.message || "fetch failed"}. ` +
-      `Please check your internet connection or network proxy status and try again.`
-    );
-  }
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`${provider.toUpperCase()} API error (${response.status}): ${errorText}`);
-  }
-
-  if (!response.body) throw new Error(`No response body from ${provider}`);
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  // Accumulate tool call delta
-  const toolCallAccumulator: Record<number, { id: string; name: string; args: string }> = {};
-  let toolCallsFlushed = false;
-
-  function* flushAccumulatedTools(): Generator<ModelEvent> {
-    if (toolCallsFlushed) return;
-    toolCallsFlushed = true;
-    for (const [, tc] of Object.entries(toolCallAccumulator)) {
-      if (!tc.id && !tc.name) continue;
-      const rawStr = (tc.args || "{}").trim();
-      let parsedArgs: Record<string, unknown>;
-      try {
-        parsedArgs = JSON.parse(rawStr);
-      } catch {
-        try {
-          const sanitized = rawStr.replace(/"([^"\\]*(\\.[^"\\]*)*)"/g, (match) => {
-            return match.replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t");
-          });
-          parsedArgs = JSON.parse(sanitized);
-        } catch {
-          parsedArgs = { raw: rawStr };
-        }
-      }
-      yield { type: "tool_call", id: tc.id, name: tc.name, args: parsedArgs };
-    }
-  }
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith(":")) continue;
-      if (trimmed === "data: [DONE]") {
-        yield* flushAccumulatedTools();
-        yield { type: "done", usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, finishReason: "stop" };
-        return;
-      }
-
-      if (trimmed.startsWith("data: ")) {
-        try {
-          const parsed = JSON.parse(trimmed.slice(6));
-          const delta = parsed.choices?.[0]?.delta;
-
-          if (delta?.content) {
-            yield { type: "text_delta", text: delta.content };
-          }
-          if (delta?.reasoning_content) {
-            yield { type: "thought_delta", thought: delta.reasoning_content };
-          }
-
-          // Accumulate tool call deltas (streaming JSON args)
-          if (delta?.tool_calls) {
-            for (const tc of delta.tool_calls) {
-              const idx = tc.index ?? 0;
-              if (!toolCallAccumulator[idx]) {
-                toolCallAccumulator[idx] = { id: tc.id || "", name: tc.function?.name || "", args: "" };
-              }
-              if (tc.id) toolCallAccumulator[idx].id = tc.id;
-              if (tc.function?.name) toolCallAccumulator[idx].name = tc.function.name;
-              if (tc.function?.arguments) toolCallAccumulator[idx].args += tc.function.arguments;
-            }
-          }
-
-          const finishReason = parsed.choices?.[0]?.finish_reason;
-          if (finishReason === "tool_calls") {
-            yield* flushAccumulatedTools();
-          }
-        } catch { /* ignore partial chunk */ }
-      }
-    }
-  }
-
-  yield* flushAccumulatedTools();
-  yield { type: "done", usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, finishReason: "stop" };
-}
-
-// ─── Unified Entry Point ──────────────────────────────────────────────────────
-
-export async function* streamModel(request: ModelRequest, signal?: AbortSignal): AsyncIterable<ModelEvent> {
-  if (request.provider === "anthropic") {
+  // Safe defaults for callers created before the capability catalog exists.
+  if (request.provider === "openai") {
+    yield* streamOpenAiResponses(request, signal);
+  } else if (request.provider === "anthropic") {
     yield* streamAnthropic(request, signal);
+  } else if (request.provider === "google") {
+    yield* streamGemini(request, signal);
   } else {
     yield* streamOpenAiCompatible(request, signal);
   }
 }
 
+/** Backwards-compatible entry point; DeepSeek now uses the generic adapter. */
 export const streamDeepSeek = streamModel;

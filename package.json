@@ -7,9 +7,17 @@
   "scripts": {
     "build": "pnpm -r run build",
     "dev": "pnpm --filter inflynx-agent run dev",
-    "dev:tui": "pnpm --filter inflynx-tui run dev",
-    "test": "pnpm -r run test",
-    "clean": "pnpm -r run clean"
+    "dev:server": "pnpm --filter inflynx-server run dev",
+    "test": "pnpm --filter inflynx-agent exec tsx ../../tests/run-all-tests.ts",
+    "test:unit": "pnpm --filter inflynx-agent exec tsx ../../tests/run-all-tests.ts --unit",
+    "test:integration": "pnpm --filter inflynx-agent exec tsx ../../tests/run-all-tests.ts --integration",
+    "test:all": "pnpm --filter inflynx-agent exec tsx ../../tests/run-all-tests.ts --all",
+    "typecheck": "tsc -p packages/config/tsconfig.json && tsc -p packages/model-gateway/tsconfig.json && tsc -p packages/protocol/tsconfig.json && tsc -p packages/policy-engine/tsconfig.json && tsc -p packages/tool-runtime/tsconfig.json && tsc -p packages/patch-engine/tsconfig.json && tsc -p packages/session-store/tsconfig.json && tsc -p packages/agent-core/tsconfig.json && tsc -p apps/cli/tsconfig.json && tsc -p apps/server/tsconfig.json",
+    "clean": "pnpm -r run clean",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f",
+    "docker:reset": "docker compose down -v"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",

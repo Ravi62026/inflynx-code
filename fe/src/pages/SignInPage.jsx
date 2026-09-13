@@ -37,9 +37,9 @@ export default function SignInPage() {
           {/* Recent activity preview */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             {[
-              { icon: 'check_circle', color: 'var(--color-tertiary-fixed)', text: 'Token refresh fix — Completed 2h ago' },
-              { icon: 'memory', color: 'var(--color-primary-fixed-dim)', text: 'Auth migration plan — Ready for review' },
-              { icon: 'pending', color: 'var(--color-secondary-fixed-dim)', text: 'Security audit — In progress' },
+              { icon: 'check_circle', color: 'var(--color-tertiary-fixed)', text: 'Claude Opus 5: Token refresh fix — Completed 2h ago' },
+              { icon: 'memory', color: 'var(--color-primary-fixed-dim)', text: 'GPT-6 Astra: Auth migration plan — Ready for review' },
+              { icon: 'pending', color: 'var(--color-secondary-fixed-dim)', text: 'Gemini 3.8 Flash: 1M AST security audit — In progress' },
             ].map(({ icon, color, text }) => (
               <div key={text} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', background: 'rgba(230,242,255,0.05)', borderRadius: 8, border: '1px solid rgba(195,198,215,0.1)' }}>
                 <span className="material-symbols-outlined" style={{ fontSize: 18, color }}>{icon}</span>
@@ -83,7 +83,7 @@ export default function SignInPage() {
             <div>
               <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
                 <label style={{ fontFamily: 'var(--font-inter)', fontWeight: 600, fontSize: 13, color: 'var(--color-on-surface)' }}>Password</label>
-                <Link to="#" style={{ fontFamily: 'var(--font-inter)', fontSize: 13, color: 'var(--color-primary)', textDecoration: 'none' }}>Forgot?</Link>
+                <Link to="/contact" style={{ fontFamily: 'var(--font-inter)', fontSize: 13, color: 'var(--color-primary)', textDecoration: 'none' }}>Forgot?</Link>
               </div>
               <div style={{ position: 'relative' }}>
                 <input className="input" type={showPass ? 'text' : 'password'} placeholder="Your password" required value={formData.password} onChange={e => setFormData(d => ({ ...d, password: e.target.value }))} style={{ paddingRight: 44 }} />

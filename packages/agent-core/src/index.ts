@@ -123,15 +123,6 @@ export interface TaskPlan {
   steps: TaskStep[];
 }
 
-export interface ContextItem {
-  id: string;
-  content: string;
-  priority: "pinned" | "high" | "medium" | "low" | "ephemeral";
-  category: "system" | "user" | "tool_result" | "file_content" | "error" | "plan";
-  tokens: number;
-  timestamp: number;
-  dependencyDistance?: number;
-}
 
 export function computeRelevanceScore(
   importance: number,
@@ -142,13 +133,36 @@ export function computeRelevanceScore(
   return (importance * recency * similarity) / (dependencyDistance + 1);
 }
 
-// ─── Planning Engine ──────────────────────────────────────────────────────────
+// ─── Shared Orchestrator & State Machine ──────────────────────────────────────
+export { AgentOrchestrator, type TurnResult } from "./orchestrator/AgentOrchestrator.js";
+export { StateMachine, LEGAL_STATE_TRANSITIONS } from "./orchestrator/StateMachine.js";
+export {
+  BudgetManager,
+  DEFAULT_EFFORT_PROFILES,
+  type AgentBudgetLevel,
+  type EffortLevel,
+  type EffortProfile,
+  type BudgetState,
+} from "./orchestrator/BudgetManager.js";
+export { ExecutionContext, type ExecutionOptions } from "./orchestrator/ExecutionContext.js";
+export { ApprovalProvider, type ToolApprovalRequest, type ApprovalHandler } from "./orchestrator/ApprovalProvider.js";
+
+// ─── Planning Engine & Context Manager ────────────────────────────────────────
 export { PlanEngine } from "./planning/PlanEngine.js";
 export type { ActivePlan, PlanStep, PlanStatus } from "./planning/PlanEngine.js";
+export { TaskClassifier, type TaskCategory, type TaskClassificationResult } from "./planning/TaskClassifier.js";
+export { ContextManager, type ContextItem } from "./context/ContextManager.js";
+export { StructuredPlanEngine, type StructuredStepSpec, type StructuredPlanSpec } from "./planning/StructuredPlan.js";
 
 // ─── Debug & Review Engine ───────────────────────────────────────────────────
 export { DebugEngine } from "./debug/DebugEngine.js";
 export type { DebugReportSummary } from "./debug/DebugEngine.js";
+export { FindingEngine, type BugFinding, type FindingSeverity, type FindingCategory, type FindingEvidence } from "./debug/FindingEngine.js";
+
+// ─── Verification Engine & Failure Repair Loop ────────────────────────────────
+export { VerificationEngine, type VerificationCheck, type VerificationResult, type SuiteSummary } from "./verification/VerificationEngine.js";
+export { FailureParser, type DiagnosticError } from "./verification/FailureParser.js";
+export { RepairLoop, type RepairSafetyCheckResult } from "./verification/RepairLoop.js";
 
 // ─── Codebase Graph & Mindmap Engine ─────────────────────────────────────────
 export { GraphEngine } from "./graph/GraphEngine.js";

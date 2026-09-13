@@ -5,6 +5,7 @@
 
 import { spawn, type ChildProcess } from "child_process";
 import { loadMcpConfig, saveMcpServerConfig, type McpServerConfig } from "@inflynx/config";
+import { CommandPolicy, validatePublicUrl } from "@inflynx/policy-engine";
 import type { ToolDefinition, ToolRegistry } from "@inflynx/tool-runtime";
 
 export interface ConnectedMcpServer {
@@ -86,11 +87,12 @@ export class McpClientManager {
       throw new Error(`MCP Stdio server "${config.id}" is missing 'command' setting.`);
     }
 
+    const parsedCommand = CommandPolicy.parseCommandToArgs(config.command);
     const env = { ...process.env, ...(config.env || {}) };
-    const proc = spawn(config.command, config.args || [], {
+    const proc = spawn(parsedCommand.executable, [...parsedCommand.args, ...(config.args || [])], {
       env,
       stdio: ["pipe", "pipe", "pipe"],
-      shell: true,
+      shell: false,
     });
 
     const serverObj: ConnectedMcpServer = {
@@ -191,10 +193,15 @@ export class McpClientManager {
 
     // Basic SSE endpoint probe for tools
     try {
-      const res = await fetch(config.url, {
+      const publicUrl = await validatePublicUrl(config.url);
+      const res = await fetch(publicUrl, {
         headers: { "Accept": "application/json, text/event-stream" },
+        redirect: "manual",
       });
 
+      if (res.status >= 300 && res.status < 400) {
+        throw new Error("Redirects are disabled by SSRF protection; configure the final public endpoint.");
+      }
       if (!res.ok) {
         throw new Error(`HTTP Error ${res.status}: ${res.statusText}`);
       }
@@ -222,7 +229,12 @@ export class McpClientManager {
             required: ["query"],
           },
           execute: async (args) => {
-            const fetchRes = await fetch(`${config.url}?query=${encodeURIComponent(String(args.query))}`);
+            const endpoint = await validatePublicUrl(config.url!);
+            endpoint.searchParams.set("query", String(args.query));
+            const fetchRes = await fetch(endpoint, { redirect: "manual" });
+            if (fetchRes.status >= 300 && fetchRes.status < 400) {
+              throw new Error("Redirects are disabled by SSRF protection.");
+            }
             return await fetchRes.text();
           },
         },
@@ -249,7 +261,8 @@ export class McpClientManager {
     return {
       name: qualifiedName,
       description: `[MCP: ${serverId}] ${rawTool.description || rawTool.name}`,
-      permissionLevel: "readwrite",
+      permissionLevel: rawTool.annotations?.readOnlyHint ? "readonly" : "readwrite",
+      isMutating: !rawTool.annotations?.readOnlyHint,
       origin: "mcp",
       serverName: serverId,
       parameters: params,

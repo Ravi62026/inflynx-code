@@ -6,6 +6,7 @@
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import { CanonicalPathGuard } from "@inflynx/policy-engine";
 
 // ─── Existing Types ───────────────────────────────────────────────────────────
 
@@ -244,8 +245,10 @@ export function computeUnifiedDiff(
 export class EditTransactionManager {
   private stagedPatches = new Map<string, FilePatch>();
   private currentTransactionId: string;
+  private readonly pathGuard: CanonicalPathGuard;
 
-  constructor() {
+  constructor(workspaceRoot: string = process.env.INFLYNX_WORKSPACE_ROOT || process.cwd()) {
+    this.pathGuard = new CanonicalPathGuard(workspaceRoot);
     this.currentTransactionId = `tx_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   }
 
@@ -257,9 +260,13 @@ export class EditTransactionManager {
    * Stages a surgical code patch for a file.
    */
   stagePatch(filePath: string, targetCode: string, replacementCode: string): FilePatch {
-    const root = process.env.INFLYNX_WORKSPACE_ROOT || process.cwd();
-    const absPath = path.isAbsolute(filePath) ? filePath : path.join(root, filePath);
+    const root = this.pathGuard.getWorkspaceRoot();
+    const absPath = this.pathGuard.validateAndResolve(filePath);
     const relPath = path.relative(root, absPath);
+
+    if (fs.existsSync(absPath) && fs.lstatSync(absPath).isDirectory()) {
+      throw new Error(`Cannot patch file: "${absPath}" is an existing directory.`);
+    }
 
     const oldContent = fs.existsSync(absPath) ? fs.readFileSync(absPath, "utf-8") : "";
     const patchResult = applySurgicalPatch(oldContent, targetCode, replacementCode);
@@ -283,12 +290,12 @@ export class EditTransactionManager {
    * Stages a full file write for multi-file transactions.
    */
   stageFileWrite(filePath: string, newContent: string): FilePatch {
-    const root = process.env.INFLYNX_WORKSPACE_ROOT || process.cwd();
-    const absPath = path.isAbsolute(filePath) ? filePath : path.join(root, filePath);
+    const root = this.pathGuard.getWorkspaceRoot();
+    const absPath = this.pathGuard.validateAndResolve(filePath);
     const relPath = path.relative(root, absPath);
 
     // Guard: if path exists but is a directory, raise clear error
-    if (fs.existsSync(absPath) && fs.statSync(absPath).isDirectory()) {
+    if (fs.existsSync(absPath) && fs.lstatSync(absPath).isDirectory()) {
       throw new Error(
         `Cannot write file: "${absPath}" is an existing directory. ` +
         `Check the path — you may have passed a directory path instead of a file path.`
@@ -334,6 +341,12 @@ export class EditTransactionManager {
     try {
       // Phase 1: Write all new contents to .inflynx_tmp files
       for (const patch of patches) {
+        // Re-resolve immediately before touching disk. This protects the
+        // transaction from a symlink being introduced after staging.
+        const resolvedPath = this.pathGuard.validateAndResolve(patch.absolutePath);
+        if (resolvedPath !== patch.absolutePath) {
+          throw new Error(`Path changed during transaction for ${patch.filePath}`);
+        }
         fs.mkdirSync(path.dirname(patch.absolutePath), { recursive: true });
         const tmpPath = patch.absolutePath + `.inflynx_tmp_${Date.now()}`;
         fs.writeFileSync(tmpPath, patch.newContent, "utf-8");

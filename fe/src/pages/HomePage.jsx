@@ -229,7 +229,7 @@ export default function HomePage() {
               <div style={{ width: 1, height: 44, background: 'var(--color-outline-variant)' }} />
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--color-on-surface-variant)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Context Window</span>
-                <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: 16, color: 'var(--color-primary)' }}>200k+ Tokens</span>
+                <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: 16, color: 'var(--color-primary)' }}>1M+ Tokens</span>
               </div>
             </div>
           </div>
@@ -467,10 +467,10 @@ export default function HomePage() {
                 <div style={{ background: '#121d27', borderRadius: 6, padding: '6px 10px', border: '1px solid rgba(195, 198, 215, 0.1)' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', fontFamily: 'var(--font-mono)', fontSize: 10, color: 'rgba(230, 242, 255, 0.5)', marginBottom: 4 }}>
                     <span>Context Window Assembled</span>
-                    <span style={{ fontWeight: 600, color: 'var(--color-primary-fixed-dim)' }}>12,450 / 200,000 Tokens</span>
+                    <span style={{ fontWeight: 600, color: 'var(--color-primary-fixed-dim)' }}>18,450 / 1,000,000 Tokens</span>
                   </div>
                   <div className="progress-bar" style={{ height: 4 }}>
-                    <div className="progress-fill" style={{ width: '38%' }} />
+                    <div className="progress-fill" style={{ width: '28%' }} />
                   </div>
                 </div>
               </div>
@@ -498,7 +498,7 @@ export default function HomePage() {
             { value: 2400, suffix: '+', label: 'Engineers using Inflynx' },
             { value: 98, suffix: '%', label: 'Patch success rate' },
             { value: 70, suffix: '%', label: 'Token cost reduction' },
-            { value: 200, suffix: 'k', label: 'Context window tokens' },
+            { value: 1, suffix: 'M+', label: 'Frontier context window' },
           ].map(({ value, suffix, label }) => (
             <div key={label} style={{ textAlign: 'center', display: 'flex', flexDirection: 'column', gap: 4 }}>
               <span style={{ fontFamily: 'var(--font-geist)', fontWeight: 700, fontSize: 36, color: 'var(--color-primary)', letterSpacing: '-0.03em' }}>
@@ -620,15 +620,16 @@ export default function HomePage() {
               Model Agnostic Execution.
             </h2>
             <p style={{ fontFamily: 'var(--font-inter)', fontSize: 16, lineHeight: 1.7, color: 'var(--color-on-surface-variant)' }}>
-              Different tasks require different cognitive architectures. Route sub-tasks between Claude, Gemini, and DeepSeek within a single session seamlessly.
+              Different tasks require different cognitive architectures. Route sub-tasks between Claude Opus 5, GPT-6 Astra, Gemini 3.8 Flash, and DeepSeek V4 Flash within a single session seamlessly.
             </p>
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 16, width: '100%' }}>
             {[
-              { letter: 'C', label: 'Claude 3.5 Sonnet', desc: 'Best for complex architectural planning and precise refactoring.', tag: '@claude-plan', color: 'var(--color-secondary)', barColor: 'var(--color-secondary-container)', delay: '0s' },
-              { letter: 'G', label: 'Gemini 2.5 Pro', desc: 'Best for massive context analysis and cross-repo symbol tracing.', tag: '@gemini-search', color: 'var(--color-primary)', barColor: 'var(--color-primary)', delay: '0.15s' },
-              { letter: 'D', label: 'DeepSeek Coder V2', desc: 'Best for rapid, low-latency implementation of isolated functions.', tag: '@deepseek-impl', color: 'var(--color-tertiary)', barColor: 'var(--color-tertiary)', delay: '0.3s' },
+              { letter: 'C', label: 'Claude Opus 5 / Sonnet 5', desc: 'Best for complex architectural planning, deep reasoning, and precise refactoring.', tag: '@claude-opus', color: 'var(--color-secondary)', barColor: 'var(--color-secondary-container)', delay: '0s' },
+              { letter: 'O', label: 'GPT-6 Astra / GPT-5.6 Sol', desc: 'Best for frontier multi-step reasoning, autonomous execution, and computer use.', tag: '@gpt-6-astra', color: '#10a37f', barColor: '#10a37f', delay: '0.1s' },
+              { letter: 'G', label: 'Gemini 3.8 Flash', desc: 'Best for 1M+ token context analysis, native thinking, and cross-repo symbol tracing.', tag: '@gemini-trace', color: 'var(--color-primary)', barColor: 'var(--color-primary)', delay: '0.2s' },
+              { letter: 'D', label: 'DeepSeek V4 Flash', desc: 'Best for ultra-low latency isolated code synthesis and MoE unit test generation.', tag: '@deepseek-v4', color: 'var(--color-tertiary)', barColor: 'var(--color-tertiary)', delay: '0.3s' },
             ].map(({ letter, label, desc, tag, color, barColor, delay }) => (
               <div
                 key={label}
@@ -714,7 +715,7 @@ export default function HomePage() {
               code: 'Sandbox Exec         PASS\nRunning `npm run test:auth`...\n✓ 14 passing (42ms)\n✓ 0 vulnerabilities found',
               delay: '0.3s',
             },
-          ].map(({ phase, icon, color, desc, code, delay }, i) => (
+          ].map(({ phase, icon, color, desc, code, delay }) => (
             <div
               key={phase}
               style={{
@@ -839,7 +840,7 @@ export default function HomePage() {
               <div style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 12, fontFamily: 'var(--font-mono)', fontSize: 12 }}>
                 {[
                   { time: '14:02:11', tag: '[SECRETS]', tagColor: 'var(--color-tertiary-fixed)', text: 'Redacted `AWS_ACCESS_KEY` from prompt payload.' },
-                  { time: '14:02:12', tag: '[ROUTING]', tagColor: 'var(--color-primary-fixed-dim)', text: 'Dispatching to Claude 3.5 Sonnet (us-east-1).' },
+                  { time: '14:02:12', tag: '[ROUTING]', tagColor: 'var(--color-primary-fixed-dim)', text: 'Dispatching to Claude Opus 5 (us-east-1).' },
                   { time: '14:02:18', tag: '[SANDBOX]', tagColor: 'var(--color-secondary-fixed-dim)', text: 'Container `inflynx-exec-49f2` created. Network: None.' },
                   { time: '14:02:19', tag: '[SANDBOX]', tagColor: 'var(--color-secondary-fixed-dim)', text: "Executed: `npm run lint`. Status: 0." },
                   { time: '14:02:22', tag: '[APPROVE]', tagColor: 'var(--color-primary-fixed-dim)', text: 'User `admin@org.com` signed off on patch `f4a81b`.', highlight: true },

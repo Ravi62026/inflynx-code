@@ -1,0 +1,50 @@
+name: inflynx-code
+
+# Inflynx Code — Local Development Infrastructure
+# Bring up: pnpm docker:up   |   Tear down: pnpm docker:down   |   Wipe data: pnpm docker:reset
+#
+# Provides:
+#   - PostgreSQL: canonical session/message/tool-execution/telemetry store (@inflynx/session-store)
+#   - Redis:      tool/API rate-limiting + forward-compatible event pub/sub (@inflynx/cache)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: inflynx-code-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-inflynx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-inflynx_dev_pw}
+      POSTGRES_DB: ${POSTGRES_DB:-inflynx_code}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - inflynx_code_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-inflynx} -d ${POSTGRES_DB:-inflynx_code}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    container_name: inflynx-code-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - inflynx_code_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 3s
+
+volumes:
+  inflynx_code_pgdata:
+    name: inflynx_code_pgdata
+  inflynx_code_redisdata:
+    name: inflynx_code_redisdata
