@@ -10,8 +10,11 @@ import { BudgetMeter } from "./components/BudgetMeter.js";
 import type {
   AgentMode,
   BudgetStatePayload,
+  ModelInfo,
+  ReasoningEffort,
   ToWebviewMessage,
   ToolApprovalRequestPayload,
+  AttachmentPayload,
 } from "../types.js";
 
 interface MessageEntry {
@@ -20,6 +23,7 @@ interface MessageEntry {
   content: string;
   thought?: string;
   tools?: ToolCallState[];
+  attachments?: AttachmentPayload[];
 }
 
 function hydrateMessages(loadedMsgs: any[], toolExecutions: any[] = []): MessageEntry[] {
@@ -42,6 +46,7 @@ function hydrateMessages(loadedMsgs: any[], toolExecutions: any[] = []): Message
         id: m.id || `user_${i}`,
         role: "user",
         content: m.content || "",
+        attachments: m.attachments,
       });
       continue;
     }
@@ -130,6 +135,8 @@ export const App: React.FC = () => {
   const [activeMode, setActiveMode] = useState<AgentMode>("agent");
   const [activeModel, setActiveModel] = useState<string>("openai/gpt-5.6-luna");
   const [activeProvider, setActiveProvider] = useState<string>("openrouter");
+  const [activeEffort, setActiveEffort] = useState<ReasoningEffort>("high");
+  const [modelsCatalog, setModelsCatalog] = useState<ModelInfo[]>([]);
   const [budget, setBudget] = useState<BudgetStatePayload | undefined>();
   const [isConnected, setIsConnected] = useState<boolean>(false);
 
@@ -228,12 +235,31 @@ export const App: React.FC = () => {
           setBudget(msg.payload);
           break;
 
+        case "models.loaded": {
+          const raw = msg.payload.catalog;
+          let list: ModelInfo[] = [];
+          if (Array.isArray(raw)) {
+            list = raw;
+          } else if (raw && typeof raw === "object") {
+            list = Object.values(raw).flat() as ModelInfo[];
+          }
+          setModelsCatalog(list);
+          break;
+        }
+
+        case "effort.changed":
+          setActiveEffort(msg.payload.effort);
+          break;
+
         case "session.loaded": {
           const { session, messages: loadedMsgs, toolExecutions } = msg.payload;
           setSessionId(session.sessionId);
           setActiveMode(session.activeMode || "agent");
           setActiveModel(session.model || "openai/gpt-5.6-luna");
           setActiveProvider(session.providerId || "openrouter");
+          if (session.reasoningEffort) {
+            setActiveEffort(session.reasoningEffort);
+          }
 
           const mapped = hydrateMessages(loadedMsgs, toolExecutions);
           setMessages(mapped);
@@ -448,29 +474,43 @@ export const App: React.FC = () => {
     return () => window.removeEventListener("message", handleMessage);
   }, []);
 
-  const handleSendPrompt = useCallback((prompt: string) => {
-    isAutoScrollActiveRef.current = true;
-    setShowJumpBottomBtn(false);
-    setIsRunning(true);
-    setPendingApproval(null);
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `user_${Date.now()}`,
-        role: "user",
-        content: prompt,
-      },
-      {
-        id: `assist_${Date.now()}`,
-        role: "assistant",
-        content: "",
-        thought: "",
-        tools: [],
-      },
-    ]);
-    post({ type: "send.prompt", payload: { prompt } });
-    requestAnimationFrame(() => scrollToBottom(false));
-  }, [post, scrollToBottom]);
+  const handleSendPrompt = useCallback(
+    (prompt: string, attachments?: AttachmentPayload[]) => {
+      isAutoScrollActiveRef.current = true;
+      setShowJumpBottomBtn(false);
+      setIsRunning(true);
+      setPendingApproval(null);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `user_${Date.now()}`,
+          role: "user",
+          content: prompt,
+          attachments,
+        },
+        {
+          id: `assist_${Date.now()}`,
+          role: "assistant",
+          content: "",
+          thought: "",
+          tools: [],
+        },
+      ]);
+      post({
+        type: "send.prompt",
+        payload: {
+          prompt,
+          attachments,
+          mode: activeMode,
+          model: activeModel,
+          provider: activeProvider,
+          effort: activeEffort,
+        },
+      });
+      requestAnimationFrame(() => scrollToBottom(false));
+    },
+    [post, scrollToBottom, activeMode, activeModel, activeProvider, activeEffort]
+  );
 
   const handleAbort = useCallback(() => {
     post({ type: "abort.turn" });
@@ -479,6 +519,17 @@ export const App: React.FC = () => {
   const handleSelectMode = useCallback((mode: AgentMode) => {
     setActiveMode(mode);
     post({ type: "set.mode", payload: { mode } });
+  }, [post]);
+
+  const handleSelectModel = useCallback((model: string, provider: string) => {
+    setActiveModel(model);
+    setActiveProvider(provider);
+    post({ type: "set.model", payload: { model, provider } });
+  }, [post]);
+
+  const handleSelectEffort = useCallback((effort: ReasoningEffort) => {
+    setActiveEffort(effort);
+    post({ type: "set.effort", payload: { effort } });
   }, [post]);
 
   const handleApproveTool = useCallback((toolCallId: string) => {
@@ -504,17 +555,21 @@ export const App: React.FC = () => {
             <div className={`status-dot ${isConnected ? "" : "offline"}`} />
             <span>INFLYNX</span>
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-            <ModelBadge
-              model={activeModel}
-              provider={activeProvider}
-              onClick={() => post({ type: "request.models" })}
-            />
+          <div className="header-right-actions">
             <BudgetMeter budget={budget} />
+            <button
+              className="header-action-btn"
+              onClick={() => post({ type: "create.session" })}
+              title="New Session"
+              aria-label="New Session"
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="12" y1="5" x2="12" y2="19" />
+                <line x1="5" y1="12" x2="19" y2="12" />
+              </svg>
+            </button>
           </div>
         </div>
-
-        <ModeSelector currentMode={activeMode} onSelectMode={handleSelectMode} />
       </div>
 
       {!isConnected && (
@@ -538,12 +593,25 @@ export const App: React.FC = () => {
         onWheel={handleWheel}
       >
         {messages.length === 0 ? (
-          <div style={{ textAlign: "center", marginTop: "40px", opacity: 0.6, fontSize: "12px" }}>
-            <div style={{ fontSize: "28px", marginBottom: "8px" }}>⚡</div>
-            <div style={{ fontWeight: 600 }}>Welcome to Inflynx Code</div>
-            <div style={{ marginTop: "4px" }}>Autonomous AI coding agent in VS Code</div>
-            <div style={{ marginTop: "12px", fontSize: "11px", opacity: 0.8 }}>
-              Try: <code>Explain this codebase</code> or <code>Add unit tests for user service</code>
+          <div className="empty-state-hero">
+            <div className="empty-hero-icon">⚡</div>
+            <h2 className="empty-hero-title">inflynx-code</h2>
+            <p className="empty-hero-subtitle">Autonomous coding agent in VS Code</p>
+            <div className="empty-hero-suggestions">
+              <button
+                type="button"
+                className="hero-pill-btn"
+                onClick={() => handleSendPrompt("Explain this codebase and architecture")}
+              >
+                Explain this codebase
+              </button>
+              <button
+                type="button"
+                className="hero-pill-btn"
+                onClick={() => handleSendPrompt("Add unit tests for core services")}
+              >
+                Add unit tests
+              </button>
             </div>
           </div>
         ) : (
@@ -565,6 +633,7 @@ export const App: React.FC = () => {
                   content={m.content}
                   thought={m.thought}
                   tools={m.tools}
+                  attachments={m.attachments}
                   isStreaming={isRunning && idx === messages.length - 1}
                   onOpenFile={handleOpenFile}
                 />
@@ -600,12 +669,19 @@ export const App: React.FC = () => {
         </button>
       )}
 
-      {/* Input Area */}
+      {/* Antigravity Input Area */}
       <InputBox
         onSend={handleSendPrompt}
         onAbort={handleAbort}
         isRunning={isRunning}
         activeMode={activeMode}
+        activeModel={activeModel}
+        activeProvider={activeProvider}
+        activeEffort={activeEffort}
+        modelsCatalog={modelsCatalog}
+        onSelectMode={handleSelectMode}
+        onSelectModel={handleSelectModel}
+        onSelectEffort={handleSelectEffort}
       />
     </div>
   );

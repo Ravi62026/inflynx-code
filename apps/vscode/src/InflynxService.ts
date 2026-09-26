@@ -38,6 +38,7 @@ export class InflynxService extends EventEmitter {
   private currentModel: string = "openai/gpt-5.6-luna";
   private currentProvider: string = "openrouter";
   private currentBudget: AgentBudgetLevel = "medium";
+  private currentEffort: ReasoningEffort = "high";
   private activeAbortController: AbortController | null = null;
   private isConnected = false;
   private healthCheckTimer: NodeJS.Timeout | null = null;
@@ -74,6 +75,14 @@ export class InflynxService extends EventEmitter {
   setCurrentModel(model: string, provider = "openrouter"): void {
     this.currentModel = model;
     this.currentProvider = provider;
+  }
+
+  getCurrentEffort(): ReasoningEffort {
+    return this.currentEffort;
+  }
+
+  setCurrentEffort(effort: ReasoningEffort): void {
+    this.currentEffort = effort;
   }
 
   getCurrentBudget(): AgentBudgetLevel {
@@ -175,6 +184,9 @@ export class InflynxService extends EventEmitter {
       this.currentBudget = hydration.session.budgetLevel || this.currentBudget;
       this.currentModel = hydration.session.model || this.currentModel;
       this.currentProvider = hydration.session.providerId || this.currentProvider;
+      if (hydration.session.reasoningEffort) {
+        this.currentEffort = hydration.session.reasoningEffort;
+      }
     }
     this.emit("session.hydrated", hydration);
     return hydration;
@@ -194,7 +206,7 @@ export class InflynxService extends EventEmitter {
       model: options?.model || this.currentModel,
       providerId: options?.providerId || this.currentProvider,
       budgetLevel: options?.budgetLevel || this.currentBudget,
-      reasoningEffort: options?.reasoningEffort,
+      reasoningEffort: options?.reasoningEffort || this.currentEffort,
       workspaceRoot: options?.workspaceRoot,
       autoApprove: options?.autoApprove,
     };
@@ -218,6 +230,9 @@ export class InflynxService extends EventEmitter {
     this.currentMode = session.activeMode || this.currentMode;
     this.currentBudget = session.budgetLevel || this.currentBudget;
     this.currentModel = session.model || this.currentModel;
+    if (session.reasoningEffort) {
+      this.currentEffort = session.reasoningEffort;
+    }
     this.emit("session.started", session);
     return session;
   }
@@ -230,12 +245,22 @@ export class InflynxService extends EventEmitter {
       sessionId?: string;
       attachedContext?: string;
       autoApprove?: boolean;
+      mode?: AgentMode;
+      model?: string;
+      providerId?: string;
+      reasoningEffort?: ReasoningEffort;
+      attachments?: Array<{ name: string; mimeType: string; dataUrl: string; size?: number }>;
     }
   ): Promise<TurnCompletedPayload> {
     let sessionId = options?.sessionId || this.currentSessionId;
     if (!sessionId) {
       try {
-        const newSession = await this.createSession();
+        const newSession = await this.createSession({
+          mode: options?.mode,
+          model: options?.model,
+          providerId: options?.providerId,
+          reasoningEffort: options?.reasoningEffort,
+        });
         sessionId = newSession.sessionId;
       } catch (err: any) {
         const msg = `⚠️ Unable to connect to Inflynx backend server at ${this.serverUrl}.\n\nPlease ensure the server is running. You can start it via:\n- **Command Palette**: \`Cmd+Shift+P\` → \`Inflynx: Start Backend Server\`\n- **Terminal**: \`pnpm --filter inflynx-server run dev\``;
@@ -263,7 +288,12 @@ export class InflynxService extends EventEmitter {
         headers,
         body: JSON.stringify({
           prompt,
+          attachments: options?.attachments,
           attachedContext: options?.attachedContext,
+          activeMode: options?.mode || this.currentMode,
+          model: options?.model || this.currentModel,
+          providerId: options?.providerId || this.currentProvider,
+          reasoningEffort: options?.reasoningEffort || this.currentEffort,
         }),
         signal: this.activeAbortController.signal,
       });

@@ -30,11 +30,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ serv
 
   // 1. Core Service
   const service = new InflynxService(serverUrl);
-  service.setCurrentMode(defaultMode);
+  const savedMode = context.workspaceState.get<AgentMode>("inflynx.mode") || defaultMode;
+  service.setCurrentMode(savedMode);
   service.setCurrentBudget(defaultBudget);
-  if (defaultModel) {
-    service.setCurrentModel(defaultModel, defaultProvider || "openrouter");
+  const savedModel = context.workspaceState.get<string>("inflynx.model") || defaultModel;
+  const savedProvider = context.workspaceState.get<string>("inflynx.provider") || defaultProvider;
+  if (savedModel) {
+    service.setCurrentModel(savedModel, savedProvider || "openrouter");
   }
+  const defaultEffort = config.get<ReasoningEffort>("reasoningEffort", "high");
+  const savedEffort = context.workspaceState.get<ReasoningEffort>("inflynx.reasoningEffort") || defaultEffort;
+  service.setCurrentEffort(savedEffort);
   serviceInstance = service;
 
   // 2. Tool Approval Manager
@@ -49,7 +55,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ serv
   statusBarInstance = statusBar;
 
   // 5. Chat Webview Provider
-  const chatProvider = new ChatViewProvider(context.extensionUri, service, approvalManager);
+  const chatProvider = new ChatViewProvider(context.extensionUri, service, approvalManager, context);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatProvider, {
       webviewOptions: { retainContextWhenHidden: true },

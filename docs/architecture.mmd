@@ -1,0 +1,99 @@
+%% Inflynx Code — system architecture
+%% Render with: npx @mermaid-js/mermaid-cli -i docs/architecture.mmd -o docs/architecture.svg
+flowchart TB
+  subgraph Clients[Client Interfaces]
+    CLI[CLI Agent\napps/cli]
+    VSCode[VS Code Extension\napps/vscode]
+    Web[Web Frontend\nfe/]
+    Desktop[Desktop App\napps/desktop]
+  end
+
+  subgraph API[Application Layer]
+    Server[Local API + SSE Server\napps/server\n:4000]
+    Protocol[Protocol + Event Bus\npackages/protocol]
+  end
+
+  subgraph Core[Agent Execution Core]
+    Orchestrator[Agent Orchestrator\nState machine + turn loop]
+        Modes["Modes<br/>ask / plan / agent / debug"]
+    Planning[Planning + Context Manager]
+    Debug[Debug + Findings Engine]
+    Verify[Verification + Repair Loop]
+    Graph[Codebase Graph / Mind Map]
+  end
+
+  subgraph Intelligence[AI and Context]
+    Gateway[Model Gateway\nstreaming provider adapters]
+    Providers[OpenAI-compatible\nAnthropic\nGemini]
+    Workspace[Workspace Runtime\nindexer + filesystem watcher]
+    Symbols[Symbol Graph]
+    Vector[Vector Store\nsemantic search]
+    MCP[MCP Runtime]
+    Skills[Skill Runtime]
+  end
+
+  subgraph Tools[Tools and Change Execution]
+    Registry[Tool Registry]
+    DAG[DAG Scheduler]
+    Patch[Patch Engine\nunified diff + surgical edits]
+    Policy[Policy Engine\npath + command + SSRF guards]
+    Sandbox[Shell / PTY Sandbox]
+  end
+
+  subgraph Persistence[Persistence and Operations]
+    Sessions[Session Store\nLocal JSON or PostgreSQL]
+    Postgres[(PostgreSQL)]
+    Cache[Cache / PubSub\nRedis]
+    Telemetry[Telemetry + Usage/Cost Tracking]
+  end
+
+  CLI --> Orchestrator
+  CLI --> Server
+  VSCode --> Server
+  Web --> Server
+  Desktop --> Server
+
+  Server --> Protocol
+  Server --> Orchestrator
+  Server --> Sessions
+  Server --> Cache
+
+  Orchestrator --> Modes
+  Orchestrator --> Planning
+  Orchestrator --> Debug
+  Orchestrator --> Verify
+  Orchestrator --> Graph
+  Orchestrator --> Gateway
+  Orchestrator --> Registry
+  Orchestrator --> Sessions
+  Orchestrator --> Telemetry
+
+  Gateway --> Providers
+  Planning --> Workspace
+  Planning --> Vector
+  Graph --> Symbols
+  Workspace --> Symbols
+  Workspace --> Vector
+
+  Registry --> DAG
+  DAG --> Policy
+  DAG --> Patch
+  DAG --> Sandbox
+  Orchestrator --> MCP
+  Orchestrator --> Skills
+
+  Sessions --> Postgres
+  Cache --> Postgres
+  Telemetry --> Sessions
+
+  classDef client fill:#e8f1ff,stroke:#3973c6,color:#123;
+  classDef core fill:#e9f8ef,stroke:#2d8a53,color:#123;
+  classDef intelligence fill:#fff5dc,stroke:#c28a16,color:#123;
+  classDef tools fill:#ffe9e9,stroke:#c54b4b,color:#123;
+  classDef storage fill:#f0e9ff,stroke:#7651b8,color:#123;
+
+  class CLI,VSCode,Web,Desktop client;
+  class Server,Protocol,Orchestrator,Modes,Planning,Debug,Verify,Graph core;
+  class Gateway,Providers,Workspace,Symbols,Vector,MCP,Skills intelligence;
+  class Registry,DAG,Patch,Policy,Sandbox tools;
+  class Sessions,Postgres,Cache,Telemetry storage;

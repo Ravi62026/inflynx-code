@@ -17,11 +17,22 @@ interface ToolCallCardProps {
   onOpenFile?: (filePath: string) => void;
 }
 
+function formatDisplayPath(rawPath: string): string {
+  if (!rawPath) return "";
+  const clean = rawPath.replace(/^\.\//, "");
+  const parts = clean.split("/").filter(Boolean);
+  if (parts.length <= 2) return clean;
+  if (parts.length > 3) {
+    return `${parts[0]}/${parts[1]}/.../${parts[parts.length - 1]}`;
+  }
+  return clean;
+}
+
 export const ToolCallCard: React.FC<ToolCallCardProps> = ({ tool, onOpenFile }) => {
   const [expanded, setExpanded] = useState(false);
 
   const isFileEdit = tool.toolName === "patch_file" || tool.toolName === "write_file";
-  const targetFile = String(tool.args?.targetFile || tool.args?.path || "");
+  const targetFile = String(tool.args?.targetFile || tool.args?.path || tool.args?.filePath || "");
 
   let statusIcon = "○";
   let statusColor = "#888";
@@ -56,13 +67,23 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ tool, onOpenFile }) 
           <span>{tool.toolName}</span>
           {targetFile && (
             <span
-              style={{ color: "#38bdf8", cursor: "pointer", textDecoration: "underline", fontSize: "10px" }}
+              style={{
+                color: "#38bdf8",
+                cursor: "pointer",
+                textDecoration: "underline",
+                fontSize: "10px",
+                maxWidth: "180px",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap"
+              }}
+              title={targetFile}
               onClick={(e) => {
                 e.stopPropagation();
                 onOpenFile?.(targetFile);
               }}
             >
-              {targetFile.split("/").pop()}
+              {formatDisplayPath(targetFile)}
             </span>
           )}
         </div>

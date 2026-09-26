@@ -12,7 +12,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   constructor(
     private readonly extensionUri: vscode.Uri,
     private readonly service: InflynxService,
-    private readonly approvalManager: ApprovalManager
+    private readonly approvalManager: ApprovalManager,
+    private readonly context?: vscode.ExtensionContext
   ) {
     this.registerServiceEvents();
   }
@@ -115,6 +116,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           },
         });
 
+        // Broadcast current mode, model, and effort
+        this.postMessage({
+          type: "mode.changed",
+          payload: { mode: this.service.getCurrentMode() },
+        });
+        this.postMessage({
+          type: "model.changed",
+          payload: {
+            model: this.service.getCurrentModel(),
+            provider: (this.service as any).currentProvider || "openrouter",
+          },
+        });
+        this.postMessage({
+          type: "effort.changed",
+          payload: { effort: this.service.getCurrentEffort() },
+        });
+
+        // Fetch and send models catalog
+        this.service.getModels().then((catalog) => {
+          this.postMessage({ type: "models.loaded", payload: catalog });
+        }).catch(() => {});
+
         // If there's an active session, hydrate it
         const currentSessionId = this.service.getCurrentSessionId();
         if (currentSessionId) {
@@ -130,7 +153,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       case "send.prompt": {
         try {
-          await this.service.sendPrompt(message.payload.prompt);
+          if (message.payload.mode) {
+            this.service.setCurrentMode(message.payload.mode);
+            this.context?.workspaceState.update("inflynx.mode", message.payload.mode);
+          }
+          if (message.payload.model) {
+            this.service.setCurrentModel(message.payload.model, message.payload.provider);
+            this.context?.workspaceState.update("inflynx.model", message.payload.model);
+            if (message.payload.provider) {
+              this.context?.workspaceState.update("inflynx.provider", message.payload.provider);
+            }
+          }
+          if (message.payload.effort) {
+            this.service.setCurrentEffort(message.payload.effort);
+            this.context?.workspaceState.update("inflynx.reasoningEffort", message.payload.effort);
+          }
+
+          await this.service.sendPrompt(message.payload.prompt, {
+            mode: message.payload.mode,
+            model: message.payload.model,
+            providerId: message.payload.provider,
+            reasoningEffort: message.payload.effort,
+            attachments: message.payload.attachments,
+          });
         } catch (err: any) {
           console.error("[Inflynx ChatView] Error sending prompt:", err);
           this.postMessage({
@@ -180,15 +225,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       case "set.mode": {
         this.service.setCurrentMode(message.payload.mode);
+        this.context?.workspaceState.update("inflynx.mode", message.payload.mode);
         this.postMessage({ type: "mode.changed", payload: { mode: message.payload.mode } });
         break;
       }
 
       case "set.model": {
         this.service.setCurrentModel(message.payload.model, message.payload.provider);
+        this.context?.workspaceState.update("inflynx.model", message.payload.model);
+        if (message.payload.provider) {
+          this.context?.workspaceState.update("inflynx.provider", message.payload.provider);
+        }
         this.postMessage({
           type: "model.changed",
           payload: { model: message.payload.model, provider: message.payload.provider || "openrouter" },
+        });
+        break;
+      }
+
+      case "set.effort": {
+        this.service.setCurrentEffort(message.payload.effort);
+        this.context?.workspaceState.update("inflynx.reasoningEffort", message.payload.effort);
+        this.postMessage({
+          type: "effort.changed",
+          payload: { effort: message.payload.effort },
         });
         break;
       }

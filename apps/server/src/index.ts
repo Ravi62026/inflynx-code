@@ -7,6 +7,8 @@
  */
 
 import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
 import { URL } from "node:url";
 import {
   loadEnv,
@@ -14,6 +16,7 @@ import {
   TOP_PROVIDERS,
   REASONING_EFFORTS,
   getProvider,
+  supportsReasoningEffort,
   type ReasoningEffort,
 } from "@inflynx/config";
 import { createSessionStore, type SessionStore } from "@inflynx/session-store";
@@ -197,7 +200,10 @@ const server = http.createServer(async (req, res) => {
       const apiKey = body.apiKey || (provider ? process.env[provider.envKey] : "") || "mock_key";
       const activeMode = (body.activeMode as AgentMode) || "agent";
       const budgetLevel = (body.budgetLevel as AgentBudgetLevel) || "medium";
-      const reasoningEffort = (body.reasoningEffort as ReasoningEffort) || undefined;
+      let reasoningEffort = (body.reasoningEffort as ReasoningEffort) || undefined;
+      if (reasoningEffort && !supportsReasoningEffort(providerId, model, reasoningEffort)) {
+        reasoningEffort = "none";
+      }
       const workspaceRoot = body.workspaceRoot || WORKSPACE_ROOT;
 
       const bus = new AgentEventBus();
@@ -230,6 +236,7 @@ const server = http.createServer(async (req, res) => {
         model,
         activeMode,
         budgetLevel,
+        reasoningEffort: orchestrator.modelConfiguration.reasoningEffort,
         state: orchestrator.state,
       });
     }
@@ -362,6 +369,33 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
+      // Dynamically sync mode, reasoning effort, and model if passed in request body
+      if (active?.orchestrator) {
+        if (body.activeMode && body.activeMode !== active.orchestrator.state) {
+          active.orchestrator.setMode(body.activeMode);
+        }
+        if (body.reasoningEffort && body.reasoningEffort !== active.orchestrator.modelConfiguration.reasoningEffort) {
+          try {
+            await active.orchestrator.setReasoningEffort(body.reasoningEffort);
+          } catch (effortErr: any) {
+            console.warn(`[Inflynx Server] Could not set reasoning effort:`, effortErr?.message);
+          }
+        }
+        if (body.model && body.model !== active.orchestrator.modelConfiguration.model) {
+          try {
+            const switched = await active.orchestrator.switchModel({
+              model: body.model,
+              providerId: body.providerId || active.orchestrator.modelConfiguration.providerId,
+              reasoningEffort: body.reasoningEffort || active.orchestrator.modelConfiguration.reasoningEffort,
+            });
+            active.orchestrator = switched;
+            activeOrchestrators.set(sessionId, active);
+          } catch (modelErr: any) {
+            console.warn(`[Inflynx Server] Could not switch model:`, modelErr?.message);
+          }
+        }
+      }
+
       // Setup SSE response
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
@@ -459,8 +493,51 @@ const server = http.createServer(async (req, res) => {
         sseWrite(event.type, event.payload);
       });
 
+      // Process any attached images / screenshots / files
+      let attachedContext = body.attachedContext || "";
+      const attachments = Array.isArray(body.attachments) ? body.attachments : [];
+      if (attachments.length > 0) {
+        const attachmentsDir = path.join(WORKSPACE_ROOT, ".inflynx", "attachments");
+        try {
+          await fs.promises.mkdir(attachmentsDir, { recursive: true });
+        } catch {}
+
+        const notes: string[] = [];
+        for (let i = 0; i < attachments.length; i++) {
+          const att = attachments[i];
+          if (att && att.dataUrl) {
+            if (att.mimeType?.startsWith("image/")) {
+              try {
+                const ext = att.mimeType.split("/")[1]?.replace("jpeg", "jpg") || "png";
+                const cleanName = (att.name || `screenshot_${i + 1}`).replace(/[^a-zA-Z0-9_.-]/g, "_");
+                const filename = `${Date.now()}_${cleanName.endsWith(`.${ext}`) ? cleanName : `${cleanName}.${ext}`}`;
+                const filePath = path.join(attachmentsDir, filename);
+                const base64Data = att.dataUrl.replace(/^data:image\/\w+;base64,/, "");
+                await fs.promises.writeFile(filePath, Buffer.from(base64Data, "base64"));
+                const relPath = path.relative(WORKSPACE_ROOT, filePath);
+                notes.push(`[Attached Screenshot saved at: ${relPath}]\n![${att.name || "Screenshot"}](${att.dataUrl})`);
+              } catch {
+                notes.push(`![${att.name || "Screenshot"}](${att.dataUrl})`);
+              }
+            } else {
+              notes.push(`[Attached File: ${att.name}]`);
+            }
+          }
+        }
+        if (notes.length > 0) {
+          attachedContext = (attachedContext ? `${attachedContext}\n\n` : "") + notes.join("\n\n");
+        }
+      }
+
+      const onClientClose = () => {
+        try {
+          active.orchestrator.abort();
+        } catch {}
+      };
+      req.on("close", onClientClose);
+
       try {
-        const turnResult = await active.orchestrator.runTurn(prompt, body.attachedContext);
+        const turnResult = await active.orchestrator.runTurn(prompt, attachedContext);
         sseWrite("turn.completed", {
           finalText: turnResult.finalText,
           toolResults: turnResult.toolResults,
@@ -483,6 +560,7 @@ const server = http.createServer(async (req, res) => {
         });
         res.write("data: [DONE]\n\n");
       } finally {
+        req.off("close", onClientClose);
         unsubBus();
         res.end();
       }

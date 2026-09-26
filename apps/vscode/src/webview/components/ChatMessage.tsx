@@ -1,7 +1,8 @@
-import React, { useMemo } from "react";
+import React, { useMemo, useState } from "react";
 import { marked } from "marked";
 import { ThinkingIndicator } from "./ThinkingIndicator.js";
 import type { ToolCallState } from "./ToolCallCard.js";
+import type { AttachmentPayload } from "../../types.js";
 
 // Configure marked
 marked.setOptions({
@@ -37,6 +38,7 @@ interface ChatMessageProps {
   content: string;
   thought?: string;
   tools?: ToolCallState[];
+  attachments?: AttachmentPayload[];
   isStreaming?: boolean;
   onCopy?: (text: string) => void;
   onOpenFile?: (filePath: string) => void;
@@ -47,12 +49,14 @@ const ChatMessageComponent: React.FC<ChatMessageProps> = ({
   content,
   thought,
   tools,
+  attachments,
   isStreaming = false,
   onCopy,
   onOpenFile,
 }) => {
   const isUser = role === "user";
   const isSystem = role === "system";
+  const [previewImage, setPreviewImage] = useState<string | null>(null);
 
   const { content: displayContent, thought: displayThought } = useMemo(
     () => (isUser || isSystem ? { content, thought } : parseThinkTags(content, thought)),
@@ -136,8 +140,37 @@ const ChatMessageComponent: React.FC<ChatMessageProps> = ({
       )}
 
       {isUser ? (
-        <div className="message-content" style={{ whiteSpace: "pre-wrap" }}>
-          {displayContent}
+        <div className="user-message-body">
+          {attachments && attachments.length > 0 && (
+            <div className="message-attachments-container">
+              {attachments.map((att, idx) => (
+                <div key={idx} className="message-attachment-card">
+                  {att.mimeType?.startsWith("image/") ? (
+                    <div
+                      className="message-attachment-thumb-wrap"
+                      onClick={() => setPreviewImage(att.dataUrl)}
+                      title={`Click to preview: ${att.name}`}
+                    >
+                      <img src={att.dataUrl} alt={att.name || "Screenshot"} className="message-attachment-thumb" />
+                      <div className="thumb-zoom-overlay">
+                        <span>🔍 Preview</span>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="message-attachment-file-chip">
+                      <span className="file-chip-icon">📄</span>
+                      <span className="file-chip-name">{att.name}</span>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {displayContent && (
+            <div className="message-content" style={{ whiteSpace: "pre-wrap" }}>
+              {displayContent}
+            </div>
+          )}
         </div>
       ) : (
         <>
@@ -174,6 +207,28 @@ const ChatMessageComponent: React.FC<ChatMessageProps> = ({
             </div>
           ) : null}
         </>
+      )}
+
+      {/* Lightbox Modal for Image Zoom Preview */}
+      {previewImage && (
+        <div className="attachment-lightbox-backdrop" onClick={() => setPreviewImage(null)}>
+          <div className="attachment-lightbox-content" onClick={(e) => e.stopPropagation()}>
+            <div className="attachment-lightbox-header">
+              <span className="attachment-lightbox-title">Image Preview</span>
+              <button
+                type="button"
+                className="attachment-lightbox-close"
+                onClick={() => setPreviewImage(null)}
+                title="Close preview"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="attachment-lightbox-img-wrap">
+              <img src={previewImage} alt="Expanded Screenshot" className="attachment-lightbox-img" />
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

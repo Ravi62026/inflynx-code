@@ -74,6 +74,24 @@ export function formatOpenAiCompatibleMessages(messages: Message[]): Array<Recor
       return formatted;
     }
 
+    if (message.role === "user" && typeof message.content === "string") {
+      const dataUrlRegex = /data:image\/(?:png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+/g;
+      const matches = message.content.match(dataUrlRegex);
+      if (matches && matches.length > 0) {
+        const cleanText = message.content.replace(/!\[.*?\]\(data:image\/[^\)]+\)/g, "[Attached Screenshot]").trim();
+        const parts: Array<Record<string, unknown>> = [
+          { type: "text", text: cleanText || "Analyze this image." },
+        ];
+        for (const dataUrl of matches) {
+          parts.push({
+            type: "image_url",
+            image_url: { url: dataUrl },
+          });
+        }
+        return { role: "user", content: parts };
+      }
+    }
+
     return { role: message.role, content: message.content };
   });
 }
@@ -126,14 +144,11 @@ export async function* streamOpenAiCompatible(
       body.reasoning_effort = request.reasoningEffort === "max" ? "max" : request.reasoningEffort === "low" ? "low" : "high";
     } else if (provider === "openrouter") {
       body.reasoning = { effort: request.reasoningEffort };
-      body.provider = { require_parameters: true };
     } else if (provider === "custom-openai-compatible") {
       throw new Error("Custom model profile does not declare reasoning support.");
     }
   } else if (provider === "deepseek") {
     body.thinking = { type: "disabled" };
-  } else if (provider === "openrouter" && request.reasoningEffort === "none") {
-    body.reasoning = { enabled: false };
   }
 
   let response: Response;

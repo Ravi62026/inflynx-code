@@ -1,25 +1,122 @@
 :root {
-  --inflynx-primary: #00d8ff;
-  --inflynx-primary-hover: #38bdf8;
-  --inflynx-accent: #8b5cf6;
+  /* Core brand & accents */
+  --inflynx-primary: #0284c7;
+  --inflynx-primary-hover: #0369a1;
+  --inflynx-accent: #6366f1;
   --inflynx-success: #10b981;
   --inflynx-warning: #f59e0b;
   --inflynx-danger: #ef4444;
-  --inflynx-bg: var(--vscode-editor-background, #1e1e1e);
-  --inflynx-fg: var(--vscode-editor-foreground, #d4d4d4);
-  --inflynx-card-bg: rgba(255, 255, 255, 0.04);
-  --inflynx-card-border: rgba(255, 255, 255, 0.08);
-  --inflynx-input-bg: var(--vscode-input-background, #252526);
-  --inflynx-input-fg: var(--vscode-input-foreground, #cccccc);
-  --inflynx-input-border: var(--vscode-input-border, rgba(255, 255, 255, 0.12));
-  --inflynx-button-bg: var(--vscode-button-background, #007acc);
-  --inflynx-button-fg: var(--vscode-button-foreground, #ffffff);
-  --inflynx-radius-sm: 4px;
-  --inflynx-radius-md: 8px;
-  --inflynx-radius-lg: 12px;
-  --inflynx-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
 
-  /* Thinking Block Theme Variables (Dark Mode Default) */
+  /* Surfaces & Typography (Default / Light mode) */
+  --inflynx-bg: var(--vscode-editor-background, #ffffff);
+  --inflynx-fg: var(--vscode-editor-foreground, #1f2937);
+  --inflynx-fg-muted: var(--vscode-descriptionForeground, #6b7280);
+  --inflynx-border: var(--vscode-widget-border, rgba(0, 0, 0, 0.08));
+
+  /* Unified Input Card */
+  --inflynx-card-bg: var(--vscode-input-background, #f8f8fa);
+  --inflynx-card-border: var(--vscode-input-border, rgba(0, 0, 0, 0.12));
+  --inflynx-card-border-focus: var(--vscode-focusBorder, #0284c7);
+  --inflynx-card-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+  --inflynx-card-shadow-focus: 0 0 0 1px rgba(2, 132, 199, 0.35), 0 4px 16px rgba(0, 0, 0, 0.08);
+
+  /* Input Text & Placeholder */
+  --inflynx-input-fg: var(--vscode-input-foreground, #111827);
+  --inflynx-input-placeholder: var(--vscode-input-placeholderForeground, #9ca3af);
+
+  /* Toolbar buttons & pills */
+  --inflynx-toolbar-btn-fg: #4b5563;
+  --inflynx-toolbar-btn-hover-bg: rgba(0, 0, 0, 0.06);
+  --inflynx-toolbar-btn-hover-fg: #111827;
+  --inflynx-toolbar-pill-bg: rgba(0, 0, 0, 0.04);
+  --inflynx-toolbar-pill-border: rgba(0, 0, 0, 0.08);
+  --inflynx-toolbar-pill-fg: #374151;
+  --inflynx-toolbar-pill-hover-bg: rgba(0, 0, 0, 0.08);
+
+  /* Send Button */
+  --inflynx-send-btn-disabled-bg: rgba(0, 0, 0, 0.08);
+  --inflynx-send-btn-disabled-fg: rgba(0, 0, 0, 0.3);
+  --inflynx-send-btn-active-bg: #18181b;
+  --inflynx-send-btn-active-fg: #ffffff;
+
+  /* Floating Popover Menus */
+  --inflynx-popover-bg: var(--vscode-menu-background, #ffffff);
+  --inflynx-popover-border: var(--vscode-menu-border, rgba(0, 0, 0, 0.14));
+  --inflynx-popover-shadow: 0 12px 32px rgba(0, 0, 0, 0.14), 0 2px 6px rgba(0, 0, 0, 0.06);
+  --inflynx-popover-fg: var(--vscode-menu-foreground, #1f2937);
+  --inflynx-popover-fg-muted: #6b7280;
+  --inflynx-popover-hover-bg: var(--vscode-menu-selectionBackground, rgba(0, 0, 0, 0.05));
+  --inflynx-popover-selected-bg: rgba(2, 132, 199, 0.08);
+  --inflynx-popover-selected-border: rgba(2, 132, 199, 0.3);
+
+  /* Radius & Transitions */
+  --inflynx-radius-sm: 6px;
+  --inflynx-radius-md: 10px;
+  --inflynx-radius-lg: 16px;
+  --inflynx-radius-full: 9999px;
+
+  /* Thinking Block */
+  --inflynx-thinking-bg: #f8f7ff;
+  --inflynx-thinking-border: #ddd6fe;
+  --inflynx-thinking-accent: #7c3aed;
+  --inflynx-thinking-title: #1e1b4b;
+  --inflynx-thinking-body-bg: #ffffff;
+  --inflynx-thinking-body-fg: #1e293b;
+  --inflynx-thinking-pill-bg: #ede9fe;
+  --inflynx-thinking-pill-fg: #6d28d9;
+}
+
+/* ─── Explicit VS Code Dark / High-Contrast Themes ─── */
+body.vscode-dark,
+body.vscode-high-contrast,
+body[data-vscode-theme-kind="vscode-dark"],
+body[data-vscode-theme-kind="vscode-high-contrast"] {
+  --inflynx-primary: #38bdf8;
+  --inflynx-primary-hover: #7dd3fc;
+  --inflynx-accent: #a78bfa;
+
+  --inflynx-bg: var(--vscode-editor-background, #18181b);
+  --inflynx-fg: var(--vscode-editor-foreground, #e2e8f0);
+  --inflynx-fg-muted: var(--vscode-descriptionForeground, #94a3b8);
+  --inflynx-border: var(--vscode-widget-border, rgba(255, 255, 255, 0.09));
+
+  /* Unified Input Card (Dark) */
+  --inflynx-card-bg: var(--vscode-input-background, #202127);
+  --inflynx-card-border: var(--vscode-input-border, rgba(255, 255, 255, 0.1));
+  --inflynx-card-border-focus: rgba(56, 189, 248, 0.5);
+  --inflynx-card-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  --inflynx-card-shadow-focus: 0 0 0 1px rgba(56, 189, 248, 0.3), 0 6px 24px rgba(0, 0, 0, 0.45);
+
+  /* Input Text & Placeholder (Dark) */
+  --inflynx-input-fg: var(--vscode-input-foreground, #f3f4f6);
+  --inflynx-input-placeholder: var(--vscode-input-placeholderForeground, rgba(255, 255, 255, 0.38));
+
+  /* Toolbar buttons & pills (Dark) */
+  --inflynx-toolbar-btn-fg: rgba(255, 255, 255, 0.65);
+  --inflynx-toolbar-btn-hover-bg: rgba(255, 255, 255, 0.08);
+  --inflynx-toolbar-btn-hover-fg: #ffffff;
+  --inflynx-toolbar-pill-bg: rgba(255, 255, 255, 0.05);
+  --inflynx-toolbar-pill-border: rgba(255, 255, 255, 0.08);
+  --inflynx-toolbar-pill-fg: rgba(255, 255, 255, 0.85);
+  --inflynx-toolbar-pill-hover-bg: rgba(255, 255, 255, 0.1);
+
+  /* Send Button (Dark) */
+  --inflynx-send-btn-disabled-bg: rgba(255, 255, 255, 0.08);
+  --inflynx-send-btn-disabled-fg: rgba(255, 255, 255, 0.28);
+  --inflynx-send-btn-active-bg: #38bdf8;
+  --inflynx-send-btn-active-fg: #041019;
+
+  /* Floating Popover Menus (Dark) */
+  --inflynx-popover-bg: var(--vscode-menu-background, #1b1e25);
+  --inflynx-popover-border: var(--vscode-menu-border, rgba(255, 255, 255, 0.12));
+  --inflynx-popover-shadow: 0 16px 40px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  --inflynx-popover-fg: var(--vscode-menu-foreground, #f3f4f6);
+  --inflynx-popover-fg-muted: rgba(255, 255, 255, 0.5);
+  --inflynx-popover-hover-bg: var(--vscode-menu-selectionBackground, rgba(255, 255, 255, 0.07));
+  --inflynx-popover-selected-bg: rgba(56, 189, 248, 0.12);
+  --inflynx-popover-selected-border: rgba(56, 189, 248, 0.3);
+
+  /* Thinking Block (Dark) */
   --inflynx-thinking-bg: rgba(139, 92, 246, 0.1);
   --inflynx-thinking-border: rgba(139, 92, 246, 0.35);
   --inflynx-thinking-accent: #8b5cf6;
@@ -28,22 +125,4 @@
   --inflynx-thinking-body-fg: #e2e8f0;
   --inflynx-thinking-pill-bg: rgba(139, 92, 246, 0.25);
   --inflynx-thinking-pill-fg: #c4b5fd;
-}
-
-body.vscode-light {
-  --inflynx-primary: #0284c7;
-  --inflynx-accent: #7c3aed;
-  --inflynx-card-bg: rgba(0, 0, 0, 0.03);
-  --inflynx-card-border: rgba(0, 0, 0, 0.08);
-  --inflynx-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
-
-  /* Thinking Block Theme Variables (Light Mode High-Contrast) */
-  --inflynx-thinking-bg: #f8f6ff;
-  --inflynx-thinking-border: #c4b5fd;
-  --inflynx-thinking-accent: #6d28d9;
-  --inflynx-thinking-title: #1e1b4b;
-  --inflynx-thinking-body-bg: #ffffff;
-  --inflynx-thinking-body-fg: #0f172a;
-  --inflynx-thinking-pill-bg: #ede9fe;
-  --inflynx-thinking-pill-fg: #5b21b6;
 }

@@ -23,7 +23,7 @@ export interface ProviderInfo {
 }
 
 export interface ModelsResponse {
-  catalog: ModelInfo[];
+  catalog: ModelInfo[] | Record<string, ModelInfo[]>;
   providers: ProviderInfo[];
   supportedEfforts: ReasoningEffort[];
 }
@@ -44,6 +44,7 @@ export interface SessionRecord {
   model: string;
   activeMode: AgentMode;
   budgetLevel: AgentBudgetLevel;
+  reasoningEffort?: ReasoningEffort;
   state?: string;
   title?: string;
   createdAt?: string;
@@ -57,6 +58,7 @@ export interface StoredMessage {
   thought?: string;
   tool_call_id?: string;
   timestamp?: number;
+  attachments?: AttachmentPayload[];
   toolCalls?: Array<{
     id: string;
     name: string;
@@ -131,17 +133,26 @@ export type ToWebviewMessage =
   | { type: "budget.updated"; payload: BudgetStatePayload }
   | { type: "mode.changed"; payload: { mode: AgentMode } }
   | { type: "model.changed"; payload: { model: string; provider: string } }
+  | { type: "effort.changed"; payload: { effort: ReasoningEffort } }
   | { type: "config.updated"; payload: { autoApproveReadonly: boolean; autoApproveAll: boolean; showThinking: boolean; theme: string } };
+
+export interface AttachmentPayload {
+  name: string;
+  mimeType: string;
+  dataUrl: string;
+  size?: number;
+}
 
 export type FromWebviewMessage =
   | { type: "ready" }
-  | { type: "send.prompt"; payload: { prompt: string; attachedFiles?: string[] } }
+  | { type: "send.prompt"; payload: { prompt: string; attachments?: AttachmentPayload[]; attachedFiles?: string[]; mode?: AgentMode; model?: string; provider?: string; effort?: ReasoningEffort } }
   | { type: "abort.turn" }
-  | { type: "create.session"; payload?: { mode?: AgentMode; model?: string; provider?: string; budget?: AgentBudgetLevel } }
+  | { type: "create.session"; payload?: { mode?: AgentMode; model?: string; provider?: string; budget?: AgentBudgetLevel; effort?: ReasoningEffort } }
   | { type: "resume.session"; payload: { sessionId: string } }
   | { type: "approve.tool"; payload: { toolCallId: string; approved: boolean } }
   | { type: "set.mode"; payload: { mode: AgentMode } }
   | { type: "set.model"; payload: { model: string; provider?: string } }
+  | { type: "set.effort"; payload: { effort: ReasoningEffort } }
   | { type: "set.budget"; payload: { budget: AgentBudgetLevel } }
   | { type: "open.file"; payload: { filePath: string; line?: number } }
   | { type: "copy.clipboard"; payload: { text: string } }

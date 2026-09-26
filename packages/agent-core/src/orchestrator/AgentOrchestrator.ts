@@ -407,6 +407,11 @@ export class AgentOrchestrator {
     let keepLooping = true;
 
     while (keepLooping) {
+      if (this.context.signal.aborted) {
+        keepLooping = false;
+        break;
+      }
+
       const limitCheck = this.budgetManager.checkLimits();
       if (limitCheck.isExhausted) {
         this.eventBus.emit("session.failed", this.context.sessionId, { reason: limitCheck.reason });
@@ -538,6 +543,11 @@ export class AgentOrchestrator {
           }
 
           for (const tc of pendingToolCalls) {
+            if (this.context.signal.aborted) {
+              keepLooping = false;
+              break;
+            }
+
             tc.args = safeParseJsonArgs(tc.args);
             const toolDef = this.registry.get(tc.name);
             const permissionLevel = toolDef?.permissionLevel || "readonly";
