@@ -1,5 +1,6 @@
 import { checkRateLimit, type RateLimitResult } from "@inflynx/cache";
 import type { ReasoningEffort } from "@inflynx/config";
+import type { Message } from "@inflynx/model-gateway";
 import { AgentEventBus } from "@inflynx/protocol";
 
 /**
@@ -87,6 +88,14 @@ export interface BudgetState {
   completionTokens: number;
   reasoningTokens: number;
   estimatedCostUsd: number;
+  /**
+   * Occupancy of the *model's window* for the next request, which is not the same
+   * thing as the cumulative `promptTokens` above (that sum grows every turn and can
+   * never answer "how full is the context?"). 0 when the window is unknown.
+   */
+  contextUtilizationPercent: number;
+  contextWindow: number;
+  projectedContextTokens: number;
 }
 
 export class BudgetManager {
@@ -114,15 +123,124 @@ export class BudgetManager {
       completionTokens: 0,
       reasoningTokens: 0,
       estimatedCostUsd: 0,
+      contextUtilizationPercent: 0,
+      contextWindow: 0,
+      projectedContextTokens: 0,
     };
+  }
+
+  // ─── Context-window accounting ──────────────────────────────────────────────
+  private contextWindow = 0;
+  private outputTokenCeiling = 0;
+  private lastPromptTokens = 0;
+  private lastCompletionTokens = 0;
+  private messagesAtLastRequest = 0;
+  private lastProjectedTokens = 0;
+
+  /** Called by the orchestrator at construction and whenever the model changes. */
+  setModelWindow(contextWindow: number, maxOutputTokens: number): void {
+    this.contextWindow = Math.max(0, Math.floor(contextWindow || 0));
+    this.outputTokenCeiling = Math.max(0, Math.floor(maxOutputTokens || 0));
+  }
+
+  get windowKnown(): boolean {
+    return this.contextWindow > 0;
+  }
+
+  get contextWindowTokens(): number {
+    return this.contextWindow;
+  }
+
+  get outputLimit(): number {
+    return this.outputTokenCeiling;
+  }
+
+  /** Records how long the history was when the request went out. */
+  noteRequestSent(messageCount: number): void {
+    this.messagesAtLastRequest = messageCount;
+  }
+
+  /**
+   * Projected size of the next request.
+   *
+   * Anchored on the provider's own `prompt_tokens` for the previous call — the
+   * ground truth the gateway already parses and used to discard — and then only the
+   * messages appended since are estimated with the crude chars/4 heuristic. The new
+   * assistant reply is counted twice (inside `lastCompletionTokens` and in the tail);
+   * over-estimating errs towards evicting early, which is the safe direction.
+   */
+  projectedContextTokens(history: readonly Message[]): number {
+    const tail = history.slice(Math.max(0, this.messagesAtLastRequest));
+    let chars = 0;
+    for (const message of tail) {
+      chars += (message.content?.length || 0) + (message.reasoning_content?.length || 0);
+      for (const call of message.tool_calls || []) {
+        chars += (call.function?.arguments?.length || 0) + 16;
+      }
+    }
+    const projected = Math.max(
+      this.lastPromptTokens + this.lastCompletionTokens + Math.ceil(chars / 4),
+      Math.ceil((history.reduce((sum, m) => sum + (m.content?.length || 0), 0)) / 4)
+    );
+    this.lastProjectedTokens = projected;
+    return projected;
+  }
+
+  /**
+   * Lower the anchor after the caller drops content from history.
+   *
+   * Without this the projection is permanently stuck at whatever the last request
+   * measured, so evicting 50k characters would not reduce utilization at all and
+   * the loop above would spin without making progress.
+   */
+  accountForEviction(charsFreed: number): void {
+    if (charsFreed <= 0) return;
+    this.lastPromptTokens = Math.max(0, this.lastPromptTokens - Math.ceil(charsFreed / 4));
+  }
+
+  /**
+   * Call after history has been *rewritten* (a compaction spliced messages out),
+   * which is different from eviction: `messagesAtLastRequest` is an index into a
+   * history that no longer has that shape, so the anchor and the tail boundary are
+   * both stale and would under-count what survives.
+   *
+   * Rather than guess, this falls back to a plain chars/4 estimate of the whole
+   * history and re-anchors on the provider's real number at the next response.
+   */
+  reanchorAfterRewrite(history: readonly Message[]): void {
+    const chars = history.reduce(
+      (sum, m) => sum + (m.content?.length || 0) + (m.reasoning_content?.length || 0),
+      0
+    );
+    this.lastPromptTokens = Math.ceil(chars / 4);
+    this.lastCompletionTokens = 0;
+    this.messagesAtLastRequest = history.length;
+  }
+
+  /** 0 when the window is unknown, so callers never divide by zero or act on a guess. */
+  contextUtilization(history: readonly Message[]): number {
+    if (!this.windowKnown) return 0;
+    return this.projectedContextTokens(history) / this.contextWindow;
   }
 
   getEffortProfile(): EffortProfile {
     return this.profile;
   }
 
-  getBudgetState(): Readonly<BudgetState> {
-    return { ...this.state };
+  getBudgetState(history?: readonly Message[]): Readonly<BudgetState> {
+    const headroom = this.windowKnown ? Math.max(this.outputTokenCeiling, 0) : 0;
+    // Pass the live history and the snapshot reports *now*, not whenever the last
+    // projection happened to run. Without this, a UI reading `budget` after a
+    // compaction still showed the pre-compaction number (backlog Phase 15).
+    const projected = history ? this.projectedContextTokens(history) : this.lastProjectedTokens;
+    return {
+      ...this.state,
+      contextWindow: this.contextWindow,
+      projectedContextTokens: projected,
+      contextUtilizationPercent: this.windowKnown
+        ? Math.min(100, Math.round(((projected + headroom) / this.contextWindow) * 100))
+        : 0,
+    };
   }
 
   setBudgetLevel(level: AgentBudgetLevel): void {
@@ -147,6 +265,10 @@ export class BudgetManager {
   recordUsage(usage: { promptTokens: number; completionTokens: number; reasoningTokens?: number; estimatedCostUsd?: number }): void {
     this.state.promptTokens += usage.promptTokens;
     this.state.completionTokens += usage.completionTokens;
+    // Per-call values, kept separately from the cumulative sums above: these are
+    // what context projection is anchored on.
+    if (usage.promptTokens > 0) this.lastPromptTokens = usage.promptTokens;
+    if (usage.completionTokens > 0) this.lastCompletionTokens = usage.completionTokens;
     if (usage.reasoningTokens) {
       this.state.reasoningTokens += usage.reasoningTokens;
     }

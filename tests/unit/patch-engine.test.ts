@@ -41,7 +41,8 @@ async function runPatchEngineTests() {
   fs.writeFileSync(file1, "Original File 1", "utf-8");
   fs.writeFileSync(file2, "Original File 2", "utf-8");
 
-  const txManager = new EditTransactionManager();
+  // Explicit root required since Phase 5 — no process.env/process.cwd() fallback.
+  const txManager = new EditTransactionManager(tmpDir);
   txManager.stageFileWrite(file1, "Modified File 1");
   txManager.stageFileWrite(file2, "Modified File 2");
 

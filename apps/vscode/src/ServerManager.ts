@@ -82,15 +82,27 @@ export class ServerManager {
     }
 
     const isTypeScript = serverScript.endsWith(".ts");
-    const cmd = isTypeScript ? "pnpm" : "node";
-    const args = isTypeScript ? ["--filter", "inflynx-server", "run", "dev"] : [serverScript];
+    const port = this.resolveServerPort();
+    const launch = this.resolveLaunch(workspaceRoot, serverScript, isTypeScript);
 
     try {
-      this.outputChannel.appendLine(`[Inflynx] Spawning: ${cmd} ${args.join(" ")} in ${workspaceRoot}`);
-      this.childProcess = spawn(cmd, args, {
+      this.outputChannel.appendLine(
+        `[Inflynx] Spawning: ${launch.command} ${launch.args.join(" ")} in ${workspaceRoot} (port ${port})`
+      );
+      this.childProcess = spawn(launch.command, launch.args, {
         cwd: workspaceRoot,
-        env: { ...process.env, PORT: "4000" },
-        shell: true,
+        // PORT was previously hard-coded to "4000", so pointing `inflynx.serverUrl`
+        // at another port made the extension poll one port while the server bound
+        // another. HOST is pinned to loopback to match the server's local-first
+        // default (backlog Phase 2).
+        env: { ...process.env, PORT: String(port), HOST: "127.0.0.1" },
+        // No shell: `shell: true` handed the workspace path to a shell, so a path
+        // containing `$`, backticks or quotes could be interpreted, not quoted.
+        shell: false,
+        // Own process group so stopServer() can reap the tree; killing `pnpm` alone
+        // left the `node` grandchild orphaned and still bound to the port (J10).
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
       });
 
       this.childProcess.stdout?.on("data", (chunk) => {
@@ -104,6 +116,15 @@ export class ServerManager {
       this.childProcess.on("exit", (code, signal) => {
         this.outputChannel.appendLine(`[Inflynx] Server process exited with code ${code} (${signal})`);
         this.childProcess = null;
+      });
+
+      // Spawn failures (e.g. `pnpm` not on PATH) surface as an async 'error'
+      // event, which the surrounding try/catch cannot see — unhandled, it would
+      // throw out of the extension host.
+      this.childProcess.on("error", (err) => {
+        this.outputChannel.appendLine(`[Inflynx] Failed to launch server: ${err.message}`);
+        this.childProcess = null;
+        this.isStarting = false;
       });
 
       // Poll health check for up to 10 seconds
@@ -131,11 +152,83 @@ export class ServerManager {
 
   stopServer(): void {
     if (this.childProcess) {
-      this.outputChannel.appendLine(`[Inflynx] Terminating server process...`);
-      this.childProcess.kill("SIGTERM");
+      this.outputChannel.appendLine(`[Inflynx] Terminating server process group...`);
+      this.killTree(this.childProcess);
       this.childProcess = null;
       vscode.window.showInformationMessage("Inflynx server stopped.");
     }
+  }
+
+  /**
+   * Kill the whole process group (`detached: true` gave us a negative pid).
+   * Falls back to killing the direct child if the group is already gone.
+   */
+  private killTree(child: ChildProcess): void {
+    if (child.pid === undefined) {
+      child.kill("SIGTERM");
+      return;
+    }
+    try {
+      process.kill(-child.pid, "SIGTERM");
+    } catch {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // Already exited.
+      }
+    }
+  }
+
+  /** Port the extension actually talks to — derived from `inflynx.serverUrl`. */
+  private resolveServerPort(): number {
+    try {
+      const parsed = new URL(this.service.getServerUrl());
+      if (parsed.port) return Number(parsed.port);
+    } catch {
+      // fall through
+    }
+    return 4000;
+  }
+
+  /**
+   * Resolve a real executable + argument array. Never a shell string, so the
+   * workspace path can never be re-interpreted by a shell.
+   */
+  private resolveLaunch(
+    workspaceRoot: string,
+    serverScript: string,
+    isTypeScript: boolean
+  ): { command: string; args: string[] } {
+    if (!isTypeScript) {
+      // Built `dist/index.js`: run it on the very Node binary the extension host is
+      // already using — no PATH lookup, no shell, works identically everywhere.
+      return { command: process.execPath, args: [serverScript] };
+    }
+
+    // Source-only dev fallback: exec tsx's own JS entry through node, resolved via
+    // the .bin symlink. If that isn't resolvable (e.g. the Windows .cmd shim) we
+    // fall back to the package manager, which is still an argument array, no shell.
+    const binName = process.platform === "win32" ? "tsx.cmd" : "tsx";
+    for (const bin of [
+      path.join(workspaceRoot, "node_modules", ".bin", binName),
+      path.join(workspaceRoot, "apps", "server", "node_modules", ".bin", binName),
+    ]) {
+      try {
+        if (fs.existsSync(bin)) {
+          const real = fs.realpathSync(bin);
+          if (/\.[cm]?js$/.test(real)) {
+            return { command: process.execPath, args: [real, serverScript] };
+          }
+        }
+      } catch {
+        // Unresolvable symlink — try the next candidate.
+      }
+    }
+
+    return {
+      command: process.platform === "win32" ? "pnpm.cmd" : "pnpm",
+      args: ["--filter", "inflynx-server", "run", "dev"],
+    };
   }
 
   async restartServer(): Promise<void> {
@@ -146,7 +239,7 @@ export class ServerManager {
 
   dispose(): void {
     if (this.childProcess) {
-      this.childProcess.kill("SIGTERM");
+      this.killTree(this.childProcess);
       this.childProcess = null;
     }
   }

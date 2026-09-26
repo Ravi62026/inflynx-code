@@ -5,6 +5,7 @@ import path from "path";
 
 const isWatch = process.argv.includes("--watch");
 const isProduction = process.env.NODE_ENV === "production" || process.argv.includes("--production");
+const isSyncRequested = process.argv.includes("--sync-installed");
 
 // Ensure output dirs exist
 fs.mkdirSync("dist/webview", { recursive: true });
@@ -36,23 +37,46 @@ const webviewConfig = {
   logLevel: "info",
 };
 
+/**
+ * Opt-in only: `pnpm dev:sync` with `INFLYNX_SYNC_TARGETS` set.
+ *
+ * This used to run on EVERY build and overwrite `dist/` and `package.json` inside
+ * `~/.vscode`, `~/.cursor` and `~/.antigravity-ide` extension folders, with a
+ * hard-coded personal home fallback. A plain `pnpm build` must never write outside
+ * the repository — an untested dev build was silently replacing the very extension
+ * you were running (backlog A6).
+ */
 function syncToInstalledExtensions() {
-  const home = process.env.HOME || "/Users/ravishankar";
-  const targets = [
-    path.join(home, ".vscode", "extensions", "inflynx.inflynx-code-1.0.0"),
-    path.join(home, ".antigravity-ide", "extensions", "inflynx.inflynx-code-1.0.0"),
-    path.join(home, ".cursor", "extensions", "inflynx.inflynx-code-1.0.0"),
-  ];
+  if (!isSyncRequested) return;
+
+  const targets = (process.env.INFLYNX_SYNC_TARGETS || "")
+    .split(path.delimiter)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  if (targets.length === 0) {
+    console.warn(
+      "⚠️  [esbuild] --sync-installed was given but INFLYNX_SYNC_TARGETS is empty; nothing synced.\n" +
+      "   Example: INFLYNX_SYNC_TARGETS=\"$HOME/.vscode/extensions/inflynx.inflynx-code-1.0.0\" pnpm dev:sync"
+    );
+    return;
+  }
 
   for (const target of targets) {
-    if (fs.existsSync(target)) {
-      try {
-        fs.cpSync("dist", path.join(target, "dist"), { recursive: true });
-        fs.copyFileSync("package.json", path.join(target, "package.json"));
-        console.log(`🚀 [esbuild] Successfully synced build to ${target}`);
-      } catch (e) {
-        console.warn(`⚠️ [esbuild] Failed to sync to ${target}:`, e.message);
-      }
+    if (!path.isAbsolute(target)) {
+      console.warn(`⚠️  [esbuild] Skipping relative sync target (absolute path required): ${target}`);
+      continue;
+    }
+    if (!fs.existsSync(target)) {
+      console.warn(`⚠️  [esbuild] Skipping missing sync target: ${target}`);
+      continue;
+    }
+    try {
+      fs.cpSync("dist", path.join(target, "dist"), { recursive: true });
+      fs.copyFileSync("package.json", path.join(target, "package.json"));
+      console.log(`🚀 [esbuild] Synced build to ${target}`);
+    } catch (e) {
+      console.warn(`⚠️ [esbuild] Failed to sync to ${target}:`, e.message);
     }
   }
 }

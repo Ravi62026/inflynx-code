@@ -6,7 +6,7 @@
 
 import fs from "fs";
 import path from "path";
-import { select, password, search, confirm } from "@inquirer/prompts";
+import { select, input, password, search, confirm } from "@inquirer/prompts";
 import {
   createCredentialProfile,
   deleteCredentialProfile,
@@ -24,6 +24,10 @@ import {
   type ProviderInfo,
   type ReasoningEffort,
   findWorkspaceRoot,
+  getProjectMcpConfigPaths,
+  listTrustedMcpServers,
+  revokeMcpServer,
+  trustMcpServer,
 } from "@inflynx/config";
 import { ToolRegistry, CORE_TOOLS } from "@inflynx/tool-runtime";
 import {
@@ -36,15 +40,23 @@ import {
   DebugEngine,
   GraphEngine,
   AgentOrchestrator,
-  ContextManager,
   VerificationEngine,
+  resolvePackageManager,
   FindingEngine,
   MODE_TOOL_PERMISSIONS,
   type ApprovalHandler,
   type ToolApprovalRequest,
 } from "@inflynx/agent-core";
 import { AgentEventBus } from "@inflynx/protocol";
-import { CanonicalPathGuard, CommandPolicy } from "@inflynx/policy-engine";
+import {
+  CanonicalPathGuard,
+  CommandPolicy,
+  getShellAuditPath,
+  getUserShellRulesPath,
+  readShellAudit,
+  reviewShellCommand,
+  SHELL_AUDIT_RELATIVE_PATH,
+} from "@inflynx/policy-engine";
 import { HnswVectorStore } from "@inflynx/vector-store";
 import { createSessionStore } from "@inflynx/session-store";
 import { applySurgicalPatch, computeUnifiedDiff } from "@inflynx/patch-engine";
@@ -71,10 +83,11 @@ const SLASH_COMMANDS = [
   { name: "/sessions",     value: "/sessions",     description: "List all saved agent sessions (SQLite & PostgreSQL)" },
   { name: "/resume",       value: "/resume",       description: "Restore & resume a past agent session: /resume <session_id>" },
   { name: "/tokens",       value: "/tokens",       description: "Show real-time session token usage telemetry & USD cost tracking" },
-  { name: "/compact",      value: "/compact",      description: "Inspect & trigger priority-based context compaction" },
-  { name: "/context",      value: "/context",      description: "Alias for /compact — inspect context compaction" },
+  { name: "/compact",      value: "/compact",      description: "Reclaim window space now: drop stale tool output and fold the oldest turns into a summary" },
+  { name: "/context",      value: "/context",      description: "Alias for /compact — show and reclaim context-window usage" },
   { name: "/security",     value: "/security",     description: "Inspect path traversal guards, command policy & tool mode permissions" },
-  { name: "/verify",       value: "/verify",       description: "Run workspace build & test verification engine with repair checks" },
+  { name: "/verify",       value: "/verify",       description: "Run the workspace build/typecheck/test gates and report which one failed (--dry-run to just list them)" },
+  { name: "/undo",         value: "/undo",         description: "Revert the last turn that changed files, from its checkpoint (--list to see the history)" },
   { name: "/findings",     value: "/findings",     description: "Show evidence-first debug findings & codebase health score" },
   { name: "/vector",       value: "/vector",       description: "Semantic search across workspace using vector embeddings & cosine similarity" },
   { name: "/mode",         value: "/mode",         description: "Switch execution mode: ask | plan | agent | debug" },
@@ -91,7 +104,7 @@ const SLASH_COMMANDS = [
   { name: "/reasoning",   value: "/reasoning",    description: "Alias for /effort — set thinking/reasoning effort" },
   { name: "/budget",      value: "/budget",       description: "Set local agent loop budget: low|medium|high" },
   { name: "/tools",        value: "/tools",        description: "List available agent tools (filtered by active mode)" },
-  { name: "/mcp",          value: "/mcp",          description: "Manage & list Model Context Protocol (MCP) connectors" },
+  { name: "/mcp",          value: "/mcp",          description: "Manage MCP connectors: list | add <name> | trust <id> | untrust <id>" },
   { name: "/skills",       value: "/skills",       description: "List & view discovered agent skills (.inflynx/skills)" },
   { name: "/create-skill", value: "/create-skill", description: "Interactively create a new reusable agent skill" },
   { name: "/index",        value: "/index",        description: "View workspace index summary & relevant files" },
@@ -128,6 +141,28 @@ function getApiKeyForProvider(providerId: string): string | undefined {
 // after a crash) used to be duplicated here. It now lives once, centrally, in
 // `ExecutionContext.ensureHistoryIntegrity()` — called automatically by
 // `AgentOrchestrator.runTurn()`'s error handler and by `resumeSession()`.
+
+/**
+ * Parses a JSON object a model produced as *data* (currently: an MCP server
+ * proposal). Returns null rather than throwing, because the caller's next step is a
+ * human confirmation screen and "the model's answer was not JSON" belongs there as
+ * an outcome, not as a crash. Never eval, never a schema-less cast beyond this.
+ */
+function safeParseJsonObject(text: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function truncateForPrompt(text: string, max: number): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  return oneLine.length > max ? oneLine.slice(0, max - 1) + "…" : oneLine;
+}
 
 function printToolApprovalHeader(toolName: string, args: Record<string, unknown>) {
   console.log();
@@ -216,9 +251,11 @@ async function selectAllModelsDropdown(currentModel: string, currentProviderId: 
 async function main() {
   loadEnv();
 
-  // Find true monorepo workspace root
+  // Find true monorepo workspace root. This is now the ONLY root: it is passed to
+  // the orchestrator, whose ToolExecutionGateway hands the same canonical guard to
+  // every tool. The old `process.env.INFLYNX_WORKSPACE_ROOT` side-channel let tools
+  // re-resolve paths against a process-wide root and disagree with the guard.
   const workspaceRoot = findWorkspaceRoot(process.cwd());
-  process.env.INFLYNX_WORKSPACE_ROOT = workspaceRoot;
 
   // Init tool registry, MCP client manager, Skill manager, Plan engine & workspace indexer
   const registry = new ToolRegistry(CORE_TOOLS);
@@ -335,34 +372,90 @@ async function main() {
   const eventBus = new AgentEventBus();
 
   // ─── Tool Approval Handler ───────────────────────────────────────────────────
-  // ApprovalProvider auto-approves "readonly" tools before ever calling this —
-  // this handler only fires for readwrite/shell tools.
+  // Commands the user chose "allow for the rest of this session" for, so a repeated
+  // build/test loop does not re-prompt every round. Exact-string, not prefix: "npm
+  // run test" must not silently authorise "npm run test && rm -rf /".
+  const sessionApprovedCommands = new Set<string>();
+
+  // ApprovalProvider auto-approves read-only *core* tools before ever calling this —
+  // this handler fires for readwrite/shell tools, MCP tools, and anything the shell
+  // rule engine graded `ask`.
   const approvalHandler: ApprovalHandler = async (request: ToolApprovalRequest) => {
     const permColor = request.permissionLevel === "shell" ? colors.red : colors.yellow;
+    const command = String(request.args?.command || "");
+    const isShell = request.permissionLevel === "shell";
+
+    if (isShell && sessionApprovedCommands.has(command)) {
+      console.log(`${colors.gray}[allowed earlier for this session]${colors.reset}`);
+      return true;
+    }
+
     console.log(`${permColor}Permission required: ${request.permissionLevel}${colors.reset}`);
+    if (request.shellReview) {
+      // The structure itself was already printed with the tool.proposed header; here
+      // only name the part that forced the prompt, so the decision is scannable.
+      const escalations = request.shellReview.verdicts.filter((v) => v.decision !== "allow");
+      for (const verdict of escalations) {
+        console.log(`  ${colors.yellow}→ ${verdict.text}${colors.reset} ${colors.gray}— ${verdict.reason}${colors.reset}`);
+      }
+      if (request.shellReview.features.writeRedirections.length > 0) {
+        console.log(
+          `  ${colors.yellow}⚠ writes ${request.shellReview.features.writeRedirections.join(", ")} directly — ` +
+          `no diff preview, no undo${colors.reset}`
+        );
+      }
+      if (request.shellReview.features.substitutions.length > 0) {
+        console.log(`  ${colors.yellow}⚠ also runs: ${request.shellReview.features.substitutions.join(" ; ")}${colors.reset}`);
+      }
+    } else if (!isShell) {
+      printToolApprovalHeader(request.toolName, request.args as Record<string, unknown>);
+    }
 
-    let approved = false;
     try {
-      approved = await confirm({
-        message: `Execute ${colors.bold}${request.toolName}${colors.reset}?`,
-        default: false,
-      });
-    } catch {
-      approved = false;
-    }
+      const choices = isShell
+        ? [
+            { name: "Yes, run this once", value: "once" },
+            { name: `Yes, and allow \`${truncateForPrompt(command, 46)}\` for the rest of this session`, value: "session" },
+            { name: "No — deny", value: "deny" },
+          ]
+        : [
+            { name: "Yes, run this", value: "once" },
+            { name: "No — deny", value: "deny" },
+          ];
 
-    if (!approved) {
+      const answer = await select({
+        message: `Execute ${colors.bold}${request.toolName}${colors.reset}?`,
+        choices,
+      });
+      const approved = answer === "once" || answer === "session";
+      if (answer === "session" && isShell) sessionApprovedCommands.add(command);
+      if (!approved) console.log(`${colors.yellow}⊘ Denied: ${request.toolName}${colors.reset}\n`);
+      return approved;
+    } catch {
+      // Ctrl+C / closed prompt is a refusal, never an implicit yes.
       console.log(`${colors.yellow}⊘ Skipped: ${request.toolName}${colors.reset}\n`);
+      return false;
     }
-    return approved;
   };
 
   // ─── Live Event Bus Rendering ────────────────────────────────────────────────
   // Everything the terminal prints during a turn is driven by AgentOrchestrator's
   // events — this is the single code path shared by every tool call, whether it
   // came from a plain user message, /debug, /plan, /execute-plan, or /mcp add.
-  eventBus.on<{ toolName: string; permissionLevel: string; args: Record<string, unknown> }>("tool.proposed", (evt) => {
-    printToolApprovalHeader(evt.payload.toolName, evt.payload.args);
+  eventBus.on<{ toolName: string; permissionLevel: string; args: Record<string, unknown>; shellDecision?: string; shellSegments?: Array<{ text: string; decision: string; reason: string }> }>("tool.proposed", (evt) => {
+    if (evt.payload.shellSegments?.length) {
+      // Every shell call shows its parsed structure, including the ones the rules
+      // cleared without asking — otherwise "what just ran?" has no answer on screen.
+      const line = truncateForPrompt(String(evt.payload.args?.command || ""), 120);
+      console.log(`${colors.bold}${colors.magenta}$${colors.reset} ${colors.bold}${line}${colors.reset}`);
+      for (const verdict of evt.payload.shellSegments) {
+        if (verdict.decision === "allow" && evt.payload.shellSegments.length === 1) continue;
+        const color = verdict.decision === "deny" ? colors.red : verdict.decision === "ask" ? colors.yellow : colors.brightGreen;
+        console.log(`  ${color}${verdict.decision}${colors.reset} ${colors.gray}${verdict.text} — ${verdict.reason}${colors.reset}`);
+      }
+    } else {
+      printToolApprovalHeader(evt.payload.toolName, evt.payload.args);
+    }
 
     if (evt.payload.toolName === "patch_file") {
       const filePath = String(evt.payload.args.path || "");
@@ -463,7 +556,51 @@ async function main() {
     sessionStore
   );
 
-  const contextManager = new ContextManager(128000);
+  // NOTE: the old `new ContextManager(128000)` lived here. It was never fed any
+  // messages, so `/compact` reported 0 items forever and the 128000 had no
+  // relationship to the selected model. Context relief now lives in the
+  // orchestrator, driven by the model's actual window.
+
+  // ─── Ctrl+C Interrupt ─────────────────────────────────────────────────────
+  // During a turn this now genuinely stops it: `runTurn` holds one AbortSignal per
+  // turn and checks that exact signal between tool calls (Phase 6), so pending
+  // calls are skipped and the interrupted round is repaired before the next turn.
+  // A second Ctrl+C exits the process outright.
+  let turnInFlight = false;
+  let interruptRequested = false;
+  // One exit path, so a background shell can never survive a way out of the CLI.
+  // `detached` children outlive an unclean parent by design; reaping here is the
+  // only thing that guarantees a leftover `pnpm dev` is not holding port 3000 for
+  // the next session. The count is reported, not assumed.
+  const exitInflynx = (code: number, label: string) => {
+    const { shellsStopped } = orchestrator.shutdown({ abortTurn: false });
+    mcpManager.disconnectAll();
+    if (shellsStopped > 0) {
+      console.log(`${colors.yellow}⚠ Stopped ${shellsStopped} background shell(s) this session had started.${colors.reset}`);
+    }
+    console.log(`\n${colors.cyan}${label} 👋${colors.reset}\n`);
+    process.exit(code);
+  };
+
+  process.on("SIGINT", () => {
+    if (!turnInFlight) {
+      exitInflynx(130, "Goodbye!");
+    }
+    if (interruptRequested) {
+      console.log(`\n${colors.red}Second interrupt — exiting.${colors.reset}`);
+      exitInflynx(130, "Goodbye!");
+    }
+    interruptRequested = true;
+    orchestrator.abort();
+    const running = orchestrator.runningShellCount();
+    console.log(
+      `\n${colors.yellow}⏹ Interrupting this turn — finishing the current step, then returning to the prompt. ` +
+      `Ctrl+C again to exit.${colors.reset}` +
+      (running > 0
+        ? `\n${colors.gray}   ${running} background shell(s) keep running; shell_stop them or exit to clean up.${colors.reset}`
+        : "")
+    );
+  });
 
   const switchToKnownModel = async (
     provider: ProviderInfo,
@@ -669,23 +806,53 @@ async function main() {
         }
         console.log(`  ${colors.cyan}Total Tokens:${colors.reset}       ${totalTokens.toLocaleString()}`);
         console.log(`  ${colors.brightGreen}Estimated Cost:${colors.reset}     $${budget.estimatedCostUsd.toFixed(6)} USD`);
+        if (budget.contextWindow > 0) {
+          console.log(`  ${colors.cyan}Model Window:${colors.reset}        ${budget.contextWindow.toLocaleString()} tokens`);
+          console.log(
+            `  ${colors.cyan}Context Used:${colors.reset}        ${budget.projectedContextTokens.toLocaleString()} projected ` +
+            `${colors.brightCyan}(${budget.contextUtilizationPercent}% incl. output headroom)${colors.reset}`
+          );
+          console.log(
+            `  ${colors.cyan}Window Policy:${colors.reset}       ${orchestrator.contextStrategy}` +
+            `${orchestrator.contextStrategy === "evict" ? " (stale tool output is dropped automatically; set INFLYNX_CONTEXT_STRATEGY=compact for summarization)" : ""}`
+          );
+        } else {
+          console.log(`  ${colors.yellow}Context Used:${colors.reset}        window unknown for this model`);
+        }
         console.log(`${colors.gray}${"─".repeat(52)}${colors.reset}\n`);
         continue;
       }
 
       if (cmd === "compact" || cmd === "context") {
-        const activeItems = contextManager.getItems();
-        const beforeTokens = contextManager.getTotalTokens();
-        const compacted = contextManager.compactContext();
-        const afterTokens = contextManager.getTotalTokens();
+        const before = orchestrator.budget;
+        // An explicit /compact is the user asking for the expensive tier too, so it
+        // overrides the opt-in `compact` default (but never `off`).
+        const relief = await orchestrator.compactContextNow({ summarize: true });
+        const after = orchestrator.budget;
 
-        console.log(`\n${colors.bold}🧹 Context Compaction Status:${colors.reset}`);
+        console.log(`\n${colors.bold}🧹 Context Window Relief:${colors.reset}`);
         console.log(`${colors.gray}${"─".repeat(52)}${colors.reset}`);
-        console.log(`  ${colors.cyan}Total Context Items:${colors.reset}   ${activeItems.length}`);
-        console.log(`  ${colors.cyan}Retained Items:${colors.reset}        ${compacted.length}`);
-        console.log(`  ${colors.cyan}Tokens Before:${colors.reset}         ${beforeTokens.toLocaleString()}`);
-        console.log(`  ${colors.brightGreen}Tokens After:${colors.reset}          ${afterTokens.toLocaleString()}`);
-        console.log(`  ${colors.yellow}Token Limit:${colors.reset}           ${contextManager.getMaxTokenLimit().toLocaleString()}`);
+        console.log(`  ${colors.cyan}Model Window:${colors.reset}        ${after.contextWindow.toLocaleString()} tokens`);
+        console.log(`  ${colors.cyan}Before:${colors.reset}                ${before.projectedContextTokens.toLocaleString()} projected (${before.contextUtilizationPercent}%)`);
+        console.log(`  ${colors.brightGreen}After:${colors.reset}                 ${after.projectedContextTokens.toLocaleString()} projected (${after.contextUtilizationPercent}%)`);
+        console.log(
+          `  ${colors.cyan}Evicted:${colors.reset}               ${relief.dropped} stale tool result(s)`
+        );
+        console.log(
+          `  ${colors.cyan}Summarized:${colors.reset}            ` +
+          (relief.summarized > 0
+            ? `oldest turns folded into one summary`
+            : `no summary (nothing safe to fold, strategy is off, or the model declined)`)
+        );
+        console.log(`  ${colors.cyan}Freed:${colors.reset}                 ${relief.charsFreed.toLocaleString()} chars`);
+        if (relief.dropped === 0 && relief.summarized === 0) {
+          console.log(
+            `  ${colors.yellow}Nothing to drop — the remaining turns are all recent, and the older ones are` +
+            ` too small to be worth folding.${colors.reset}\n` +
+            `  ${colors.gray}Auto-summarization is gated off by design; set INFLYNX_CONTEXT_STRATEGY=compact to` +
+            ` enable it mid-session.${colors.reset}`
+          );
+        }
         console.log(`${colors.gray}${"─".repeat(52)}${colors.reset}\n`);
         continue;
       }
@@ -700,24 +867,166 @@ async function main() {
         console.log(`  ${colors.cyan}Path Guard Status:${colors.reset}       ${colors.brightGreen}ACTIVE (fs.realpathSync symlink defense)${colors.reset}`);
         console.log(`  ${colors.cyan}Active Mode:${colors.reset}             ${MODE_BADGE_COLORS[activeMode]}[${activeMode}]${colors.reset}`);
         console.log(`  ${colors.cyan}Allowed Tool Levels:${colors.reset}     ${allowedPermissions.join(", ")}`);
-        console.log(`  ${colors.cyan}Command Policy Guards:${colors.reset}   ${colors.yellow}Blocked: rm -rf /, sudo, fork bombs, destructive shell args${colors.reset}`);
+        const offered = filterToolsForMode(registry.list(), activeMode);
+        const externalOffered = offered.filter((t) => t.origin === "mcp" || t.origin === "plugin");
+        console.log(
+          `  ${colors.cyan}Third-party tools:${colors.reset}       ` +
+          `${externalOffered.length > 0 ? `${colors.brightMagenta}${externalOffered.length} available, each needs approval` : `${colors.gray}not offered in [${activeMode}] mode`}${colors.reset}`
+        );
+
+        // Shell policy, reported from the engine rather than described from memory —
+        // a HUD that recites what a control "does" is how this project ended up
+        // advertising sandbox profiles it did not have.
+        const sample = reviewShellCommand("rm -rf ./build && echo done");
+        console.log(`  ${colors.cyan}Shell policy:${colors.reset}           ${colors.yellow}parse + classify + human approval${colors.reset}`);
+        console.log(
+          `  ${colors.cyan}  worked example:${colors.reset}         ${colors.gray}${sample.command}${colors.reset} → ${
+            sample.decision === "allow" ? colors.brightGreen : sample.decision === "deny" ? colors.red : colors.yellow
+          }${sample.decision}${colors.reset} (${sample.headline})`
+        );
+        const rulesFile = getUserShellRulesPath();
+        console.log(
+          `  ${colors.cyan}  your rules:${colors.reset}          ${fs.existsSync(rulesFile) ? `${colors.brightGreen}${rulesFile}${colors.reset}` : `${colors.gray}${rulesFile} (none — built-in rules only)${colors.reset}`}`
+        );
+
+        const auditLog = getShellAuditPath(workspaceRoot);
+        const recentShell = readShellAudit(workspaceRoot, 3);
+        const auditPad = `${colors.gray}${" ".repeat(21)}${colors.reset}`;
+        console.log(
+          `  ${colors.cyan}Shell audit log:${colors.reset}        ` +
+          (recentShell.length === 0
+            ? `${colors.gray}${fs.existsSync(auditLog) ? "empty" : "no entries yet"} — ${SHELL_AUDIT_RELATIVE_PATH}${colors.reset}`
+            : recentShell
+                .map((entry) =>
+                  `${entry.decision === "allow" ? colors.brightGreen : entry.decision === "deny" ? colors.red : colors.yellow}` +
+                  `${entry.approvedBy}${colors.reset} "${truncateForPrompt(entry.command, 28)}"`
+                )
+                .join(`\n${auditPad}`))
+        );
+
+        const awaitingTrust = mcpManager.listServers().filter((s) => s.status === "needs-trust");
+        console.log(
+          `  ${colors.cyan}MCP trust:${colors.reset}              ` +
+          (awaitingTrust.length === 0
+            ? `${colors.gray}no repository-defined server awaiting trust${colors.reset}`
+            : `${colors.brightCyan}${awaitingTrust.length} not trusted (from repo config): ${awaitingTrust.map((s) => s.config.id).join(", ")}${colors.reset}`)
+        );
+        console.log(`  ${colors.cyan}Context strategy:${colors.reset}       ${orchestrator.contextStrategy}`);
         console.log(`${colors.gray}${"─".repeat(52)}${colors.reset}\n`);
+        continue;
+      }
+
+      // ─── /undo Command — turn checkpoints (backlog Phase 30) ─────────────────
+      if (cmd === "undo") {
+        const arg = parts.slice(1).join("").trim();
+        const history = orchestrator.listCheckpoints();
+
+        if (arg === "--list" || arg === "-l") {
+          if (history.length === 0) {
+            console.log(`\n  ${colors.gray}No checkpointed file changes in this session.${colors.reset}\n`);
+            continue;
+          }
+          console.log(`\n${colors.bold}🕘 Checkpointed turns (newest first):${colors.reset}`);
+          for (const c of history.slice(0, 10)) {
+            const mark = c.undone ? `${colors.gray}↩ undone${colors.reset}` : `${colors.yellow}• live${colors.reset}`;
+            console.log(
+              `  ${mark} ${colors.gray}${new Date(c.at).toLocaleTimeString()}${colors.reset} ` +
+              `${c.files.length} file(s): ${colors.brightCyan}${c.files.slice(0, 4).join(", ")}${colors.reset}` +
+              `${c.files.length > 4 ? ` +${c.files.length - 4} more` : ""}`
+            );
+            console.log(`      ${colors.gray}${c.label}${colors.reset}`);
+          }
+          console.log(`\n  ${colors.gray}Use /undo to revert the newest live one.${colors.reset}\n`);
+          continue;
+        }
+
+        const target = history.find((c) => !c.undone);
+        if (!target) {
+          console.log(`\n  ${colors.yellow}Nothing to undo — this session has not changed any files.${colors.reset}\n`);
+          continue;
+        }
+        console.log(`\n${colors.bold}↩ Revert this turn?${colors.reset}`);
+        console.log(`  ${colors.gray}${new Date(target.at).toLocaleString()} — ${target.label}${colors.reset}`);
+        for (const f of target.files) console.log(`    ${colors.brightCyan}${f}${colors.reset}`);
+
+        const ok = await confirm({ message: "Undo these files back to their pre-turn content?", default: false }).catch(() => false);
+        if (!ok) {
+          console.log(`\n  ${colors.gray}Kept as-is — nothing was changed.${colors.reset}\n`);
+          continue;
+        }
+        const res = orchestrator.undoLastTurn();
+        if (!res) {
+          console.log(`\n  ${colors.yellow}No checkpoint was available.${colors.reset}\n`);
+          continue;
+        }
+        for (const f of res.restored) console.log(`  ${colors.brightGreen}✓ restored${colors.reset} ${f}`);
+        for (const c of res.conflicts) console.log(`  ${colors.red}✗ left alone${colors.reset}    ${c.path} — ${c.reason}`);
+        console.log(
+          res.conflicts.length > 0
+            ? `\n  ${colors.yellow}${res.restored.length} reverted, ${res.conflicts.length} protected from overwrite.` +
+              ` Those files were changed by someone else after the turn — re-read them before continuing.${colors.reset}\n`
+            : `\n  ${colors.brightGreen}Turn reverted.${colors.reset}\n`
+        );
         continue;
       }
 
       // ─── /verify Command ────────────────────────────────────────────────────
       if (cmd === "verify") {
-        console.log(`\n${colors.bold}🧪 Running Verification Engine Checks...${colors.reset}`);
-        const verifier = new VerificationEngine("cli_verification");
+        const only = parts.slice(1).join("").trim();
+        // `/verify` used to print the discovered checks and a "✓ READY" badge for
+        // each, then run nothing — the command reported readiness as if it were a
+        // result. It now actually executes them; `--dry-run` keeps the old listing
+        // for when you only want to see what would be gated.
+        const dryRun = only === "--dry-run" || only === "-n";
+        const verifier = new VerificationEngine("cli_verification", eventBus, { depth: "deep" });
         const checks = verifier.discoverWorkspaceChecks(workspaceRoot);
+        const pm = resolvePackageManager(workspaceRoot);
 
+        console.log(`\n${colors.bold}🧪 Verification Engine — ${checks.length} check(s) via ${pm.manager}${colors.reset}`);
         console.log(`${colors.gray}${"─".repeat(52)}${colors.reset}`);
-        console.log(`  ${colors.cyan}Discovered Checks:${colors.reset}    ${checks.length}`);
+        console.log(`  ${colors.cyan}Runner:${colors.reset}               ${pm.manager} ${colors.gray}(${pm.reason})${colors.reset}`);
         for (const c of checks) {
-          console.log(`  • ${colors.bold}${c.name.padEnd(24)}${colors.reset} [${colors.brightGreen}✓ READY${colors.reset}] (${c.command} ${c.args.join(" ")})`);
+          const label = `${c.command} ${c.args.join(" ")}`;
+          console.log(
+            `  • ${colors.bold}${c.name.padEnd(26)}${colors.reset}` +
+            `${c.isGate ? colors.red + "[GATE]" + colors.reset : colors.gray + "[advisory]" + colors.reset} ${label} ` +
+            `${colors.gray}≤${Math.round(c.timeoutMs / 1000)}s${colors.reset}`
+          );
         }
-        console.log(`  ${colors.cyan}Repair Loop Rules:${colors.reset}    ${colors.yellow}Rejects @ts-ignore & test assertion deletion${colors.reset}`);
-        console.log(`${colors.gray}${"─".repeat(52)}${colors.reset}\n`);
+        if (checks.length === 0) {
+          console.log(`  ${colors.yellow}No typecheck/build/test script discovered — nothing can be verified here.${colors.reset}`);
+          console.log(`${colors.gray}${"─".repeat(52)}${colors.reset}\n`);
+          continue;
+        }
+        if (dryRun) {
+          console.log(`  ${colors.gray}Dry run: nothing executed. Re-run /verify to run them.${colors.reset}`);
+          console.log(`${colors.gray}${"─".repeat(52)}${colors.reset}\n`);
+          continue;
+        }
+
+        const startedAt = Date.now();
+        const summary = await verifier.runAllChecks(workspaceRoot, AbortSignal.timeout(30 * 60_000));
+        for (const r of summary.results) {
+          const icon = r.passed ? `${colors.brightGreen}✓ PASS` : `${colors.red}✗ FAIL`;
+          console.log(`  ${icon}${colors.reset} ${r.checkName.padEnd(26)} ${colors.gray}${r.durationMs.toLocaleString()}ms · exit ${r.exitCode ?? "-"}${colors.reset}`);
+          for (const e of r.parsedErrors.slice(0, 6)) {
+            console.log(`      ${colors.gray}${(e.rawOutput || e.message).slice(0, 160)}${colors.reset}`);
+          }
+          if (r.parsedErrors.length > 6) {
+            console.log(`      ${colors.gray}…and ${r.parsedErrors.length - 6} more diagnostic(s)${colors.reset}`);
+          }
+          if (!r.passed && !r.parsedErrors.length && r.stdout.trim()) {
+            // Still show something: a failing command with no parseable diagnostics
+            // is otherwise a blank wall.
+            console.log(`      ${colors.gray}${r.stdout.trim().split("\n").slice(0, 6).join("\n      ").slice(0, 900)}${colors.reset}`);
+          }
+          if (!r.passed) break;
+        }
+        console.log(`${colors.gray}${"─".repeat(52)}${colors.reset}`);
+        console.log(
+          `  ${summary.passed ? colors.brightGreen : colors.red}${summary.summaryMessage}${colors.reset} ` +
+          `${colors.gray}(${(Date.now() - startedAt).toLocaleString()}ms)${colors.reset}\n`
+        );
         continue;
       }
 
@@ -1008,17 +1317,159 @@ async function main() {
         const subCmd = parts[1]?.toLowerCase();
         const query = parts.slice(2).join(" ");
 
+        if (subCmd === "trust" || subCmd === "untrust") {
+          // Trust is recorded against the exact command line, so reviewing here means
+          // reviewing what will actually run — not a name in a file.
+          const pending = mcpManager.listServers().filter((s) => s.config.id === query.trim());
+          if (pending.length === 0) {
+            console.log(`\n${colors.yellow}No configured MCP server named "${query}".${colors.reset}\n`);
+            continue;
+          }
+          for (const s of pending) {
+            if (subCmd === "trust") {
+              // Show the URL for *any* url transport. Keying this on `transport === "sse"`
+              // meant a streamable-http server was confirmed as an empty command line —
+              // asking someone to approve a thing by showing them a different thing.
+              const line = s.config.url
+                ? `${s.config.transport} ${s.config.url}`
+                : `${s.config.command} ${(s.config.args || []).join(" ")}`.trim();
+              console.log(`\n${colors.bold}You are agreeing to run:${colors.reset} ${colors.cyan}${line}${colors.reset}`);
+              console.log(`${colors.gray}from ${path.relative(workspaceRoot, getProjectMcpConfigPaths(workspaceRoot)[0]) || "mcp.json"}, as a subprocess with a minimal environment (PATH/HOME/TMP only) plus whatever that file's "env" block sets explicitly.${colors.reset}`);
+              const ok = await confirm({ message: "Trust and start this MCP server?", default: false }).catch(() => false);
+              if (ok) {
+                trustMcpServer(s.config, `trusted manually on ${new Date().toISOString()}`);
+                // Connect immediately instead of telling the user to run the command twice:
+                // the human has now seen and agreed to this exact line, and that is the only
+                // gate in the way.
+                const reconnected = await mcpManager.reconnect(s.config.id).catch(() => null);
+                if (reconnected?.status === "connected") {
+                  const total = mcpManager.registerToolsInto(registry);
+                  console.log(
+                    `${colors.brightGreen}✓ Trusted and connected${colors.reset} — ` +
+                    `${reconnected.tools.length} tool(s) from ${reconnected.wire || s.config.transport}` +
+                    `${reconnected.serverInfo?.name ? ` (${reconnected.serverInfo.name})` : ""}; registry now has ${total}.\n`
+                  );
+                } else {
+                  console.log(
+                    `${colors.yellow}✓ Trusted, but it did not come up:${colors.reset} ` +
+                    `${(reconnected?.error || "connection failed").split("\n")[0]}\n`
+                  );
+                }
+              } else {
+                console.log(`${colors.yellow}⊘ Not trusted.${colors.reset}\n`);
+              }
+            } else {
+              const removed = s.config.trustId ? revokeMcpServer(s.config.trustId) : false;
+              console.log(
+                removed
+                  ? `\n${colors.brightGreen}✓ Trust revoked for "${s.config.id}".${colors.reset}\n`
+                  : `\n${colors.gray}"${s.config.id}" was not in the trust store.${colors.reset}\n`
+              );
+            }
+          }
+          continue;
+        }
+
         if (subCmd === "add" && query) {
-          console.log(`\n${colors.brightCyan}⚡ Auto-discovering MCP Server for: "${query}"...${colors.reset}`);
-          inputStr = [
-            `The user wants to add an MCP (Model Context Protocol) server for: "${query}".`,
-            `Please follow these steps:`,
-            `1. Use web_search to find the official/popular npm package or command for the "${query}" MCP server (e.g. @modelcontextprotocol/server-github, @figma/mcp-server, etc.).`,
-            `2. Read the configuration requirements (command, args, env vars).`,
-            `3. Use patch_file or write_file to add this new server configuration to .inflynx/mcp.json under "mcpServers".`,
-            `4. Inform the user what was added and ask them to restart or run /mcp list.`,
-          ].join("\n");
-          // Proceed into LLM execution loop below instead of slash command continue!
+          // This used to hand the model a to-do list that ended in "use write_file to
+          // edit .inflynx/mcp.json" — which turns anything the model reads on the web
+          // into a command it is allowed to run on this machine. The research may
+          // still be delegated; the *write* is a code path behind a confirmation, so
+          // untrusted content can propose but never install (backlog B6).
+          console.log(`\n${colors.brightCyan}🔌 MCP server setup — Inflynx will write the config, not the model.${colors.reset}`);
+          console.log(`${colors.gray}Searching the web for the official package is optional; it is untrusted input and can only influence what is *proposed*, never what is saved.${colors.reset}\n`);
+
+          let suggested: { id: string; command: string; args?: string[]; env?: Record<string, string>; envPassthrough?: string[] } | null = null;
+          const offerManual = async () => {
+            const command = await input({ message: `command (e.g. npx)` });
+            const argStr = await input({ message: `args (space-separated, may be empty)`, default: "" });
+            const envNames = await input({ message: `env var names it needs (comma-separated, may be empty)`, default: "" });
+            suggested = {
+              id: query.trim().toLowerCase().replace(/\s+/g, "-"),
+              command,
+              args: argStr.trim() ? argStr.trim().split(/\s+/) : [],
+              envPassthrough: envNames.trim()
+                ? envNames.split(",").map((n) => n.trim()).filter(Boolean)
+                : undefined,
+            };
+          };
+          const auto = await select({
+            message: `${colors.bold}How should Inflynx configure "${query}"?${colors.reset}`,
+            choices: [
+              { name: "Type the command myself (recommended — you know what you installed)", value: "manual" },
+              { name: "Ask the model to research it first (untrusted web content)", value: "research" },
+              { name: "Cancel", value: "cancel" },
+            ],
+          });
+
+          if (auto === "cancel") {
+            console.log(`\n${colors.yellow}⊘ Cancelled.${colors.reset}\n`);
+            continue;
+          }
+
+          if (auto === "research") {
+            console.log(`\n${colors.gray}Researching… the model is limited to read-only tools for this turn.${colors.reset}`);
+            const previousMode = activeMode;
+            activeMode = "ask";
+            orchestrator.setMode("ask");
+            orchestrator.setSystemPrompt(buildModeSystemPrompt("ask"));
+            const research = await orchestrator.runTurn([
+              `Research the MCP (Model Context Protocol) server for: "${query}".`,
+              `Answer with ONLY a JSON object, no prose, no markdown fence:`,
+              `{"id":"<short-slug>","command":"<executable>","args":["<arg>","..."],"envPassthrough":["<ENV NAME the server needs>"]}`,
+              `Do not invent a package you are unsure about; if you cannot name one, return {"id":"${query}","command":""}.`,
+            ].join("\n")).catch(() => null);
+            orchestrator.setMode(previousMode);
+            orchestrator.setSystemPrompt(buildModeSystemPrompt(previousMode));
+
+            const jsonMatch = (research?.finalText || "").match(/\{[\s\S]*\}/);
+            const proposal = jsonMatch ? safeParseJsonObject(jsonMatch[0]) : null;
+            if (proposal && typeof proposal.command === "string" && proposal.command.trim()) {
+              suggested = {
+                id: String(proposal.id || query).toLowerCase().replace(/\s+/g, "-"),
+                command: String(proposal.command).trim(),
+                args: Array.isArray(proposal.args) ? proposal.args.map(String) : [],
+                envPassthrough: Array.isArray(proposal.envPassthrough) ? proposal.envPassthrough.map(String) : undefined,
+              };
+            } else {
+              console.log(`${colors.yellow}The model did not return a usable proposal.${colors.reset}`);
+            }
+          }
+
+          if (!suggested) await offerManual();
+
+          const cfg = suggested!;
+          console.log(`\n${colors.bold}About to add MCP server:${colors.reset}`);
+          console.log(`  ${colors.cyan}id${colors.reset}      ${cfg.id}`);
+          console.log(`  ${colors.cyan}command${colors.reset}  ${cfg.command} ${(cfg.args || []).join(" ")}`);
+          if (cfg.envPassthrough?.length) {
+            console.log(`  ${colors.cyan}env${colors.reset}       will receive: ${cfg.envPassthrough.join(", ")}`);
+          }
+          console.log(`${colors.gray}Nothing else from your environment is passed to it.${colors.reset}`);
+
+          const ok = await confirm({ message: "Save and start this server?", default: false }).catch(() => false);
+          if (!ok) {
+            console.log(`\n${colors.yellow}⊘ Not added. Re-run /mcp add ${query} any time.${colors.reset}\n`);
+            continue;
+          }
+
+          try {
+            const added = await mcpManager.addServer(
+              { id: cfg.id, transport: "stdio", command: cfg.command, args: cfg.args, envPassthrough: cfg.envPassthrough },
+              workspaceRoot
+            );
+            const registered = mcpManager.registerToolsInto(registry);
+            console.log(
+              `\n${colors.brightGreen}✓ Added "${cfg.id}" — ${added.tools.length} tool(s); registry now has ${registered}.${colors.reset}\n`
+            );
+          } catch (err: any) {
+            console.log(`\n${colors.red}✗ Saved, but connecting failed: ${err?.message || err}${colors.reset}`);
+            console.log(`${colors.gray}Fix the command and run /mcp again; the entry is in .inflynx/mcp.json.${colors.reset}\n`);
+          }
+          continue;
+        } else if (subCmd === "add") {
+          console.log(`\n${colors.gray}Usage: /mcp add <name>  |  /mcp trust <id>  |  /mcp untrust <id>${colors.reset}\n`);
+          continue;
         } else {
           console.log(`\n${colors.bold}${colors.brightMagenta}🔌 Model Context Protocol (MCP) Connectors:${colors.reset}`);
           const servers = mcpManager.listServers();
@@ -1026,18 +1477,55 @@ async function main() {
             console.log(`  ${colors.gray}No MCP servers configured in .inflynx/mcp.json${colors.reset}\n`);
           } else {
             for (const s of servers) {
-              const statusColor = s.status === "connected" ? colors.brightGreen : s.status === "disabled" ? colors.yellow : colors.red;
-              console.log(`  ${colors.cyan}• ${s.config.id}${colors.reset} [${statusColor}${s.status}${colors.reset}] — ${s.config.transport.toUpperCase()} ${s.config.command || s.config.url || ""}`);
+              const statusColor =
+                s.status === "connected" ? colors.brightGreen
+                : s.status === "disabled" ? colors.yellow
+                : s.status === "needs-trust" ? colors.brightCyan
+                : colors.red;
+              const origin = s.config.source === "user" ? "~/.inflynx" : "this repo";
+              // The *negotiated* wire, not the configured one: a config that says
+              // streamable-http and falls back to legacy SSE would otherwise be reported
+              // as something it is not actually talking.
+              const wire = (s.wire || s.config.transport).toUpperCase();
+              // The whole command line, args included. Showing just `npx` here made a
+              // server that actually runs `npx -y @modelcontextprotocol/server-memory`
+              // look like something else in the one list people read to check config.
+              const target = s.config.url
+                || (s.config.command ? `${s.config.command} ${(s.config.args || []).join(" ")}`.trim() : "");
+              const who = s.serverInfo?.name
+                ? ` · ${s.serverInfo.name}${s.serverInfo.version ? ` ${s.serverInfo.version}` : ""}`
+                : "";
+              console.log(`  ${colors.cyan}• ${s.config.id}${colors.reset} [${statusColor}${s.status}${colors.reset}] — ${wire} ${target}${who} ${colors.gray}(${origin})${colors.reset}`);
               if (s.tools.length > 0) {
                 console.log(`    ${colors.gray}Tools (${s.tools.length}): ${s.tools.map((t) => t.name).join(", ")}${colors.reset}`);
               }
               if (s.error) {
-                console.log(`    ${colors.red}Error: ${s.error}${colors.reset}`);
+                // "Error: Connected, but the server advertised no tools" is not an error.
+                // A healthy-but-empty server gets a neutral prefix so the list stays readable.
+                const prefix = s.status === "needs-trust" ? "Waiting on you: "
+                  : s.status === "connected" ? "Note: " : "Error: ";
+                console.log(`    ${s.status === "connected" ? colors.yellow : colors.red}${prefix}${s.error}${colors.reset}`);
               }
+            }
+            const needingTrust = servers.filter((s) => s.status === "needs-trust");
+            if (needingTrust.length > 0) {
+              console.log(
+                `\n  ${colors.brightCyan}${needingTrust.length} server(s) defined by this repository are not running.${colors.reset}\n` +
+                `  ${colors.gray}Repo content cannot grant itself permission to execute. Review then run:${colors.reset}\n` +
+                needingTrust.map((s) => `    ${colors.cyan}/mcp trust ${s.config.id}${colors.reset}`).join("\n") +
+                "\n"
+              );
+            }
+            const trustedEntries = listTrustedMcpServers();
+            if (trustedEntries.length > 0) {
+              console.log(
+                `  ${colors.gray}Trust store: ${trustedEntries.length} entr(y/ies) in ~/.inflynx/mcp-trust.json ` +
+                `(revoked with /mcp untrust <id>; an entry stops applying if the command it records changes).${colors.reset}\n`
+              );
             }
             console.log();
           }
-          console.log(`${colors.gray}Tip: Type '/mcp add figma' or '/mcp add github' to auto-find and configure new MCP servers!${colors.reset}\n`);
+          console.log(`${colors.gray}Tip: '/mcp add <name>' configures a server — you approve the exact command before it is saved or run.${colors.reset}\n`);
           continue;
         }
       }
@@ -1443,9 +1931,23 @@ async function main() {
       }
 
       if (cmd === "exit" || cmd === "quit") {
-        mcpManager.disconnectAll();
-        console.log(`\n${colors.cyan}Goodbye! 👋${colors.reset}\n`);
-        process.exit(0);
+        const running = orchestrator.runningShellCount();
+        if (running > 0) {
+          // Say which ones, so the choice to leave is informed rather than a coin flip.
+          console.log(`\n${colors.yellow}⚠ ${running} background shell(s) still running:${colors.reset}`);
+          for (const shell of orchestrator.runningShells()) {
+            console.log(`  ${colors.cyan}${shell.id}${colors.reset} $ ${shell.command}`);
+          }
+          const sure = await confirm({
+            message: `Stopping them all and exit? Choosing no returns to the prompt.`,
+            default: true,
+          }).catch(() => false);
+          if (!sure) {
+            console.log(`${colors.gray}Still running. Use shell_stop <id>, or /exit again to confirm.${colors.reset}\n`);
+            continue;
+          }
+        }
+        exitInflynx(0, "Goodbye!");
       }
 
       // If command was /mcp add, /skills add, /plan <task>, /execute-plan, or /debug <task>, break out and let LLM process!
@@ -1510,10 +2012,38 @@ async function main() {
     // tracking, and persistence of every user/assistant/tool message + token
     // telemetry to SessionStore. Everything printed during the turn is driven by
     // the `eventBus` listeners registered once at startup, above.
+    turnInFlight = true;
+    interruptRequested = false;
+    let turnResult: Awaited<ReturnType<AgentOrchestrator["runTurn"]>> | undefined;
     try {
-      await orchestrator.runTurn(inputStr, attachedContext || undefined);
+      turnResult = await orchestrator.runTurn(inputStr, attachedContext || undefined);
     } catch (err: any) {
       console.error(`\n${colors.red}❌ Unexpected orchestrator error:${colors.reset} ${err?.message || String(err)}\n`);
+    } finally {
+      turnInFlight = false;
+    }
+
+    // The verification gate's own words, printed where the user always looks: the end of
+    // a turn. `verification.started/finished` also stream on the event bus, but a control
+    // that exists only as an event is a control nobody sees — the same reason `/security`
+    // and `/tokens` report live state instead of reciting policy (backlog Phase 31).
+    const gate = turnResult?.verification;
+    if (gate) {
+      const tone =
+        gate.outcome === "passed" ? colors.brightGreen :
+        gate.outcome === "failed" ? colors.red : colors.yellow;
+      console.log(
+        `${tone}🔒 verification: ${gate.outcome}${colors.reset}` +
+        `${colors.gray}  ·  ${gate.packageManager ?? "?"} ${gate.depth} depth  ·  `
+        + `${gate.checksRun} check(s)  ·  ${gate.sourceFilesChanged.length} file(s) changed`
+        + `${gate.repairAttempts ? `  ·  ${gate.repairAttempts} repair attempt(s)` : ""}${colors.reset}`
+      );
+      if (gate.failedChecks.length > 0) {
+        console.log(`   ${colors.red}failing gates:${colors.reset} ${gate.failedChecks.join(", ")}`);
+      }
+      if (gate.outcome !== "passed" && gate.summaryMessage) {
+        console.log(`   ${colors.gray}${gate.summaryMessage}${colors.reset}`);
+      }
     }
     console.log();
   }

@@ -21,6 +21,9 @@ export type AgentEventType =
   | "file.changed"
   | "verification.started"
   | "verification.finished"
+  // Was emitted as `"repair.attempted" as any` from RepairLoop — an event the type
+  // system had never heard of, so no UI could subscribe to it without a cast.
+  | "repair.attempted"
   | "budget.warning"
   | "turn.completed"
   | "turn.failed"

@@ -40,13 +40,9 @@ export const ModelEffortPopover: React.FC<ModelEffortPopoverProps> = ({
   const popoverRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
-  const catalogList: ModelInfo[] = Array.isArray(modelsCatalog)
-    ? modelsCatalog
-    : modelsCatalog && typeof modelsCatalog === "object"
-    ? Object.values(modelsCatalog).flat()
-    : [];
-
-  const availableModels = catalogList.length > 0 ? catalogList : DEFAULT_MODELS;
+  // `modelsCatalog` is already normalized upstream by App.tsx via
+  // normalizeModelsCatalog(); this component must not re-derive it.
+  const availableModels = modelsCatalog.length > 0 ? modelsCatalog : DEFAULT_MODELS;
 
   const filteredModels = availableModels.filter((m) => {
     if (!m) return false;

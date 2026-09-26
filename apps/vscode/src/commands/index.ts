@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import path from "node:path";
 import fs from "node:fs";
 import type { InflynxService } from "../InflynxService.js";
+import { formatContextWindow, normalizeModelsCatalog } from "../models.js";
 import type { ServerManager } from "../ServerManager.js";
 import type { ChatViewProvider } from "../ChatViewProvider.js";
 import type { SessionTreeProvider } from "../trees/SessionTreeProvider.js";
@@ -66,13 +67,23 @@ export function registerCommands(
     vscode.commands.registerCommand("inflynx.switchModel", async () => {
       try {
         const modelsData = await service.getModels();
-        const items = modelsData.catalog.map((m) => ({
-          label: m.name || m.id,
-          description: `${m.provider} • ${Math.round(m.contextWindow / 1000)}k ctx`,
-          detail: m.description,
-          modelId: m.id,
-          provider: m.provider,
-        }));
+        type ModelPick = vscode.QuickPickItem & { modelId: string; provider: string };
+        const items: ModelPick[] = normalizeModelsCatalog(modelsData.catalog)
+          .sort((a, b) => a.provider.localeCompare(b.provider) || a.name.localeCompare(b.name))
+          .map((m) => ({
+            label: m.name || m.id,
+            description: `${m.provider} • ${formatContextWindow(m.contextWindow)}`,
+            detail: m.description,
+            modelId: m.id,
+            provider: m.provider,
+          }));
+
+        if (items.length === 0) {
+          vscode.window.showWarningMessage(
+            "No models were returned by the Inflynx server. Check that the backend is running and the catalog is configured."
+          );
+          return;
+        }
 
         const selected = await vscode.window.showQuickPick(items, {
           placeHolder: "Select Language Model",

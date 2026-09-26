@@ -7,4 +7,14 @@ esbuild.config.mjs
 *.tsbuildinfo
 node_modules/**
 .DS_Store
+# `*.map` on its own only matches the package root, so 2.2 MB of sourcemaps under
+# dist/ were shipped inside every .vsix (backlog A7). Keep both forms.
 *.map
+**/*.map
+**/*.tsbuildinfo
+**/*.vsix
+docs/**
+.inflynx/**
+*.log
+.env
+.env.*

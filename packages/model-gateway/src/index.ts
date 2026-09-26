@@ -28,6 +28,17 @@ import { streamOpenAiCompatible } from "./openai-chat.js";
 import { streamOpenAiResponses } from "./openai-responses.js";
 
 export { estimateTokenUsageCost, PROVIDER_PRICING_TABLE, type ModelPricing } from "./usage-tracker.js";
+export {
+  abortedError,
+  classifyProviderError,
+  InflynxProviderError,
+  isProviderError,
+  networkError,
+  providerError,
+  toProviderError,
+  type ProviderErrorInfo,
+  type ProviderErrorKind,
+} from "./errors.js";
 export { formatAnthropicMessages, formatAnthropicTools, streamAnthropic } from "./anthropic.js";
 export { formatGeminiContents, streamGemini } from "./gemini.js";
 export { formatOpenAiCompatibleMessages, streamOpenAiCompatible } from "./openai-chat.js";

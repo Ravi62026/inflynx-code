@@ -12,7 +12,7 @@ import { DiagnosticsProvider } from "./DiagnosticsProvider.js";
 import { InflynxCodeActionProvider } from "./CodeActionProvider.js";
 import { InflynxInlineCompletionProvider } from "./InlineCompletionProvider.js";
 import { registerCommands } from "./commands/index.js";
-import type { AgentBudgetLevel, AgentMode } from "./types.js";
+import type { AgentBudgetLevel, AgentMode, ReasoningEffort } from "./types.js";
 
 let serviceInstance: InflynxService | null = null;
 let serverManagerInstance: ServerManager | null = null;

@@ -1,20 +1,94 @@
+import path from "node:path";
 import { AgentEventBus, type PublicAgentEvent } from "@inflynx/protocol";
-import { streamModel, type Message, type ModelEvent, type ReasoningEffort, type TokenUsage } from "@inflynx/model-gateway";
+import { streamModel, toProviderError, type FinishReason, type Message, type ModelEvent, type ReasoningEffort, type TokenUsage } from "@inflynx/model-gateway";
 import {
   assertSupportedReasoningEffort,
   getCredentialProfile,
   getProvider,
   redactSecrets,
+  resolveContextLimits,
   resolveCredentialSecret,
 } from "@inflynx/config";
 import { ToolRegistry, safeParseJsonArgs, type ToolCall, type ToolResult } from "@inflynx/tool-runtime";
 import { ToolExecutionGateway } from "@inflynx/tool-runtime";
+import { reviewShellCommand } from "@inflynx/policy-engine";
 import { createSessionStore, generateSessionId, type SessionStore } from "@inflynx/session-store";
-import { StateMachine, type AgentState } from "./StateMachine.js";
+import { StateMachine, LEGAL_STATE_TRANSITIONS, type AgentState } from "./StateMachine.js";
 import { BudgetManager, type AgentBudgetLevel, type BudgetState } from "./BudgetManager.js";
-import { ExecutionContext, type ExecutionOptions } from "./ExecutionContext.js";
+import { ExecutionContext, type ContextStrategy, type ExecutionOptions } from "./ExecutionContext.js";
 import { ApprovalProvider, type ApprovalHandler } from "./ApprovalProvider.js";
-import { filterToolsForMode } from "../index.js";
+import {
+  VerificationEngine,
+  type SuiteSummary,
+  type VerificationCheck,
+} from "../verification/VerificationEngine.js";
+import { RepairLoop } from "../verification/RepairLoop.js";
+import type { DiagnosticError } from "../verification/FailureParser.js";
+import { filterToolsForMode, type AgentMode } from "../index.js";
+
+/** How many times one turn may double its output ceiling after a truncation. */
+const MAX_TRUNCATION_RETRIES = 2;
+
+/** Utilization above which stale tool results start getting dropped. */
+const CONTEXT_SOFT_LIMIT = 0.85;
+
+/**
+ * Utilization above which eviction alone is not enough and a summarization pass is
+ * worth its own model call. Deliberately above `CONTEXT_SOFT_LIMIT` so the free
+ * tier always gets first refusal.
+ */
+const CONTEXT_COMPACT_LIMIT = 0.92;
+
+/**
+ * Protected-window ladder for eviction. A single fixed floor made eviction
+ * unreachable in short sessions that carry very large tool output — exactly when it
+ * was needed — so the protected tail shrinks until something can be dropped.
+ */
+const CONTEXT_PROTECTION_LADDER = [12, 6, 2];
+
+/**
+ * Instructions for the compaction pass. It is a *memory* request, not a chat: the
+ * things listed here are the ones a model cannot reconstruct and will otherwise
+ * repeat or contradict after its earlier turns are gone.
+ */
+const SUMMARIZER_SYSTEM_PROMPT =
+  "You are compacting an AI coding agent's conversation history so it fits a smaller " +
+  "context window. Write dense notes, not a narrative. Another model will act on these " +
+  "notes believing they are its own earlier work, so preserve verbatim: " +
+  "1) the user's original request, 2) every file path read or edited and what was learned " +
+  "about it, 3) decisions taken and rejected, 4) commands run and their results, " +
+  "5) unresolved errors, failing tests and open questions, 6) the current task state. " +
+  "Drop pleasantries, restated explanations and tool output that was already acted upon. " +
+  "Answer with the notes only.";
+
+/**
+ * Renders a history slice for the summarizer. Bounded on purpose: feeding a 300k
+ * character prefix to a model with a 32k window in order to *fit* a 32k window is
+ * how compaction gets itself rejected, so the excerpt is capped and the excess is
+ * represented by a marker rather than silently dropped.
+ */
+function serializeForSummary(messages: Message[], maxChars: number): string {
+  const parts: string[] = [];
+  let used = 0;
+  for (const message of messages) {
+    const body = message.content || "";
+    const calls = (message.tool_calls || [])
+      .map((call) => `${call.function?.name}(${(call.function?.arguments || "").slice(0, 160)})`)
+      .join(", ");
+    const line = `[${message.role}]${calls ? ` calls: ${calls}` : ""} ${body}`;
+    if (used + line.length > maxChars) {
+      parts.push(`[... ${messages.length - parts.length} older message(s) omitted from this excerpt ...]`);
+      break;
+    }
+    used += line.length;
+    parts.push(line.length > 2_400 ? line.slice(0, 2_400) + " […truncated]" : line);
+  }
+  return parts.join("\n");
+}
+
+// Overflow detection used to live here as a message regex shared by the retry path.
+// It is now `classifyProviderError`/`toProviderError` in @inflynx/model-gateway, so
+// the wording is matched once, in the layer that knows which provider said it.
 
 export interface TurnResult {
   sessionId: string;
@@ -24,6 +98,42 @@ export interface TurnResult {
   toolResults: ToolResult[];
   budgetState: BudgetState;
   isCompleted: boolean;
+  /**
+   * The verification gate's verdict, when one applied. Absent means "this turn
+   * changed no source files"; present-but-failed means the turn is *not* done in
+   * the sense the user cares about, and `finalText` alone would hide that.
+   */
+  verification?: VerificationReport;
+  /** Identifies this turn in the undo journal; `/undo` lists it before reverting. */
+  turnId: string;
+  /** Files this turn's checkpoint can put back, or `[]` when nothing was written. */
+  checkpointFiles?: string[];
+}
+
+export type VerificationOutcome =
+  /** Every discovered gate passed. */
+  | "passed"
+  /** A gate failed and the repair budget is gone. */
+  | "failed"
+  /** Source files changed but the workspace declares no checks — honestly "unverified", not a pass. */
+  | "no-gates-configured"
+  /** The turn ended early (abort, budget, provider error) before the gate could run. */
+  | "not-run"
+  /** The gate ran while the user was interrupting, so its result is meaningless. */
+  | "cancelled";
+
+export interface VerificationReport {
+  outcome: VerificationOutcome;
+  /** Files that triggered the gate. Empty when `outcome` is `not-run`. */
+  sourceFilesChanged: string[];
+  checksRun: number;
+  failedChecks: string[];
+  /** Which runner and depth were used, so a failure can be read in context. */
+  packageManager?: string;
+  depth?: string;
+  repairAttempts: number;
+  /** The line to show the user — never an empty "✓ done" when nothing ran. */
+  summaryMessage: string;
 }
 
 export class AgentOrchestrator {
@@ -74,6 +184,7 @@ export class AgentOrchestrator {
     this.approvalProvider = new ApprovalProvider(approvalHandler);
     this.approvalHandler = approvalHandler;
     this.sessionStore = sessionStore || createSessionStore(this.context.workspaceRoot);
+    this.applyModelWindow();
 
     this.eventBus.emit("session.started", this.context.sessionId, {
       workspaceRoot: this.context.workspaceRoot,
@@ -147,7 +258,18 @@ export class AgentOrchestrator {
   }
 
   get budget(): BudgetState {
-    return this.budgetManager.getBudgetState();
+    // History is passed in so the context numbers describe the *current* window.
+    return this.budgetManager.getBudgetState(this.context.history);
+  }
+
+  /** The execution mode currently in force. Needed to compare before changing it. */
+  get activeMode(): AgentMode {
+    return this.context.activeMode;
+  }
+
+  /** How hard this session will work to stay inside its window. Read-only policy. */
+  get contextStrategy(): ContextStrategy {
+    return this.context.contextStrategy;
   }
 
   get store(): SessionStore {
@@ -257,6 +379,34 @@ export class AgentOrchestrator {
     if (this.stateMachine.canTransitionTo("cancelled")) {
       this.stateMachine.transitionTo("cancelled", "User signal abort");
     }
+  }
+
+  /**
+   * Ends this session's turn and terminates everything it left running.
+   *
+   * Background shells are spawned in their own process group so they can be killed
+   * cleanly — which also means they happily outlive a parent that exits without
+   * asking. Every shutdown path (CLI `/exit`, Ctrl+C, server session delete,
+   * extension deactivate) must call this, or the leftover `pnpm dev` holds the port
+   * the next session needs. Reports what it actually stopped rather than claiming a
+   * clean exit it did not perform.
+   */
+  shutdown(options: { abortTurn?: boolean } = {}): { shellsStopped: number } {
+    if (options.abortTurn !== false) this.abort();
+    return { shellsStopped: this.gateway.shutdownShells() };
+  }
+
+  /** Background shells this session started, for a status line or a confirmation prompt. */
+  runningShellCount(): number {
+    return this.runningShells().length;
+  }
+
+  /** The still-running shells themselves, so a shutdown prompt can name them. */
+  runningShells(): Array<{ id: string; command: string; cwd: string }> {
+    return this.gateway.shells
+      .list()
+      .filter((shell) => shell.endedAt === undefined)
+      .map((shell) => ({ id: shell.id, command: shell.command, cwd: shell.cwd }));
   }
 
   /**
@@ -384,9 +534,24 @@ export class AgentOrchestrator {
    * Executes a complete agentic turn with model streaming and tool invocation.
    */
   async runTurn(userPrompt: string, attachedContext?: string): Promise<TurnResult> {
-    if (this.stateMachine.canTransitionTo("classifying")) {
-      this.stateMachine.transitionTo("classifying", "Starting new task turn");
-    }
+    // One cancellation generation per turn. Hold this exact signal for the whole
+    // turn — `context.signal` can belong to a later generation after an abort.
+    const signal = this.context.beginGeneration();
+    // Repeat-read dedupe is scoped to this turn: last turn's results may since have
+    // been evicted, and a pointer to something the model can no longer see is worse
+    // than the duplicate it would have saved.
+    this.gateway.beginToolTurn();
+
+    // Undo journal (backlog Phase 30). The label is redacted because it is written to
+    // `.inflynx/checkpoints/` and a prompt may quote a token from a config file.
+    const turnId = `turn_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    this.gateway.checkpoints.beginTurn(this.context.sessionId, turnId, redactSecrets(userPrompt).slice(0, 120));
+
+    this.transitionTo("classifying", "Starting new task turn");
+
+    // Repair before sending: a previous turn can have thrown (e.g. a persistence
+    // failure) before its post-loop repair ran.
+    await this.repairHistoryIntegrity();
 
     const fullPrompt = attachedContext ? `${userPrompt}\n\n=== Attached Context ===\n${attachedContext}` : userPrompt;
     this.context.addMessage({ role: "user", content: fullPrompt });
@@ -397,17 +562,25 @@ export class AgentOrchestrator {
       content: redactSecrets(fullPrompt),
     });
 
-    if (this.stateMachine.canTransitionTo("exploring")) {
-      this.stateMachine.transitionTo("exploring", "Exploring model tool calls");
-    }
+    this.transitionTo("exploring", "Exploring model tool calls");
 
     const toolResultsAcc: ToolResult[] = [];
     let assistantText = "";
     let assistantReasoning = "";
     let keepLooping = true;
+    let truncationRetries = 0;
+    let overflowRetried = false;
+    /**
+     * Source files this turn actually changed. Only the gateway's resolved paths
+     * decide this, so a plan-mode write to `.inflynx/PLAN.md` does not trigger a
+     * verification gate, and `src/../src/app.ts` does.
+     */
+    const touchedSourceFiles = new Set<string>();
+    let gateReport: VerificationReport | undefined;
+    let verificationRounds = 0;
 
     while (keepLooping) {
-      if (this.context.signal.aborted) {
+      if (signal.aborted) {
         keepLooping = false;
         break;
       }
@@ -415,9 +588,7 @@ export class AgentOrchestrator {
       const limitCheck = this.budgetManager.checkLimits();
       if (limitCheck.isExhausted) {
         this.eventBus.emit("session.failed", this.context.sessionId, { reason: limitCheck.reason });
-        if (this.stateMachine.canTransitionTo("failed")) {
-          this.stateMachine.transitionTo("failed", limitCheck.reason);
-        }
+        this.transitionTo("failed", limitCheck.reason ?? "Agent budget exhausted");
         break;
       }
 
@@ -427,11 +598,13 @@ export class AgentOrchestrator {
           `Model rate limit reached (${modelRateLimit.limit} calls/60s). ` +
           `Retry in ${modelRateLimit.resetInSec}s.`;
         this.eventBus.emit("session.failed", this.context.sessionId, { reason });
-        if (this.stateMachine.canTransitionTo("failed")) {
-          this.stateMachine.transitionTo("failed", reason);
-        }
+        this.transitionTo("failed", reason);
         break;
       }
+
+      // Stay inside the model's window *before* spending a turn on a request that
+      // the provider is going to reject anyway (backlog C1/C2).
+      await this.makeRoomInWindow();
 
       this.budgetManager.recordTurn();
       this.eventBus.emit("turn.started", this.context.sessionId, {
@@ -442,6 +615,7 @@ export class AgentOrchestrator {
       assistantReasoning = "";
       const pendingToolCallsMap = new Map<string, { id: string; name: string; args: Record<string, unknown> }>();
       let providerMetadata: Message["provider_metadata"];
+      let finishReason: FinishReason = "stop";
 
       // Prepare tools allowed for active mode
       const allTools = this.registry.list();
@@ -453,6 +627,8 @@ export class AgentOrchestrator {
           function: { name: t.name, description: t.description, parameters: t.parameters },
         }));
 
+      this.budgetManager.noteRequestSent(this.context.history.length);
+
       try {
         const stream = streamModel({
           provider: this.context.providerId as any,
@@ -463,28 +639,34 @@ export class AgentOrchestrator {
           baseURL: this.context.baseURL,
           adapter: this.context.modelAdapter,
           reasoningEffort: this.context.reasoningEffort,
-          maxTokens: this.context.maxTokens,
+          maxTokens: (this.context.maxTokens ?? this.budgetManager.outputLimit) || undefined,
           thinkingBudget: this.budgetManager.getEffortProfile().thinkingBudgetTokens,
           allowUnauthenticated: this.context.allowUnauthenticated,
           allowLocalEndpoint: this.context.allowLocalEndpoint,
           customCapabilities: this.context.customCapabilities,
-        }, this.context.signal);
+        }, signal);
 
         for await (const event of stream) {
           if (event.type === "text_delta") {
-            const safeText = redactSecrets(event.text);
-            assistantText += safeText;
-            this.eventBus.emit("model.text_delta", this.context.sessionId, { text: safeText });
+            // The model's own history keeps the RAW text. Redaction belongs on
+            // egress (event stream, persistence, logs) only: applying it to what
+            // the model reads back silently corrupts the next edit it makes.
+            assistantText += event.text;
+            this.eventBus.emit("model.text_delta", this.context.sessionId, {
+              text: redactSecrets(event.text),
+            });
           } else if (event.type === "thought_delta") {
-            const safeThought = redactSecrets(event.thought);
-            assistantReasoning += safeThought;
-            this.eventBus.emit("model.thought_delta", this.context.sessionId, { thought: safeThought });
+            assistantReasoning += event.thought;
+            this.eventBus.emit("model.thought_delta", this.context.sessionId, {
+              thought: redactSecrets(event.thought),
+            });
           } else if (event.type === "tool_call") {
             if (!pendingToolCallsMap.has(event.id)) {
               pendingToolCallsMap.set(event.id, { id: event.id, name: event.name, args: event.args });
             }
           } else if (event.type === "done") {
             this.budgetManager.recordUsage(event.usage);
+            finishReason = event.finishReason;
             providerMetadata = event.providerMetadata;
             if (event.actualModel) {
               this.context.actualModel = event.actualModel;
@@ -504,7 +686,25 @@ export class AgentOrchestrator {
           }
         }
 
-        const pendingToolCalls = Array.from(pendingToolCallsMap.values());
+        const collectedToolCalls = Array.from(pendingToolCallsMap.values());
+
+        // A stream that stopped at the output ceiling may carry a half-written
+        // `arguments` blob. Executing it could write corrupted source, so a
+        // truncated round never executes tool calls — every adapter reported
+        // `finishReason` correctly and every one of them was ignored (C5).
+        const truncated = finishReason === "length";
+        const pendingToolCalls = truncated ? [] : collectedToolCalls;
+
+        if (finishReason === "content_filter" || finishReason === "error") {
+          this.eventBus.emit("turn.failed", this.context.sessionId, {
+            error:
+              finishReason === "content_filter"
+                ? "The provider filtered this response before it finished. Rephrase the request or narrow the attached context."
+                : "The provider reported an error while generating this response.",
+          });
+          keepLooping = false;
+          continue;
+        }
 
         // Record assistant turn in context
         const assistantMsg: Message = { role: "assistant", content: assistantText };
@@ -536,14 +736,36 @@ export class AgentOrchestrator {
           providerMetadataJson: providerMetadata ? JSON.stringify(providerMetadata) : undefined,
         });
 
+        if (truncated) {
+          if (
+            truncationRetries < MAX_TRUNCATION_RETRIES &&
+            this.context.raiseOutputTokenBudget(this.budgetManager.outputLimit || 32_768)
+          ) {
+            truncationRetries++;
+            this.context.addMessage({
+              role: "user",
+              content:
+                "Your previous response hit the output-token limit and was cut off. Continue from " +
+                "exactly where you stopped; do not repeat or restart earlier output.",
+            });
+            continue;
+          }
+          this.eventBus.emit("turn.failed", this.context.sessionId, {
+            error:
+              `Model output was still truncated at ${this.context.maxOutputTokens} tokens after ` +
+              `${truncationRetries} retry attempt(s). Split this into smaller edits or reduce the ` +
+              `amount of text requested per turn.`,
+          });
+          this.transitionTo("failed", "Output truncated repeatedly");
+          break;
+        }
+
         // Execute tool calls if any
         if (pendingToolCalls.length > 0) {
-          if (this.stateMachine.canTransitionTo("implementing")) {
-            this.stateMachine.transitionTo("implementing", "Executing proposed tool calls");
-          }
+          this.transitionTo("implementing", "Executing proposed tool calls");
 
           for (const tc of pendingToolCalls) {
-            if (this.context.signal.aborted) {
+            if (signal.aborted) {
               keepLooping = false;
               break;
             }
@@ -551,21 +773,52 @@ export class AgentOrchestrator {
             tc.args = safeParseJsonArgs(tc.args);
             const toolDef = this.registry.get(tc.name);
             const permissionLevel = toolDef?.permissionLevel || "readonly";
+            // Carried into the approval decision so a self-declared "readonly" from a
+            // remote MCP server cannot buy itself an auto-approval (backlog B9).
+            const origin = toolDef?.origin || "core";
+
+            // A read-only-by-rule command needs no human, and a hard denial is not
+            // offered for approval either — prompting "approve this?" for something the
+            // policy will refuse regardless is noise that trains the user to click
+            // through prompts. The denial still goes to the gateway, which refuses and
+            // audits it, so the model gets a correctable error rather than silence.
+            const shellReview =
+              permissionLevel === "shell" || tc.name === "execute_shell"
+                ? reviewShellCommand(String((tc.args as Record<string, unknown>)?.command || ""))
+                : null;
+            const autoAllowedByRule = shellReview?.decision === "allow";
+            const needsHuman = shellReview ? shellReview.decision === "ask" : true;
 
             this.eventBus.emit("tool.proposed", this.context.sessionId, {
               toolCallId: tc.id,
               toolName: tc.name,
               permissionLevel,
+              origin,
               args: tc.args,
+              ...(shellReview
+                ? {
+                    shellDecision: shellReview.decision,
+                    shellHeadline: shellReview.headline,
+                    shellSegments: shellReview.verdicts.map((v) => ({
+                      text: v.text,
+                      decision: v.decision,
+                      reason: v.reason,
+                    })),
+                  }
+                : {}),
             });
 
             // Approval check
-            const approved = await this.approvalProvider.requestApproval({
-              toolCallId: tc.id,
-              toolName: tc.name,
-              permissionLevel,
-              args: tc.args,
-            });
+            const approved =
+              !needsHuman ||
+              (await this.approvalProvider.requestApproval({
+                toolCallId: tc.id,
+                toolName: tc.name,
+                permissionLevel,
+                origin,
+                args: tc.args,
+                shellReview: shellReview || undefined,
+              }));
 
             if (approved) {
               this.eventBus.emit("tool.approved", this.context.sessionId, { toolCallId: tc.id, toolName: tc.name });
@@ -574,12 +827,22 @@ export class AgentOrchestrator {
               const result = await this.gateway.executeGuarded(
                 this.registry,
                 tc as ToolCall,
-                { activeMode: this.context.activeMode, sessionId: this.context.sessionId },
-                this.context.signal
+                {
+                  activeMode: this.context.activeMode,
+                  sessionId: this.context.sessionId,
+                  // Which of the two clears this run reached the gateway is exactly what
+                  // the audit log is for: the rules cleared it, or a person did. Reaching
+                  // here any other way is refused by the gateway (see 3b there).
+                  shellApprovalSource: autoAllowedByRule ? ("rule:allow" as const) : ("user:prompt" as const),
+                },
+                signal
               );
 
               this.budgetManager.recordToolCall(permissionLevel);
               toolResultsAcc.push(result);
+              if (result.touchedSourceFile && result.touchedPath) {
+                touchedSourceFiles.add(result.touchedPath);
+              }
 
               // Persist tool execution output to SessionStore
               await this.sessionStore.saveToolExecution(this.context.sessionId, {
@@ -599,10 +862,20 @@ export class AgentOrchestrator {
                 outputSnippet: redactSecrets(result.output).slice(0, 300),
               });
 
+              // RAW output into context: a redacted `handle_user_authentication_flow`
+              // is a different program, and the model would write the corruption
+              // straight back to disk. Note the deliberate trade-off — this means
+              // secrets inside readable files reach the provider. Redaction is not
+              // the right control for that; the sensitive-path fence (backlog
+              // Phase 33) is, because it prevents the read in the first place
+              // instead of feeding the model a doctored version of its own repo.
               this.context.addMessage({
                 role: "tool",
-                content: redactSecrets(result.output),
+                content: result.output,
                 tool_call_id: tc.id,
+                // Tell the model this failed. Anthropic in particular marks the
+                // tool_result block, and gateway refusals don't start with "Error:".
+                is_error: Boolean(result.isError),
               });
 
               // Persist tool message response to SessionStore
@@ -612,11 +885,15 @@ export class AgentOrchestrator {
                 toolCallId: tc.id,
               });
             } else {
-              const deniedMsg = "Tool execution was denied by approval policy or user.";
+              // "Error: " prefix keeps the semantics correct for transcripts stored
+              // before Message.is_error existed, and for providers without an
+              // explicit error field on tool results.
+              const deniedMsg = "Error: Tool execution was denied by approval policy or user.";
               this.context.addMessage({
                 role: "tool",
                 content: deniedMsg,
                 tool_call_id: tc.id,
+                is_error: true,
               });
               await this.sessionStore.saveMessage(this.context.sessionId, {
                 role: "tool",
@@ -626,20 +903,98 @@ export class AgentOrchestrator {
             }
           }
         } else {
+          // The model has stopped calling tools. If this turn changed source code,
+          // "done" cannot mean "I said so" — run the workspace's own gates and give
+          // the model a bounded chance to fix what they report (backlog C13/L3).
+          const gate = await this.runVerificationGate(signal, touchedSourceFiles, verificationRounds);
+          if (gate.action === "repair") {
+            verificationRounds++;
+            this.context.addMessage({ role: "user", content: gate.prompt });
+            continue;
+          }
+          gateReport = gate.report;
           keepLooping = false;
         }
 
       } catch (err: any) {
-        this.context.ensureHistoryIntegrity();
+        // Adapters throw `InflynxProviderError`; anything else (a bug in a tool, a
+        // store failure) gets wrapped so this layer always has a kind to act on
+        // rather than a string to squint at (backlog Phase 9).
+        const providerErr = toProviderError(this.context.providerId, err);
+        const errorMessage = redactSecrets(providerErr.message || String(err));
+
+        // A prompt that outgrew the window is recoverable: drop stale tool results
+        // and send again. Before this it was a fatal turn.failed with the oversized
+        // history still in memory, so the session was dead (backlog C4).
+        if (providerErr.kind === "context_overflow" && !overflowRetried) {
+          overflowRetried = true;
+          // The provider's own "too long" overrides our estimate, so force the pass
+          // rather than re-deriving utilization and possibly deciding there is no
+          // pressure at all.
+          const relief = await this.makeRoomInWindow({ force: true, summarize: true });
+          if (relief.dropped > 0 || relief.summarized > 0) {
+            console.warn(
+              `[agent-core] context overflow — freed ${relief.charsFreed.toLocaleString()} chars ` +
+              `(evicted ${relief.dropped}, summarized ${relief.summarized ? "1 block" : "nothing"}) and ` +
+              `retrying this turn once.`
+            );
+            continue;
+          }
+        }
+
+        const exhausted =
+          providerErr.kind === "context_overflow"
+            ? `${providerErr.userMessage} This conversation exceeded the model's context window `
+              + `with nothing left to evict — start a new session or switch to a larger-window model.`
+            : providerErr.userMessage;
+
         this.eventBus.emit("turn.failed", this.context.sessionId, {
-          error: redactSecrets(err?.message || String(err)),
+          error: providerErr.kind === "unknown" ? errorMessage : exhausted,
+          errorKind: providerErr.kind,
+          retryable: providerErr.retryable,
+          ...(providerErr.status ? { httpStatus: providerErr.status } : {}),
         });
         keepLooping = false;
       }
     }
 
-    if (this.stateMachine.canTransitionTo("verifying")) {
-      this.stateMachine.transitionTo("verifying", "Turn verification");
+    // Runs on every exit path out of the loop (abort, budget stop, error, or a
+    // clean finish) so a dangling assistant `tool_calls` message can never be
+    // carried into the next request, in memory or in the stored transcript.
+    await this.repairHistoryIntegrity();
+
+    // The gate normally runs inside the loop, when the model stops calling tools. A
+    // loop that ended another way (abort, budget, truncation, provider error) never
+    // reached it — report that as `not-run` rather than leaving the field absent, so
+    // a UI cannot render "no verification needed" for a turn that edited files.
+    if (touchedSourceFiles.size > 0 && !gateReport) {
+      gateReport = this.verificationReport("not-run", [...touchedSourceFiles], {
+        summaryMessage:
+          "⚠ This turn changed source files but the verification gate did not run — " +
+          "the turn ended before it could. Treat the result as unverified.",
+        totalChecks: 0,
+      }, verificationRounds);
+    }
+
+    // Closing the lifecycle honestly: a turn that changed code went through
+    // `verifying` (and possibly `repairing`), and a read-only turn stays in
+    // `exploring`. Requesting `verifying` unconditionally is what produced a refusal
+    // on every plain question.
+    if (this.stateMachine.state === "implementing") {
+      // `implementing → verifying → completed` is the only legal forward path, and
+      // `implementing` is entered for *any* tool call — including a turn that only
+      // read files. So this transit is lifecycle bookkeeping, not evidence that checks
+      // ran. Consumers must key off `verification.started` or `TurnResult.verification`
+      // for that, never off this label; the reason string says which case happened.
+      this.transitionTo(
+        "verifying",
+        gateReport ? "Turn verification" : "No source files changed — gate not applicable"
+      );
+    } else if (this.stateMachine.state === "repairing") {
+      // A repair attempt ended without a re-check (interrupt or provider failure
+      // mid-repair). `repairing → verifying` is the only legal forward edge, and it
+      // is accurate: the fix is unverified.
+      this.transitionTo("verifying", "Repair attempt ended; gate did not re-run");
     }
 
     const isCompleted = this.stateMachine.canTransitionTo("completed");
@@ -647,15 +1002,421 @@ export class AgentOrchestrator {
       this.stateMachine.transitionTo("completed", "Turn execution finished");
     }
 
+    // Close the undo journal for this turn. A turn that wrote nothing produces no
+    // checkpoint, so `/undo` walks past it to the last turn that actually changed files.
+    const checkpoint = await this.gateway.checkpoints.commitTurn();
+
     return {
       sessionId: this.context.sessionId,
-      finalText: assistantText,
-      finalReasoning: assistantReasoning,
+      // Egress boundary: callers put these straight onto a UI, an SSE stream or
+      // a log, so this is where redaction belongs.
+      finalText: redactSecrets(assistantText),
+      finalReasoning: assistantReasoning ? redactSecrets(assistantReasoning) : undefined,
       state: this.stateMachine.state,
       toolResults: toolResultsAcc,
-      budgetState: this.budgetManager.getBudgetState(),
+      budgetState: this.budgetManager.getBudgetState(this.context.history),
       isCompleted,
+      turnId,
+      ...(gateReport ? { verification: gateReport } : {}),
+      ...(checkpoint ? { checkpointFiles: checkpoint.entries.map((e) => e.path) } : {}),
     };
+  }
+
+  /** Turns with a checkpoint on disk for this session, newest first (what `/undo` lists). */
+  listCheckpoints(): Array<{ turnId: string; label: string; at: number; files: string[]; undone: boolean }> {
+    return this.gateway.checkpoints.list(this.context.sessionId).map((c) => ({
+      turnId: c.turnId,
+      label: c.label,
+      at: c.createdAt,
+      files: c.entries.map((e) => e.path),
+      undone: Boolean(c.undoneAt),
+    }));
+  }
+
+  /**
+   * Revert the most recent checkpointed turn of this session. Refuses, per file, anything
+   * that has been edited since — a human's concurrent work is never overwritten, which is
+   * the same rule `EditTransactionManager.commit()` now applies before its own writes.
+   */
+  undoLastTurn(): { turnId: string; restored: string[]; conflicts: Array<{ path: string; reason: string }> } | null {
+    const latest = this.gateway.checkpoints.latest(this.context.sessionId);
+    if (!latest) return null;
+    const outcome = this.gateway.checkpoints.undo(latest);
+    // The transcript is now describing work that has been taken back; say so in-session so
+    // the model does not keep reasoning about files that no longer exist.
+    this.context.addMessage({
+      role: "user",
+      content:
+        `/undo reverted the previous turn (${outcome.restored.length} file(s) restored` +
+        (outcome.conflicts.length ? `, ${outcome.conflicts.length} refused` : "") +
+        `). Discard any earlier assumption about those paths and re-read them if needed.`,
+    });
+    return { turnId: outcome.turnId, restored: outcome.restored, conflicts: outcome.conflicts };
+  }
+
+  /**
+   * Transitions when legal and *reports* refusals loudly. The previous silent
+   * `if (canTransitionTo)` guards are what let the machine sit frozen in
+   * `completed` for the rest of a session with no diagnostic at all (backlog C7).
+   */
+  private transitionTo(state: AgentState, reason: string): void {
+    if (this.stateMachine.tryTransitionTo(state, reason)) return;
+    const allowed = LEGAL_STATE_TRANSITIONS[this.stateMachine.state] ?? [];
+    console.error(
+      `[agent-core] refused state transition "${this.stateMachine.state}" → "${state}" (${reason}). ` +
+      `Legal targets from "${this.stateMachine.state}": ${allowed.join(", ") || "none"}`
+    );
+  }
+
+  /**
+   * Synthesizes any missing tool responses and persists them, so both the live
+   * context and the stored transcript stay replayable after an abort or failure.
+   */
+  private async repairHistoryIntegrity(): Promise<void> {
+    const synthesized = this.context.ensureHistoryIntegrity();
+    for (const stub of synthesized) {
+      await this.sessionStore.saveMessage(this.context.sessionId, {
+        role: "tool",
+        content: stub.content,
+        toolCallId: stub.tool_call_id,
+      });
+    }
+  }
+
+  /**
+   * Manual context relief for `/compact`. Runs the free tier (eviction) and, when
+   * the session's strategy allows it, the summarization tier — and reports what each
+   * one actually freed, so the command cannot quietly become a no-op the way it was
+   * while `ContextManager` sat unwired. The persisted transcript is untouched: this
+   * only shrinks what gets sent next.
+   */
+  async compactContextNow(
+    options: { summarize?: boolean } = {}
+  ): Promise<{ dropped: number; charsFreed: number; summarized: number; utilizationPercent: number }> {
+    const relief = await this.makeRoomInWindow({
+      force: true,
+      summarize: options.summarize ?? this.context.contextStrategy === "compact",
+    });
+    return {
+      ...relief,
+      utilizationPercent: Math.round(this.budgetManager.contextUtilization(this.context.history) * 100),
+    };
+  }
+
+  /**
+   * The verification gate, and the bounded repair loop in front of it.
+   *
+   * Called when the model stops asking for tools. If the turn wrote no source files
+   * there is nothing to verify and the turn ends as it always did — the gate is not
+   * a tax on read-only answers. If it did, the workspace's own scripts decide whether
+   * the work is done, because "the model said it finished" was never evidence
+   * (backlog C13: the verification loop existed and was simply never called).
+   *
+   * Returns either "stop" with a report, or "repair" with a corrective message to put
+   * back to the model. Bounded by the effort profile's `maxVerificationRuns` so a
+   * repo that simply does not build cannot trap the agent in a loop.
+   */
+  private async runVerificationGate(
+    signal: AbortSignal,
+    touchedSourceFiles: Set<string>,
+    round: number
+  ): Promise<{ action: "stop"; report?: VerificationReport } | { action: "repair"; prompt: string; report: VerificationReport }> {
+    const changed = [...touchedSourceFiles];
+    if (changed.length === 0) return { action: "stop" };
+
+    if (signal.aborted) {
+      return {
+        action: "stop",
+        report: this.verificationReport("cancelled", changed, {
+          summaryMessage: "Verification skipped — the turn was interrupted.",
+          totalChecks: 0,
+        }, round),
+      };
+    }
+
+    const profile = this.budgetManager.getEffortProfile();
+    const engine = new VerificationEngine(this.context.sessionId, this.eventBus, {
+      depth: profile.verificationDepth,
+      runFullRegressionSuite: profile.runFullRegressionSuite,
+    });
+    const checks: VerificationCheck[] = engine.discoverWorkspaceChecks(this.context.workspaceRoot);
+
+    if (checks.length === 0) {
+      // The honest branch. Reporting success here is how a project with no scripts
+      // would look "verified" forever.
+      console.warn(
+        `[agent-core] ${changed.length} source file(s) changed but this workspace declares no ` +
+        `verification scripts — the turn cannot be confirmed.`
+      );
+      return {
+        action: "stop",
+        report: this.verificationReport("no-gates-configured", changed, {
+          summaryMessage:
+            `⚠ Wrote ${changed.length} source file(s) but no typecheck/build/test script was ` +
+            `discovered, so nothing was verified.`,
+          totalChecks: 0,
+        }, round),
+      };
+    }
+
+    this.transitionTo("verifying", `Verifying ${changed.length} changed file(s)`);
+    const summary: SuiteSummary = await engine.runAllChecks(this.context.workspaceRoot, signal);
+    const failedNames = summary.results.filter((r) => !r.passed).map((r) => r.checkName);
+
+    if (summary.passed) {
+      return {
+        action: "stop",
+        report: this.verificationReport("passed", changed, summary, round),
+      };
+    }
+
+    const budgetExhausted = round >= profile.maxVerificationRuns;
+    const limitsSpent = this.budgetManager.checkLimits().isExhausted;
+    if (budgetExhausted || limitsSpent || signal.aborted) {
+      return {
+        action: "stop",
+        report: this.verificationReport("failed", changed, summary, round),
+      };
+    }
+
+    // One more chance, with the actual failure rather than a generic "try again".
+    this.transitionTo("repairing", `Gate failed: ${failedNames.join(", ")}`);
+    const errors = summary.results.flatMap((r) => r.parsedErrors);
+    new RepairLoop(this.context.sessionId, this.eventBus)
+      .notifyRepairAttempt(round + 1, profile.maxVerificationRuns, errors);
+    this.budgetManager.recordRetry();
+
+    return {
+      action: "repair",
+      prompt: this.formatGateFailureForModel(changed, summary, round + 1, profile.maxVerificationRuns),
+      report: this.verificationReport("failed", changed, summary, round),
+    };
+  }
+
+  /**
+   * Display path for a file the gateway reported.
+   *
+   * Relativised against the **guard's** canonical root, not `context.workspaceRoot`:
+   * the guard has already run `realpathSync`, and on macOS `/var` is a symlink to
+   * `/private/var`, so mixing the two produced `../../../../../../private/var/…`
+   * in place of `app.ts`. Same class of bug the guard exists to prevent, arriving in
+   * a cosmetic string.
+   */
+  private displayPath(absolutePath: string): string {
+    const root = this.gateway.getPathGuard().getWorkspaceRoot();
+    const rel = path.relative(root, absolutePath);
+    return rel && !rel.startsWith("..") ? rel : absolutePath;
+  }
+
+  private verificationReport(
+    outcome: VerificationOutcome,
+    changed: string[],
+    summary: Pick<SuiteSummary, "summaryMessage"> & Partial<SuiteSummary>,
+    repairAttempts: number
+  ): VerificationReport {
+    return {
+      outcome,
+      sourceFilesChanged: changed.map((p) => this.displayPath(p)),
+      checksRun: summary.totalChecks ?? 0,
+      failedChecks: summary.results?.filter((r) => !r.passed).map((r) => r.checkName) ?? [],
+      packageManager: summary.packageManager?.manager,
+      depth: this.budgetManager.getEffortProfile().verificationDepth,
+      repairAttempts,
+      summaryMessage: summary.summaryMessage,
+    };
+  }
+
+  /**
+   * The failure report sent back to the model. Bounded and concrete: a raw 200 KB
+   * build log both floods the window and buries the one line that matters, while a
+   * bare "tests failed" gives it nothing to act on.
+   */
+  private formatGateFailureForModel(
+    changed: string[],
+    summary: SuiteSummary,
+    attempt: number,
+    maxAttempts: number
+  ): string {
+    const MAX_LINES_PER_CHECK = 25;
+    const blocks: string[] = [];
+
+    for (const result of summary.results) {
+      if (result.passed) continue;
+      const raw = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+      const lines = raw.split("\n").filter((l) => l.trim().length > 0);
+      const shown = lines.slice(0, MAX_LINES_PER_CHECK).join("\n");
+      blocks.push(
+        `--- ${result.checkName} (${result.checkId}) failed with exit code ${result.exitCode} ---\n` +
+        (result.timedOut ? `[timed out — do not "fix" the code; the check itself was cut off]\n` : "") +
+        (shown || "(no output)") +
+        (lines.length > MAX_LINES_PER_CHECK ? `\n[…${lines.length - MAX_LINES_PER_CHECK} more line(s)…]` : "")
+      );
+    }
+
+    const structured = summary.results
+      .flatMap((r) => r.parsedErrors)
+      .slice(0, 12)
+      .map((e: DiagnosticError) => `  ${e.filePath || "?"}${e.line ? `:${e.line}` : ""}: ${(e.rawOutput || e.message).slice(0, 200)}`)
+      .join("\n");
+
+    return [
+      `The verification gate ran after your edits and **failed** (repair attempt ${attempt} of ${maxAttempts}).`,
+      `Files you changed in this turn: ${changed.map((p) => this.displayPath(p)).join(", ")}`,
+      "",
+      ...blocks,
+      structured ? `\nLocations:\n${structured}` : "",
+      "",
+      "Fix the underlying cause now. Do not suppress, skip, or delete what is failing — a",
+      "`@ts-ignore`, a `.skip` on a test, or an emptied assertion is a fake fix and will be",
+      "rejected. If a failure is genuinely unrelated to your changes, say so explicitly and",
+      "explain why instead of editing around it.",
+    ].join("\n");
+  }
+
+  /**
+   * Resolve and publish the window for the model actually in use. Everything that
+   * measures or protects context reads these two numbers, so this runs at
+   * construction (and therefore again after `switchModel`/`resumeSession`, which
+   * both build a new orchestrator).
+   */
+  private applyModelWindow(): void {
+    const limits = resolveContextLimits(
+      this.context.providerId,
+      this.context.model,
+      this.context.customCapabilities
+    );
+    this.budgetManager.setModelWindow(limits.contextWindow, limits.maxOutputTokens);
+  }
+
+  /**
+   * Keep the next request inside the model's window, cheapest tier first.
+   *
+   *   1. **Evict** stale tool output (free, lossless for decisions already acted on).
+   *   2. **Summarize** the oldest turns — only above `CONTEXT_COMPACT_LIMIT`, and only
+   *      when the session's `contextStrategy` allows it, because it costs a model call
+   *      and rewrites what the model remembers. `evict` (the default) opts out of the
+   *      routine pass but still allows it as an overflow last resort; `off` never
+   *      spends a call.
+   *
+   * `force` is for the overflow path, where the provider's own "too long" beats our
+   * estimate of how full we are.
+   */
+  private async makeRoomInWindow(
+    options: { force?: boolean; summarize?: boolean } = {}
+  ): Promise<{ dropped: number; charsFreed: number; summarized: number }> {
+    const result = { dropped: 0, charsFreed: 0, summarized: 0 };
+    if (!this.budgetManager.windowKnown) return result;
+
+    let utilization = this.budgetManager.contextUtilization(this.context.history);
+    if (!options.force && utilization <= CONTEXT_SOFT_LIMIT) return result;
+
+    for (const protect of CONTEXT_PROTECTION_LADDER) {
+      if (!options.force && utilization <= CONTEXT_SOFT_LIMIT) break;
+      const relief = this.context.evictStaleToolResults({ protectRecentMessages: protect });
+      if (relief.dropped === 0) continue;
+      result.dropped += relief.dropped;
+      result.charsFreed += relief.charsFreed;
+      this.budgetManager.accountForEviction(relief.charsFreed);
+      utilization = this.budgetManager.contextUtilization(this.context.history);
+    }
+
+    const strategy = this.context.contextStrategy;
+    const maySummarize =
+      options.summarize !== false &&
+      strategy !== "off" &&
+      (strategy === "compact" || options.force === true);
+
+    if (maySummarize && (options.force || utilization > CONTEXT_COMPACT_LIMIT)) {
+      const summary = await this.compactHistoryWithSummary();
+      if (summary > 0) {
+        result.summarized = 1;
+        result.charsFreed += summary;
+        utilization = this.budgetManager.contextUtilization(this.context.history);
+      }
+    }
+
+    if (result.dropped > 0) {
+      // The tombstone tells the model to re-run the call, so any "already read this
+      // turn" pointer into the dropped output has to go too.
+      this.gateway.invalidateTurnCache();
+      console.warn(
+        `[agent-core] context near capacity — evicted ${result.dropped} stale tool result(s) ` +
+        `(${result.charsFreed.toLocaleString()} chars); now at ${Math.round(utilization * 100)}% of the ` +
+        `${this.budgetManager.contextWindowTokens.toLocaleString()}-token window.`
+      );
+    } else if (result.summarized === 0) {
+      console.warn(
+        `[agent-core] context at ${Math.round(utilization * 100)}% of the window with nothing left to evict. `
+      );
+    }
+    return result;
+  }
+
+  /**
+   * One summarization pass over the oldest safe slice of history. Returns the
+   * characters freed, or 0 when there was nothing to fold or the model could not
+   * produce a summary — a failed compaction must leave the session usable, so every
+   * problem here is a silent no-op rather than a torn-down history.
+   */
+  private async compactHistoryWithSummary(): Promise<number> {
+    const plan = this.context.compactionPlan({ keepRecentMessages: 8 });
+    if (!plan) return 0;
+
+    // Keep the excerpt well under the window it is meant to relieve, and leave the
+    // summarizer's own answer some room.
+    const budget = Math.max(2_000, Math.floor(this.budgetManager.contextWindowTokens * 4 * 0.3));
+    const excerpt = serializeForSummary(plan.messages, budget);
+    if (!excerpt.trim()) return 0;
+
+    let text = "";
+    try {
+      const stream = streamModel({
+        provider: this.context.providerId as any,
+        model: this.context.model,
+        // Deliberately no `tools`: a compaction that starts calling the filesystem
+        // would be a compaction that never finishes.
+        messages: [
+          { role: "system", content: SUMMARIZER_SYSTEM_PROMPT },
+          { role: "user", content: excerpt },
+        ],
+        apiKey: this.context.apiKey,
+        baseURL: this.context.baseURL,
+        adapter: this.context.modelAdapter,
+        maxTokens: 1_024,
+        allowUnauthenticated: this.context.allowUnauthenticated,
+        allowLocalEndpoint: this.context.allowLocalEndpoint,
+        customCapabilities: this.context.customCapabilities,
+      }, this.context.signal);
+
+      for await (const event of stream) {
+        if (event.type === "text_delta") text += event.text;
+      }
+    } catch (err: any) {
+      console.warn(
+        `[agent-core] context summarization skipped (${redactSecrets(err?.message || String(err)).slice(0, 160)}); ` +
+        `eviction alone will have to carry this session.`
+      );
+      return 0;
+    }
+
+    const summary = text.trim();
+    // A summary that is barely shorter than what it replaces is worse than nothing:
+    // it spends a model call to lose fidelity and save no space.
+    if (!summary || summary.length > plan.chars * 0.5) return 0;
+
+    const applied = this.context.applyCompaction(plan, summary);
+    // The folded messages are gone from the model's view, so dedupe pointers into
+    // them must not survive either.
+    this.gateway.invalidateTurnCache();
+    // History was *rewritten*, so the provider-anchored estimate no longer describes
+    // it and the tail index points into a different array. Re-estimate from scratch;
+    // the next real response re-anchors on ground truth.
+    this.budgetManager.reanchorAfterRewrite(this.context.history);
+    console.warn(
+      `[agent-core] compacted ${applied.dropped} oldest message(s) into one summary ` +
+      `(${applied.charsFreed.toLocaleString()} chars freed). The full transcript stays in the session store.`
+    );
+    return applied.charsFreed;
   }
 
   private currentSessionModelConfig(): {

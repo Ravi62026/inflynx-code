@@ -5,7 +5,7 @@
 import fs from "fs";
 import path from "path";
 import { LocalJsonSessionStore, PostgresSessionStore, createSessionStore } from "../../packages/session-store/src/index.js";
-import { AgentOrchestrator, TaskClassifier, ContextManager, StructuredPlanEngine } from "../../packages/agent-core/src/index.js";
+import { AgentOrchestrator, TaskClassifier, ExecutionContext, StructuredPlanEngine } from "../../packages/agent-core/src/index.js";
 import { CanonicalPathGuard, CommandPolicy } from "../../packages/policy-engine/src/index.js";
 import { applySurgicalPatch, computeUnifiedDiff, EditTransactionManager } from "../../packages/patch-engine/src/index.js";
 import { ToolRegistry } from "../../packages/tool-runtime/src/index.js";
@@ -31,13 +31,31 @@ async function runLiveE2EValidation() {
     process.exit(1);
   }
 
-  const contextManager = new ContextManager(500);
-  contextManager.addItem({ category: "system", content: "You are Inflynx Agent", priority: "pinned" });
-  contextManager.addItem({ category: "user", content: task1, priority: "high" });
-  contextManager.addItem({ category: "tool_result", content: "CanonicalPathGuard uses fs.realpathSync to resolve paths.", priority: "medium" });
-  
-  const compacted = contextManager.compactContext();
-  console.log(`  ✓ Context Compaction: Token Count=${contextManager.getTotalTokens()}/500, Compacted Items=${compacted.length}`);
+  // Real window relief, on the real history type. This used to demo `ContextManager`,
+  // a parallel context store the agent never consulted (retired in backlog Phase 15).
+  const context = new ExecutionContext({
+    workspaceRoot,
+    providerId: "openai",
+    model: "gpt-4o",
+    apiKey: "mock_key",
+  });
+  context.addMessage({ role: "system", content: "You are Inflynx Agent" });
+  context.addMessage({ role: "user", content: task1 });
+  context.addMessage({
+    role: "assistant",
+    content: "checking the guard",
+    tool_calls: [{ id: "e2e_1", type: "function", function: { name: "read_file", arguments: "{}" } }],
+  });
+  context.addMessage({
+    role: "tool",
+    content: "CanonicalPathGuard uses fs.realpathSync to resolve paths. ".repeat(30),
+    tool_call_id: "e2e_1",
+  });
+  const relief = context.evictStaleToolResults({ protectRecentMessages: 0 });
+  console.log(
+    `  ✓ Context Compaction: evicted ${relief.dropped} stale tool result(s), ` +
+    `${relief.charsFreed.toLocaleString()} chars freed from a ${context.history.length}-message history`
+  );
 
   const vectorStore = new HnswVectorStore(workspaceRoot);
   vectorStore.addChunk({

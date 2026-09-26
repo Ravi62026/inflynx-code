@@ -10,6 +10,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "typecheck": "tsc --noEmit",
     "dev": "tsx src/index.ts",
     "start": "tsx src/index.ts"
   },
@@ -27,11 +28,9 @@
     "@inflynx/tool-runtime": "workspace:*",
     "@inflynx/ui-components": "workspace:*",
     "@inflynx/vector-store": "workspace:*",
-    "@inflynx/workspace-runtime": "workspace:*",
-    "inquirer": "^13.3.2"
+    "@inflynx/workspace-runtime": "workspace:*"
   },
   "devDependencies": {
-    "@types/inquirer": "^9.0.7",
     "@types/node": "^25.5.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2"

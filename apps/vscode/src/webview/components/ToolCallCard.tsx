@@ -32,7 +32,7 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ tool, onOpenFile }) 
   const [expanded, setExpanded] = useState(false);
 
   const isFileEdit = tool.toolName === "patch_file" || tool.toolName === "write_file";
-  const targetFile = String(tool.args?.targetFile || tool.args?.path || tool.args?.filePath || "");
+  const targetFile = String(tool.args?.path || tool.args?.targetFile || tool.args?.filePath || "");
 
   let statusIcon = "○";
   let statusColor = "#888";
@@ -102,8 +102,10 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ tool, onOpenFile }) 
         <div className="tool-details">
           {isFileEdit ? (
             <DiffPreview
-              targetSnippet={String(tool.args?.targetSnippet || "")}
-              replacementSnippet={String(tool.args?.replacementSnippet || tool.args?.content || "")}
+              // Real `patch_file` arguments, not the targetSnippet/replacementSnippet
+              // names this component used to read (which it never sends).
+              targetSnippet={String(tool.args?.target_code || "")}
+              replacementSnippet={String(tool.args?.replacement_code ?? tool.args?.content ?? "")}
               filePath={targetFile}
             />
           ) : (

@@ -23,17 +23,99 @@ import { createSessionStore, type SessionStore } from "@inflynx/session-store";
 import { ToolRegistry, CORE_TOOLS } from "@inflynx/tool-runtime";
 import { AgentOrchestrator, type AgentBudgetLevel, type AgentMode, type ToolApprovalRequest } from "@inflynx/agent-core";
 import { AgentEventBus, type PublicAgentEvent } from "@inflynx/protocol";
+import { isProviderError } from "@inflynx/model-gateway";
 import { getRedisClient } from "@inflynx/cache";
 
 loadEnv();
 
 const PORT = Number(process.env.PORT || 4000);
-const HOST = process.env.HOST || "0.0.0.0";
-const WORKSPACE_ROOT = process.cwd();
+
+// ─── Local-first posture (backlog Phase 2) ─────────────────────────────────────
+// This service can read, write and execute files anywhere inside its workspace
+// root. It therefore binds loopback by default, never lets a request choose the
+// root, and treats auto-approval as an operator decision made at launch. None of
+// this is authentication — identity/RBAC remain deferred (backlog §6).
+const TRUTHY = /^(1|true)$/i;
+
+function isLoopbackHost(host: string): boolean {
+  return host === "localhost" || host === "::1" || host.startsWith("127.");
+}
+
+function resolveBindHost(requested: string | undefined, allowRemote: boolean): string {
+  const host = (requested || "").trim() || "127.0.0.1";
+  if (!isLoopbackHost(host) && !allowRemote) {
+    throw new Error(
+      `Refusing to bind to "${host}". This server writes files and runs commands in the workspace, so a ` +
+      `non-loopback bind requires explicit opt-in via INFLYNX_SERVER_ALLOW_REMOTE=1 — and at that point ` +
+      `authentication and TLS are your responsibility (still unimplemented; see backlog §6).`
+    );
+  }
+  return host;
+}
+
+const SERVER_ALLOW_REMOTE = TRUTHY.test(process.env.INFLYNX_SERVER_ALLOW_REMOTE || "");
+const HOST = resolveBindHost(process.env.HOST, SERVER_ALLOW_REMOTE);
+
+/** Auto-approval is a launch-time operator decision, never a client-controllable flag. */
+const SERVER_AUTO_APPROVE = TRUTHY.test(process.env.INFLYNX_AUTO_APPROVE || "");
+
+/** Origins permitted for browser clients. Node callers (the extension host) are unaffected by CORS. */
+const ALLOWED_ORIGINS = new Set(
+  (process.env.INFLYNX_ALLOWED_ORIGINS ||
+    "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+);
+
+/** Roots an operator may point the server at. Requests never participate in this decision. */
+const ALLOWED_WORKSPACE_ROOTS = (process.env.INFLYNX_ALLOWED_ROOTS || process.cwd())
+  .split(path.delimiter)
+  .map((entry) => entry.trim())
+  .filter(Boolean)
+  .map((entry) => path.resolve(entry));
+
+function resolveServerWorkspaceRoot(): string {
+  const requested = process.env.INFLYNX_SERVER_WORKSPACE
+    ? path.resolve(process.env.INFLYNX_SERVER_WORKSPACE)
+    : process.cwd();
+  const contained = ALLOWED_WORKSPACE_ROOTS.some(
+    (root) => requested === root || requested.startsWith(root.endsWith(path.sep) ? root : root + path.sep)
+  );
+  if (!contained) {
+    throw new Error(
+      `Refusing to start: workspace "${requested}" is outside INFLYNX_ALLOWED_ROOTS ` +
+      `(${ALLOWED_WORKSPACE_ROOTS.join(", ")}).`
+    );
+  }
+  return requested;
+}
+
+const WORKSPACE_ROOT = resolveServerWorkspaceRoot();
 
 const sessionStore: SessionStore = createSessionStore(WORKSPACE_ROOT);
-const toolRegistry = new ToolRegistry(CORE_TOOLS);
-const activeOrchestrators = new Map<string, { orchestrator: AgentOrchestrator; bus: AgentEventBus }>();
+
+/**
+ * One tool registry **per session**, built on demand rather than shared.
+ *
+ * The core tools are stateless since Phase 5 (they take a `ToolExecutionContext`
+ * and the gateway owns the guard), so a shared instance was not a live isolation
+ * bug — it was a trap. The moment MCP servers or plugins are wired into this
+ * process, tool sets become per-session and a module-level registry would leak one
+ * session's connectors into another's tool list. Building it here costs a Map of
+ * eight stateless objects and removes that failure mode permanently.
+ */
+function createToolRegistry(): ToolRegistry {
+  return new ToolRegistry(CORE_TOOLS);
+}
+
+const activeOrchestrators = new Map<
+  string,
+  { orchestrator: AgentOrchestrator; bus: AgentEventBus; registry: ToolRegistry }
+>();
+
+/** Modes a client may request. Anything else is rejected rather than passed through. */
+const VALID_AGENT_MODES: AgentMode[] = ["ask", "plan", "agent", "debug"];
 
 interface PendingApproval {
   toolCallId: string;
@@ -54,7 +136,11 @@ function createApprovalHandler(sessionId: string, bus: AgentEventBus, autoApprov
 
     const toolCallId = request.toolCallId || `tc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 
-    bus.emit("tool.approval_required" as any, sessionId, {
+    // `sessionId` travels inside the payload: the SSE writer forwards the payload
+    // only, so a client could not tell which session was asking and answered against
+    // whichever session it happened to be showing (backlog K9).
+    bus.emit("tool.approval_required", sessionId, {
+      sessionId,
       toolCallId,
       toolName: request.toolName,
       permissionLevel: request.permissionLevel,
@@ -87,33 +173,81 @@ function createApprovalHandler(sessionId: string, bus: AgentEventBus, autoApprov
 }
 
 function sendJson(res: http.ServerResponse, statusCode: number, data: unknown) {
-  res.writeHead(statusCode, {
-    "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Auto-Approve",
-  });
+  // CORS is applied once per request by `applyCorsHeaders()` before any writeHead:
+  // a per-response `Access-Control-Allow-Origin` set here would override it.
+  if (res.headersSent) {
+    // Reached from the catch-all below when a route has already started streaming.
+    // `writeHead` on a live SSE response throws ERR_HTTP_HEADERS_SENT, which turns
+    // one failed turn into an uncaught exception that kills the request handler.
+    console.warn(
+      `[inflynx-server] status ${statusCode} could not be sent — the response was already ` +
+      `streaming. The error was written into the stream instead.`
+    );
+    try {
+      res.write(`event: turn.failed\ndata: ${JSON.stringify(data)}\n\n`);
+      res.end();
+    } catch {
+      res.destroy();
+    }
+    return;
+  }
+  res.writeHead(statusCode, { "Content-Type": "application/json" });
   res.end(JSON.stringify(data));
+}
+
+function applyCorsHeaders(req: http.IncomingMessage, res: http.ServerResponse): void {
+  const origin = typeof req.headers.origin === "string" ? req.headers.origin : "";
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+}
+
+function startSse(res: http.ServerResponse): void {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+  });
 }
 
 function parseJsonBody(req: http.IncomingMessage): Promise<Record<string, any>> {
   return new Promise((resolve, reject) => {
     let body = "";
+    let settled = false;
+    const fail = (message: string, statusCode: number) => {
+      if (settled) return;
+      settled = true;
+      const err = new Error(message) as Error & { statusCode?: number };
+      err.statusCode = statusCode;
+      reject(err);
+    };
     req.on("data", (chunk) => {
+      if (settled) return;
       body += chunk;
       if (body.length > 2 * 1024 * 1024) {
-        reject(new Error("Request body too large (max 2MB)"));
+        // Stop storing, but keep draining: `req.destroy()` tears down the socket and
+        // the 413 never reaches the client (measured — curl saw a bare connection
+        // reset). Dropping the data listeners and resuming discards the rest of the
+        // upload without buffering it, so the response can still be written.
+        req.removeAllListeners("data");
+        req.resume();
+        fail("Request body too large (max 2MB)", 413);
       }
     });
     req.on("end", () => {
+      if (settled) return;
+      settled = true;
       if (!body.trim()) return resolve({});
       try {
         resolve(JSON.parse(body));
-      } catch (err) {
-        reject(new Error("Invalid JSON body"));
+      } catch {
+        fail("Invalid JSON body", 400);
       }
     });
-    req.on("error", reject);
+    req.on("error", () => fail("Request stream error", 400));
   });
 }
 
@@ -121,13 +255,17 @@ const sessionHydrationCache = new Map<string, { data: any; time: number }>();
 let listSessionsCache: { data: any; time: number } | null = null;
 
 const server = http.createServer(async (req, res) => {
-  // Global CORS preflight
+  applyCorsHeaders(req, res);
+
+  // Correlation id: without it, a client-side "the turn failed" report cannot be
+  // matched to a server log line at all. Full request-scoped structured logging is
+  // Phase 45; this is the 5-line version that makes today's logs usable.
+  const requestId = `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  res.setHeader("X-Inflynx-Request-Id", requestId);
+
+  // CORS preflight
   if (req.method === "OPTIONS") {
-    res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    });
+    res.writeHead(204);
     return res.end();
   }
 
@@ -197,19 +335,51 @@ const server = http.createServer(async (req, res) => {
       }
       const provider = getProvider(providerId);
       const model = body.model || (providerId === "deepseek" ? "deepseek-v4-flash" : (process.env.INFLYNX_AGENT_MODEL || provider?.defaultModel || "openai/gpt-5.6-luna"));
-      const apiKey = body.apiKey || (provider ? process.env[provider.envKey] : "") || "mock_key";
+      const apiKey = provider ? process.env[provider.envKey] || "" : "";
+      if (body.apiKey) {
+        console.warn(
+          "[inflynx-server] Ignoring client-supplied apiKey — keys are resolved server-side from the " +
+          "environment or OS keychain only."
+        );
+      }
+      // Validated at the boundary: an unknown mode would otherwise blow up in
+      // `filterToolsForMode` (MODE_CONFIGS[mode] is undefined) on the first turn.
+      if (body.activeMode !== undefined && !VALID_AGENT_MODES.includes(body.activeMode as AgentMode)) {
+        return sendJson(res, 400, {
+          error: `Invalid activeMode "${body.activeMode}". Expected one of: ${VALID_AGENT_MODES.join(", ")}.`,
+        });
+      }
       const activeMode = (body.activeMode as AgentMode) || "agent";
       const budgetLevel = (body.budgetLevel as AgentBudgetLevel) || "medium";
       let reasoningEffort = (body.reasoningEffort as ReasoningEffort) || undefined;
       if (reasoningEffort && !supportsReasoningEffort(providerId, model, reasoningEffort)) {
         reasoningEffort = "none";
       }
-      const workspaceRoot = body.workspaceRoot || WORKSPACE_ROOT;
+      // The workspace root is operator-controlled; a request must never pick it.
+      if (body.workspaceRoot) {
+        console.warn(
+          `[inflynx-server] Ignoring client-supplied workspaceRoot "${body.workspaceRoot}"; ` +
+          `this server only operates on ${WORKSPACE_ROOT}.`
+        );
+      }
+      const workspaceRoot = WORKSPACE_ROOT;
 
       const bus = new AgentEventBus();
-      const autoApprove = req.headers["x-auto-approve"] === "true" || Boolean(body.autoApprove);
-      const targetSessionId = body.sessionId || `session_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const autoApprove = SERVER_AUTO_APPROVE;
+      if (body.autoApprove || req.headers["x-auto-approve"]) {
+        console.warn(
+          "[inflynx-server] Ignoring client-requested auto-approval — it is a launch-time operator flag " +
+          "(INFLYNX_AUTO_APPROVE), never a per-request privilege."
+        );
+      }
+      // Session identity is generated server-side: a client-chosen id could
+      // collide with (and silently graft messages onto) an existing session.
+      const targetSessionId = `session_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      if (body.sessionId) {
+        console.warn(`[inflynx-server] Ignoring client-supplied sessionId "${body.sessionId}".`);
+      }
       const approvalHandler = createApprovalHandler(targetSessionId, bus, autoApprove);
+      const registry = createToolRegistry();
 
       const orchestrator = await AgentOrchestrator.start(
         {
@@ -221,14 +391,14 @@ const server = http.createServer(async (req, res) => {
           reasoningEffort,
           sessionId: targetSessionId,
         },
-        toolRegistry,
+        registry,
         bus,
         approvalHandler,
         budgetLevel,
         sessionStore
       );
 
-      activeOrchestrators.set(orchestrator.sessionId, { orchestrator, bus });
+      activeOrchestrators.set(orchestrator.sessionId, { orchestrator, bus, registry });
 
       return sendJson(res, 201, {
         sessionId: orchestrator.sessionId,
@@ -274,18 +444,27 @@ const server = http.createServer(async (req, res) => {
       // Rehydrate or reuse active orchestrator
       let active = activeOrchestrators.get(sessionId);
       if (!active) {
+        // An unknown id used to be accepted and written to. `saveMessage` against a
+        // session with no row either fails a Postgres foreign key mid-stream (after
+        // SSE headers are out, so it cannot be reported as a 404) or silently creates
+        // an orphan row that `listSessions` never shows. Validate before any write.
+        const known = await sessionStore.getSessionHydration(sessionId);
+        if (!known) {
+          return sendJson(res, 404, {
+            error: `Session "${sessionId}" not found. Create it with POST /api/sessions first.`,
+          });
+        }
+        // Also what the resume path below needs — don't fetch it twice.
+        sessionHydrationCache.set(sessionId, { data: known, time: Date.now() });
+
         const bus = new AgentEventBus();
-        const autoApprove = req.headers["x-auto-approve"] === "true" || Boolean(body.autoApprove);
+        const registry = createToolRegistry();
+        const autoApprove = SERVER_AUTO_APPROVE;
         const approvalHandler = createApprovalHandler(sessionId, bus, autoApprove);
 
         // Check if demo turn
         if (prompt.toLowerCase().startsWith("/demo")) {
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-          });
+          startSse(res);
           const sseWrite = (event: string, payload: unknown) => {
             res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
           };
@@ -337,7 +516,7 @@ const server = http.createServer(async (req, res) => {
           const resumed = await AgentOrchestrator.resumeSession(
             WORKSPACE_ROOT,
             sessionId,
-            toolRegistry,
+            registry,
             bus,
             approvalHandler,
             sessionStore
@@ -345,15 +524,10 @@ const server = http.createServer(async (req, res) => {
           if (!resumed) {
             return sendJson(res, 404, { error: `Session "${sessionId}" not found or cannot be resumed.` });
           }
-          active = { orchestrator: resumed, bus };
+          active = { orchestrator: resumed, bus, registry };
           activeOrchestrators.set(sessionId, active);
         } catch (resumeErr: any) {
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-          });
+          startSse(res);
           const warningMsg = `⚠️ **Cannot Resume Session: Missing API Key**\n\n${resumeErr.message}\n\n### How to Fix:\n1. Open \`.env\` in the project root and add your API key.\n2. Or configure it via **VS Code Settings** (\`inflynx.openSettings\`).\n\n💡 *Tip: Type \`/demo\` in the chat box to test Inflynx Code without an API key.*`;
 
           await sessionStore.saveMessage(sessionId, {
@@ -371,8 +545,23 @@ const server = http.createServer(async (req, res) => {
 
       // Dynamically sync mode, reasoning effort, and model if passed in request body
       if (active?.orchestrator) {
-        if (body.activeMode && body.activeMode !== active.orchestrator.state) {
-          active.orchestrator.setMode(body.activeMode);
+        // This used to compare a *mode* against a *state* (`exploring`,
+        // `completed`, …) so the guard was effectively always true (J5). Values are
+        // now validated, and every change is logged so a silent ask→agent
+        // escalation is at least visible. Per-session escalation consent is Phase 10.
+        if (body.activeMode !== undefined) {
+          if (VALID_AGENT_MODES.includes(body.activeMode as AgentMode)) {
+            const requestedMode = body.activeMode as AgentMode;
+            if (requestedMode !== active.orchestrator.activeMode) {
+              console.log(
+                `[inflynx-server] session ${sessionId} mode change: ` +
+                `${active.orchestrator.activeMode} → ${requestedMode}`
+              );
+              active.orchestrator.setMode(requestedMode);
+            }
+          } else {
+            console.warn(`[inflynx-server] Ignoring invalid activeMode "${body.activeMode}".`);
+          }
         }
         if (body.reasoningEffort && body.reasoningEffort !== active.orchestrator.modelConfiguration.reasoningEffort) {
           try {
@@ -397,12 +586,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       // Setup SSE response
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "Access-Control-Allow-Origin": "*",
-      });
+      startSse(res);
 
       const sseWrite = (event: string, payload: unknown) => {
         res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
@@ -546,12 +730,19 @@ const server = http.createServer(async (req, res) => {
         });
         res.write("data: [DONE]\n\n");
       } catch (err: any) {
-        const errMsg = err?.message || String(err);
+        const errMsg = isProviderError(err) ? err.userMessage : err?.message || String(err);
         await sessionStore.saveMessage(sessionId, {
           role: "system",
           content: `⚠️ Turn Execution Error: ${errMsg}`,
         }).catch(() => {});
-        sseWrite("turn.failed", { error: errMsg });
+        sseWrite("turn.failed", {
+          error: errMsg,
+          // The provider's own sentence is already user-facing, so the UI can show
+          // `error` verbatim and use `errorKind`/`retryable` to decide what to offer.
+          ...(isProviderError(err)
+            ? { errorKind: err.kind, retryable: err.retryable, httpStatus: err.status }
+            : {}),
+        });
         sseWrite("turn.completed", {
           finalText: "",
           toolResults: [],
@@ -611,14 +802,25 @@ const server = http.createServer(async (req, res) => {
         }
         sessionMap.clear();
       }
-      return sendJson(res, 200, { status: "aborted", sessionId });
+      // A cancelled turn must not leave its dev server bound to the port: the
+      // process group is signalled, then the shell is dropped from the session.
+      const shellsStopped = active?.orchestrator.shutdown({ abortTurn: false }).shellsStopped ?? 0;
+      return sendJson(res, 200, {
+        status: "aborted",
+        sessionId,
+        ...(shellsStopped > 0 ? { shellsStopped } : {}),
+      });
     }
 
     // 404 Route Not Found
     return sendJson(res, 404, { error: `Route not found: ${req.method} ${pathname}` });
   } catch (err: any) {
-    console.error(`[inflynx-server] Unhandled error handling ${req.method} ${pathname}:`, err);
-    return sendJson(res, 500, { error: err?.message || "Internal Server Error" });
+    const statusCode = Number(err?.statusCode) || 500;
+    console.error(`[inflynx-server] ${requestId} ${req.method} ${pathname} failed:`, err);
+    return sendJson(res, statusCode, {
+      error: statusCode === 500 ? "Internal Server Error" : err?.message || "Request failed",
+      requestId,
+    });
   }
 });
 
@@ -627,19 +829,54 @@ server.listen(PORT, HOST, () => {
   console.log("⚡ INFLYNX CODE BACKEND API & SSE STREAMING SERVER");
   console.log("==================================================================");
   console.log(`🚀 Server listening on: http://${HOST}:${PORT}`);
+  console.log(`🔒 Bind scope:          ${isLoopbackHost(HOST) ? "loopback only" : `NON-LOCAL (${HOST}) via INFLYNX_SERVER_ALLOW_REMOTE`}`);
+  console.log(`🔑 Auto-approve:        ${SERVER_AUTO_APPROVE ? "ENABLED for all sessions (INFLYNX_AUTO_APPROVE)" : "disabled — per-tool approvals required"}`);
   console.log(`🏥 Health check:        http://localhost:${PORT}/health`);
   console.log(`🤖 Models catalog:      http://localhost:${PORT}/api/models`);
   console.log(`💾 Sessions endpoint:   http://localhost:${PORT}/api/sessions`);
   console.log(`📂 Workspace Root:      ${WORKSPACE_ROOT}`);
   console.log("==================================================================\n");
+
+  if (!isLoopbackHost(HOST)) {
+    console.warn("⚠️  WARNING: this server can write files and execute commands in the workspace.");
+    console.warn("   It is reachable from a routable interface while authentication and TLS are still");
+    console.warn("   unimplemented. Do not leave it exposed.\n");
+  }
 });
 
 function handleShutdown(signal: string) {
   console.log(`\n[inflynx-server] Received ${signal} — gracefully shutting down...`);
+
+  // Abort in-flight turns and reap their background shells first. Without this a
+  // `pnpm dev` the agent started outlives the server entirely, because background
+  // shells are deliberately detached into their own process group.
+  let shellsStopped = 0;
+  for (const [sessionId, active] of activeOrchestrators) {
+    try {
+      shellsStopped += active.orchestrator.shutdown({ abortTurn: true }).shellsStopped;
+    } catch (err: any) {
+      console.warn(`[inflynx-server] shutdown failed for ${sessionId}: ${err?.message || err}`);
+    }
+  }
+  activeOrchestrators.clear();
+  if (shellsStopped > 0) {
+    console.log(`[inflynx-server] stopped ${shellsStopped} background shell(s).`);
+  }
+
   server.close(() => {
     console.log("[inflynx-server] HTTP server closed.");
     process.exit(0);
   });
+  // `server.close()` only fires once every connection has ended, and an SSE stream
+  // is open by design — so a graceful close is a hang here, not a shutdown. Force
+  // the exit and say what was still in flight instead of pretending it drained.
+  const abandonedSessions = activeOrchestrators.size;
+  setTimeout(() => {
+    console.log(
+      `[inflynx-server] ${abandonedSessions} session(s) still attached (SSE streams do not close) — forcing exit.`
+    );
+    process.exit(0);
+  }, 2_000).unref?.();
 }
 
 process.on("SIGINT", () => handleShutdown("SIGINT"));

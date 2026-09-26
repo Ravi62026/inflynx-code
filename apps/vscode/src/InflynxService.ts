@@ -199,7 +199,6 @@ export class InflynxService extends EventEmitter {
     budgetLevel?: AgentBudgetLevel;
     reasoningEffort?: ReasoningEffort;
     workspaceRoot?: string;
-    autoApprove?: boolean;
   }): Promise<SessionRecord> {
     const body = {
       activeMode: options?.mode || this.currentMode,
@@ -208,7 +207,6 @@ export class InflynxService extends EventEmitter {
       budgetLevel: options?.budgetLevel || this.currentBudget,
       reasoningEffort: options?.reasoningEffort || this.currentEffort,
       workspaceRoot: options?.workspaceRoot,
-      autoApprove: options?.autoApprove,
     };
 
     const res = await fetch(`${this.serverUrl}/api/sessions`, {
@@ -244,7 +242,6 @@ export class InflynxService extends EventEmitter {
     options?: {
       sessionId?: string;
       attachedContext?: string;
-      autoApprove?: boolean;
       mode?: AgentMode;
       model?: string;
       providerId?: string;
@@ -277,10 +274,10 @@ export class InflynxService extends EventEmitter {
       Accept: "text/event-stream",
     };
 
-    if (options?.autoApprove) {
-      headers["X-Auto-Approve"] = "true";
-    }
-
+    // NOTE: no per-request auto-approval flag. Granting auto-approval is an
+    // operator decision made when the server is launched
+    // (INFLYNX_AUTO_APPROVE); a client must not be able to lower the approval
+    // bar. Client-side convenience lives in ApprovalManager's `autoApproveAll`.
     let res: Response;
     try {
       res = await fetch(`${this.serverUrl}/api/sessions/${encodeURIComponent(sessionId)}/turns`, {

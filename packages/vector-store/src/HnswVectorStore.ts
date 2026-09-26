@@ -30,7 +30,17 @@ export class HnswVectorStore {
   private indexPath: string;
   private chunks: Map<string, VectorChunk> = new Map();
 
-  constructor(workspaceRoot: string = process.cwd()) {
+  /**
+   * @param workspaceRoot the session's canonical root, **required**. It used to
+   *   default to `process.cwd()`, which meant a caller that forgot the argument
+   *   silently built `vector_store.json` in whatever directory the process happened
+   *   to start in — the same class of bug Phase 5 removed for tools (backlog H1).
+   *   The index is also session state, so it must live with that session's workspace.
+   */
+  constructor(workspaceRoot: string) {
+    if (!workspaceRoot || !workspaceRoot.trim()) {
+      throw new Error("HnswVectorStore requires an explicit workspaceRoot; there is no cwd fallback.");
+    }
     const inflynxDir = path.join(workspaceRoot, ".inflynx");
     fs.mkdirSync(inflynxDir, { recursive: true });
     this.indexPath = path.join(inflynxDir, "vector_store.json");

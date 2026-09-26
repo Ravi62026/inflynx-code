@@ -8,6 +8,8 @@ import type { FromWebviewMessage, ToWebviewMessage } from "./types.js";
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "inflynx.chatView";
   private _view?: vscode.WebviewView;
+  /** The webview only counts as a prompt surface once it has mounted. */
+  private webviewReady = false;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -32,6 +34,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.html = this.getHtmlForWebview(webviewView.webview);
 
+    // Offer the chat panel as *the* approval surface. ApprovalManager falls back to
+    // a native notification only when this returns false, so a request is never
+    // prompted twice.
+    this.approvalManager.setWebviewPrompt((request) => {
+      if (!this._view || !this.webviewReady) return false;
+      this.postMessage({ type: "tool.approval_required", payload: request });
+      return true;
+    });
+
+    webviewView.onDidDispose(() => {
+      this.webviewReady = false;
+      this.approvalManager.setWebviewPrompt(null);
+      this.approvalManager.clearSessionState();
+    });
+
+    webviewView.onDidChangeVisibility(() => {
+      if (!webviewView.visible) this.webviewReady = false;
+    });
+
     webviewView.webview.onDidReceiveMessage((message: FromWebviewMessage) => {
       this.handleWebviewMessage(message);
     });
@@ -54,10 +75,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.postMessage({ type: "tool.proposed", payload });
     });
 
-    this.service.on("tool.approval_required", (payload) => {
-      this.postMessage({ type: "tool.approval_required", payload });
-    });
-
+    // NOTE: no `tool.approval_required` forwarding here. Routing that event to both
+    // the webview and ApprovalManager's native notification is what produced two
+    // prompts for one decision; ApprovalManager now asks this panel first.
     this.service.on("tool.approved", (payload) => {
       this.postMessage({ type: "tool.approved", payload });
     });
@@ -96,12 +116,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async handleWebviewMessage(message: FromWebviewMessage): Promise<void> {
     switch (message.type) {
       case "ready": {
+        this.webviewReady = true;
         // Send initial state to webview
         const config = vscode.workspace.getConfiguration("inflynx");
         this.postMessage({
           type: "config.updated",
           payload: {
-            autoApproveReadonly: config.get<boolean>("autoApproveReadonly", true),
             autoApproveAll: config.get<boolean>("autoApproveAll", false),
             showThinking: config.get<boolean>("showThinking", true),
             theme: config.get<string>("theme", "auto"),
@@ -216,10 +236,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
 
       case "approve.tool": {
-        await this.approvalManager.resolveApprovalFromWebview(
-          message.payload.toolCallId,
-          message.payload.approved
-        );
+        // Answered against the session the request came from, and only once —
+        // `answer()` reports a duplicate instead of silently re-deciding.
+        await this.approvalManager.answer({
+          sessionId: message.payload.sessionId || this.service.getCurrentSessionId() || "",
+          toolCallId: message.payload.toolCallId,
+          approved: message.payload.approved,
+        });
         break;
       }
 

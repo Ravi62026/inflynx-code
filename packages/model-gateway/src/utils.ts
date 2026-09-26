@@ -1,6 +1,11 @@
-import { redactSecrets } from "@inflynx/config";
 import { estimateTokenUsageCost } from "./usage-tracker.js";
+import { abortedError, networkError, toProviderError } from "./errors.js";
 import type { FinishReason, TokenUsage } from "./types.js";
+
+// `providerError` and `networkError` moved to ./errors.js so every adapter throws
+// the same typed failure. Re-exported here because all four import them from this
+// module, and a silent no-op shim would let a future edit "fix" one adapter only.
+export { providerError, networkError } from "./errors.js";
 
 export function buildUsage(
   model: string,
@@ -47,17 +52,6 @@ export function normalizeFinishReason(rawReason: unknown): FinishReason {
   return "stop";
 }
 
-export function providerError(provider: string, status: number, rawBody: string): Error {
-  return new Error(`${provider.toUpperCase()} API error (${status}): ${redactSecrets(rawBody)}`);
-}
-
-export function networkError(provider: string, rawMessage: string): Error {
-  return new Error(
-    `${provider.toUpperCase()} network connection failed: ${redactSecrets(rawMessage || "fetch failed")}. ` +
-      "Please check your internet connection, endpoint configuration, or network proxy and try again."
-  );
-}
-
 export async function fetchWithRetry(
   provider: string,
   url: string,
@@ -80,8 +74,11 @@ export async function fetchWithRetry(
         : Math.min(2_000, attempt * 250);
       await sleep(waitMs, signal);
     } catch (err: unknown) {
+      // A cancelled request must stay a cancellation. Swallowing it into "check
+      // your internet connection" made an ESC look like an outage.
+      if (signal?.aborted) throw toProviderError(provider, abortedError(provider));
       lastError = err instanceof Error ? err : new Error(String(err));
-      if (signal?.aborted || attempt === maxAttempts) break;
+      if (attempt === maxAttempts) break;
       await sleep(Math.min(2_000, attempt * 250), signal);
     }
   }

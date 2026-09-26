@@ -19,6 +19,7 @@
  */
 
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { AgentEventBus } from "../../packages/protocol/src/index.js";
 import { ToolRegistry, CORE_TOOLS } from "../../packages/tool-runtime/src/index.js";
@@ -72,16 +73,34 @@ async function runGatewayEnforcementTests() {
   console.log("🔒 Running Phase 2 AgentOrchestrator Gateway Enforcement Tests...\n");
 
   const originalFetch = global.fetch;
-  const workspaceRoot = process.cwd();
+  // Neither the workspace nor the session store may be the real repo. M2 caught the
+  // store; the root itself was still `process.cwd()`, so every run wrote
+  // `.tmp_gateway_test/` and, since Phase 30, a checkpoint into the developer's
+  // `.inflynx/`. Same class, same fix: work in a temp directory. (backlog M2, M10)
+  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "inflynx-gw-workspace-"));
   const scratchDir = path.join(workspaceRoot, ".tmp_gateway_test");
   const scratchFile = path.join(scratchDir, "scratch.txt");
   const relativeScratchFile = path.relative(workspaceRoot, scratchFile);
+  // The session store must never point at the real workspace: doing so wrote a
+  // fresh session row into the developer's .inflynx/session_store.json on every
+  // test run (backlog M2).
+  const storeDir = fs.mkdtempSync(path.join(os.tmpdir(), "inflynx-gw-store-"));
 
   fs.mkdirSync(scratchDir, { recursive: true });
   if (fs.existsSync(scratchFile)) fs.unlinkSync(scratchFile);
+  // Test 3 reads `package.json` to prove a readonly tool runs without the approval
+  // handler. That only worked because the root was the repo; a workspace of its own has
+  // to provide the file it reads.
+  fs.writeFileSync(path.join(workspaceRoot, "package.json"), JSON.stringify({ name: "gw-fixture", version: "0.0.0" }, null, 2), "utf-8");
 
-  const store = new LocalJsonSessionStore(workspaceRoot);
+  const store = new LocalJsonSessionStore(storeDir);
   const registry = new ToolRegistry(CORE_TOOLS);
+
+  // This suite imports workspace packages from `src` so it runs without a build
+  // step, while `AgentOrchestrator` types them via their published `dist/*.d.ts`
+  // — so classes with private fields are nominally distinct. Re-deriving the
+  // parameter types from `start` keeps this honest instead of reaching for `any`.
+  type StartArgs = Parameters<typeof AgentOrchestrator.start>;
 
   try {
     // ── Test 1: mode-based mutation block survives an approved request ──────────
@@ -90,8 +109,8 @@ async function runGatewayEnforcementTests() {
       const eventBus = new AgentEventBus();
       const orchestrator = await AgentOrchestrator.start(
         { workspaceRoot, providerId: "openai", model: "gpt-4o", apiKey: "mock_key", activeMode: "ask", modelAdapter: "openai-chat" },
-        registry,
-        eventBus,
+        registry as unknown as StartArgs[1],
+        eventBus as unknown as StartArgs[2],
         async () => {
           approvalCalls++;
           return true; // user says yes — the gateway must still refuse.
@@ -124,8 +143,8 @@ async function runGatewayEnforcementTests() {
       const eventBus = new AgentEventBus();
       const orchestrator = await AgentOrchestrator.start(
         { workspaceRoot, providerId: "openai", model: "gpt-4o", apiKey: "mock_key", activeMode: "agent", modelAdapter: "openai-chat" },
-        registry,
-        eventBus,
+        registry as unknown as StartArgs[1],
+        eventBus as unknown as StartArgs[2],
         async () => {
           approvalCalls++;
           return false; // user says no
@@ -151,8 +170,8 @@ async function runGatewayEnforcementTests() {
       const eventBus = new AgentEventBus();
       const orchestrator = await AgentOrchestrator.start(
         { workspaceRoot, providerId: "openai", model: "gpt-4o", apiKey: "mock_key", activeMode: "agent", modelAdapter: "openai-chat" },
-        registry,
-        eventBus,
+        registry as unknown as StartArgs[1],
+        eventBus as unknown as StartArgs[2],
         async () => {
           approvalCalls++;
           return true;
@@ -178,12 +197,14 @@ async function runGatewayEnforcementTests() {
       let approvalCalls = 0;
       const eventBus = new AgentEventBus();
       const proposedEvents: unknown[] = [];
-      eventBus.on("tool.proposed", (evt) => proposedEvents.push(evt.payload));
+      eventBus.on("tool.proposed", (evt) => {
+        proposedEvents.push(evt.payload);
+      });
 
       const orchestrator = await AgentOrchestrator.start(
         { workspaceRoot, providerId: "openai", model: "gpt-4o", apiKey: "mock_key", activeMode: "agent", modelAdapter: "openai-chat" },
-        registry,
-        eventBus,
+        registry as unknown as StartArgs[1],
+        eventBus as unknown as StartArgs[2],
         async () => {
           approvalCalls++;
           return true;
@@ -220,6 +241,8 @@ async function runGatewayEnforcementTests() {
   } finally {
     global.fetch = originalFetch;
     fs.rmSync(scratchDir, { recursive: true, force: true });
+    fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    fs.rmSync(storeDir, { recursive: true, force: true });
   }
 }
 

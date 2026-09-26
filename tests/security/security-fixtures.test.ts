@@ -10,7 +10,7 @@ import {
   validatePublicUrl,
 } from "../../packages/policy-engine/src/index.js";
 import { EditTransactionManager } from "../../packages/patch-engine/src/index.js";
-import { CORE_TOOLS, executeTool, ToolRegistry } from "../../packages/tool-runtime/src/index.js";
+import { CORE_TOOLS, executeTool, ToolRegistry, createToolExecutionContext } from "../../packages/tool-runtime/src/index.js";
 
 async function runSecurityFixtureTests() {
   console.log("🛡️ Running Security Attack Fixture Suite...\n");
@@ -136,11 +136,17 @@ async function runSecurityFixtureTests() {
     if (fs.existsSync(walkSymlink)) fs.unlinkSync(walkSymlink);
     fs.symlinkSync("/etc", walkSymlink, "dir");
     const registry = new ToolRegistry(CORE_TOOLS);
-    const walkResult = await executeTool(registry, {
-      id: "security_walk",
-      name: "list_directory",
-      args: { path: ".tmp_symlink_walk_test", depth: 3 },
-    });
+    const walkResult = await executeTool(
+      registry,
+      {
+        id: "security_walk",
+        name: "list_directory",
+        args: { path: ".tmp_symlink_walk_test", depth: 3 },
+      },
+      // Since Phase 5 the workspace root is a required, explicit authority: a tool
+      // can no longer fall back to process.cwd() behind the gateway's guard.
+      createToolExecutionContext(workspaceRoot, { sessionId: "security-fixtures", mode: "agent" })
+    );
     if (!walkResult.isError && walkResult.output.includes("symlink skipped") && !walkResult.output.includes("passwd")) {
       console.log("✓ Fixture 6 Passed: list_directory skipped the escaping symlink without traversing /etc.");
     } else {

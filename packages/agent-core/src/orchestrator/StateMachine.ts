@@ -19,16 +19,23 @@ export const LEGAL_STATE_TRANSITIONS: Record<AgentState, AgentState[]> = {
   idle: ["classifying", "planning", "exploring"],
   classifying: ["planning", "exploring", "failed"],
   planning: ["exploring", "waiting_for_approval", "implementing", "failed", "cancelled"],
-  exploring: ["planning", "hypothesizing", "implementing", "failed", "cancelled"],
+  // A turn that only reads and answers is a legitimate way to finish: without
+  // "completed"/"reviewing" here, every read-only turn ended stranded in
+  // "exploring" and reported `isCompleted: false` (surfaced by the loud
+  // transition-refusal diagnostic added in Phase 7).
+  exploring: ["planning", "hypothesizing", "implementing", "verifying", "reviewing", "completed", "failed", "cancelled"],
   hypothesizing: ["exploring", "implementing", "verifying", "failed", "cancelled"],
   implementing: ["verifying", "failed", "cancelled"],
   verifying: ["reviewing", "repairing", "completed", "failed", "cancelled"],
   repairing: ["implementing", "verifying", "failed", "cancelled"],
   reviewing: ["completed", "failed", "cancelled"],
-  waiting_for_approval: ["implementing", "cancelled", "planning"],
-  completed: ["idle"],
-  failed: ["idle"],
-  cancelled: ["idle"],
+  waiting_for_approval: ["implementing", "cancelled", "planning", "exploring", "failed"],
+  // Terminal states are re-enterable: one session runs many turns. Without these
+  // edges the machine froze in `completed` after the first turn and every later
+  // transition was silently refused (backlog C7).
+  completed: ["idle", "classifying", "planning", "exploring"],
+  failed: ["idle", "classifying", "planning", "exploring"],
+  cancelled: ["idle", "classifying", "planning", "exploring"],
 };
 
 export class StateMachine {
@@ -49,6 +56,17 @@ export class StateMachine {
   canTransitionTo(nextState: AgentState): boolean {
     const allowed = LEGAL_STATE_TRANSITIONS[this.currentState];
     return allowed ? allowed.includes(nextState) : false;
+  }
+
+  /**
+   * Non-throwing variant used by the orchestrator: it reports a refusal instead of
+   * swallowing it, which is what allowed the frozen-state bug to stay invisible.
+   */
+  tryTransitionTo(nextState: AgentState, reason?: string): boolean {
+    if (this.currentState === nextState) return true;
+    if (!this.canTransitionTo(nextState)) return false;
+    this.transitionTo(nextState, reason);
+    return true;
   }
 
   /**

@@ -67,7 +67,10 @@ export function formatAnthropicMessages(messages: Message[]): AnthropicMessage[]
         type: "tool_result",
         tool_use_id: message.tool_call_id || "missing_tool_call_id",
         content: message.content,
-        is_error: message.content.startsWith("Error:"),
+        // Explicit flag wins. The prefix heuristic is only a fallback for history
+        // persisted before `is_error` existed — without this, policy denials and
+        // security-block results were reported to the model as successes.
+        is_error: message.is_error ?? message.content.startsWith("Error:"),
       });
       continue;
     }

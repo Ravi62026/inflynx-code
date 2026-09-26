@@ -7,16 +7,25 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import type { ProviderId } from "./model-catalog.js";
+import { findWorkspaceRoot } from "./workspace-root.js";
 
 export {
   assertSupportedReasoningEffort,
+  CONSERVATIVE_CONTEXT_WINDOW,
+  CONSERVATIVE_MAX_OUTPUT_TOKENS,
+  CONTEXT_STRATEGIES,
+  DEFAULT_CONTEXT_STRATEGY,
   getModelCapability,
   getProvider,
   MODEL_CATALOG,
   REASONING_EFFORTS,
+  resolveContextLimits,
+  resolveContextStrategy,
   resolveModelCapability,
   supportsReasoningEffort,
   TOP_PROVIDERS,
+  type ContextLimits,
+  type ContextStrategy,
   type ModelAdapter,
   type ModelCapability,
   type ProviderId,
@@ -55,33 +64,7 @@ export interface InflynxConfig {
   baseURL?: string;
 }
 
-export function findWorkspaceRoot(startDir: string = process.cwd()): string {
-  let curr = path.resolve(startDir);
-  while (true) {
-    if (
-      fs.existsSync(path.join(curr, "pnpm-workspace.yaml")) ||
-      fs.existsSync(path.join(curr, ".inflynx"))
-    ) {
-      return curr;
-    }
-    const parent = path.dirname(curr);
-    if (parent === curr) break;
-    curr = parent;
-  }
-
-  // Fallback: farthest parent containing package.json
-  curr = path.resolve(startDir);
-  let rootCandidate = curr;
-  while (true) {
-    if (fs.existsSync(path.join(curr, "package.json"))) {
-      rootCandidate = curr;
-    }
-    const parent = path.dirname(curr);
-    if (parent === curr) break;
-    curr = parent;
-  }
-  return rootCandidate;
-}
+export { findWorkspaceRoot } from "./workspace-root.js";
 
 export function loadEnv(startDir: string = process.cwd()): void {
   const rootDir = findWorkspaceRoot(startDir);
@@ -129,117 +112,62 @@ export function loadEnv(startDir: string = process.cwd()): void {
 }
 
 /**
- * Redacts common API-key and Authorization-header representations before an
- * error reaches terminal output, persisted messages, or telemetry.
+ * Credential-shaped strings from known issuers. Prefix-scoped on purpose: the
+ * previous catch-all (`[a-z]{2,16}_[A-Za-z0-9_-]{24,}`) also matched ordinary
+ * source identifiers such as `handle_user_authentication_flow`, which corrupted
+ * agent output and the text shown to users (backlog B13).
+ */
+const VENDOR_TOKEN_PATTERN =
+  /\b((?:sk-(?:ant-|or-v1-)?|gsk_|gh[pousr]_|github_pat_|xox[baprs]-|npm_|hf_|dckr_pat_|ASIA)[A-Za-z0-9_-]{12,})\b/g;
+
+/**
+ * A long opaque value *assigned to* a secret-sounding name, e.g.
+ * `"apiKey": "..."`, `OPENROUTER_API_KEY=...`, `client_secret = "..."`.
+ * Requiring an assignment context plus a secret-ish key name is what keeps
+ * ordinary identifiers and prose intact.
+ */
+const ASSIGNED_SECRET_PATTERN =
+  /(["']?)([A-Za-z0-9]*(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|client[_-]?secret|secret|password|passwd|credential)s?)\1(\s*[:=]\s*)(["'`]?)([A-Za-z0-9_\-./+]{8,})/gi;
+
+/**
+ * Redacts credential-shaped text before it reaches terminal output, persisted
+ * messages, the event stream or telemetry. It is deliberately NOT applied to
+ * content handed back to the model — see `AgentOrchestrator.runTurn`.
  */
 export function redactSecrets(text: string): string {
+  if (!text) return text;
   return text
     .replace(/([?&](?:api[_-]?key|key|token|access[_-]?token|authorization)=)[^&#\s]+/gi, "$1[REDACTED]")
     .replace(/(authorization\s*:\s*bearer\s+)[^\s,;"]+/gi, "$1[REDACTED]")
     .replace(/(bearer\s+)[a-z0-9._-]{16,}/gi, "$1[REDACTED]")
-    .replace(/\b(sk-(?:ant-)?[a-zA-Z0-9_-]{16,})\b/g, "[REDACTED_API_KEY]")
     .replace(/\b(AIza[a-zA-Z0-9_-]{20,})\b/g, "[REDACTED_API_KEY]")
-    .replace(/\b(gsk_[a-zA-Z0-9_-]{16,})\b/g, "[REDACTED_API_KEY]")
-    .replace(/\b(sk-or-v1-[a-zA-Z0-9_-]{16,})\b/g, "[REDACTED_API_KEY]")
-    .replace(/\b([a-z]{2,16}_[a-zA-Z0-9_-]{24,})\b/gi, "[REDACTED_API_KEY]");
+    .replace(VENDOR_TOKEN_PATTERN, "[REDACTED_API_KEY]")
+    .replace(ASSIGNED_SECRET_PATTERN, (match, quote = "", key = "", sep = "", innerQuote = "", value = "") => {
+      // Never re-redact an already-redacted placeholder.
+      if (value.startsWith("[REDACTED")) return match;
+      return `${quote}${key}${quote}${sep}${innerQuote}[REDACTED]`;
+    });
 }
 
-// ─── MCP Configuration Loader ────────────────────────────────────────────────
-
-export interface McpServerConfig {
-  id: string;
-  name?: string;
-  transport: "stdio" | "sse";
-  command?: string;
-  args?: string[];
-  env?: Record<string, string>;
-  url?: string;
-  disabled?: boolean;
-}
-
-export interface McpConfigFile {
-  mcpServers?: Record<string, {
-    command?: string;
-    args?: string[];
-    env?: Record<string, string>;
-    url?: string;
-    disabled?: boolean;
-    transport?: "stdio" | "sse";
-  }>;
-}
-
-export function loadMcpConfig(startDir: string = process.cwd()): McpServerConfig[] {
-  const rootDir = findWorkspaceRoot(startDir);
-  const configPaths = [
-    path.join(os.homedir(), ".inflynx", "mcp.json"),
-    path.join(rootDir, ".inflynx", "mcp.json"),
-    path.join(rootDir, "mcp.json"),
-  ];
-
-  const serversMap = new Map<string, McpServerConfig>();
-
-  for (const cfgPath of configPaths) {
-    if (fs.existsSync(cfgPath)) {
-      try {
-        const raw = fs.readFileSync(cfgPath, "utf-8");
-        const parsed = JSON.parse(raw) as McpConfigFile;
-        if (parsed.mcpServers) {
-          for (const [id, cfg] of Object.entries(parsed.mcpServers)) {
-            serversMap.set(id, {
-              id,
-              name: id,
-              transport: cfg.transport || (cfg.url ? "sse" : "stdio"),
-              command: cfg.command,
-              args: cfg.args,
-              env: cfg.env,
-              url: cfg.url,
-              disabled: cfg.disabled ?? false,
-            });
-          }
-        }
-      } catch {
-        // ignore malformed config files
-      }
-    }
-  }
-
-  return Array.from(serversMap.values());
-}
-
-export function saveMcpServerConfig(
-  serverConfig: McpServerConfig,
-  startDir: string = process.cwd()
-): void {
-  const rootDir = findWorkspaceRoot(startDir);
-  const inflynxDir = path.join(rootDir, ".inflynx");
-  if (!fs.existsSync(inflynxDir)) {
-    fs.mkdirSync(inflynxDir, { recursive: true });
-  }
-
-  const cfgPath = path.join(inflynxDir, "mcp.json");
-  let currentConfig: McpConfigFile = { mcpServers: {} };
-
-  if (fs.existsSync(cfgPath)) {
-    try {
-      currentConfig = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
-    } catch {
-      currentConfig = { mcpServers: {} };
-    }
-  }
-
-  if (!currentConfig.mcpServers) {
-    currentConfig.mcpServers = {};
-  }
-
-  currentConfig.mcpServers[serverConfig.id] = {
-    command: serverConfig.command,
-    args: serverConfig.args,
-    env: serverConfig.env,
-    url: serverConfig.url,
-    transport: serverConfig.transport,
-    disabled: serverConfig.disabled,
-  };
-
-  fs.writeFileSync(cfgPath, JSON.stringify(currentConfig, null, 2), "utf-8");
-}
+// ─── MCP configuration, trust & subprocess environment ───────────────────────
+// Lives in `mcp-config.ts` so that loading, trusting and spawning one server are
+// decided in one place — splitting them across files is how "where did this config
+// come from" and "what may it see" stop being the same question (backlog B5/B6).
+export {
+  buildMcpEnvironment,
+  computeMcpTrustId,
+  getProjectMcpConfigPaths,
+  getUserMcpConfigPath,
+  isMcpServerTrusted,
+  listTrustedMcpServers,
+  loadMcpConfig,
+  MCP_BASE_ENV_KEYS,
+  revokeMcpServer,
+  saveMcpServerConfig,
+  trustMcpServer,
+  type McpConfigFile,
+  type McpConfigSource,
+  type McpServerConfig,
+  type ResolvedMcpServer,
+} from "./mcp-config.js";
 

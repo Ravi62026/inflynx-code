@@ -53,7 +53,7 @@ export class RepairLoop {
    * Emits repair attempt telemetry event.
    */
   notifyRepairAttempt(attemptNumber: number, maxRetries: number, errors: DiagnosticError[]): void {
-    this.eventBus?.emit("repair.attempted" as any, this.sessionId, {
+    this.eventBus?.emit("repair.attempted", this.sessionId, {
       attemptNumber,
       maxRetries,
       errorCount: errors.length,

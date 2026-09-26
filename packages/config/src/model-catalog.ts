@@ -27,8 +27,13 @@ export interface ModelCapability {
   supportsTools: boolean;
   supportsThinking: boolean;
   supportedEfforts: readonly ReasoningEffort[];
-  contextWindow?: number;
-  maxOutputTokens?: number;
+  /**
+   * Required. These two numbers are what every context-budget decision is made
+   * against, so "we didn't write it down" is not an acceptable state — that is how
+   * a 1M-window model and an unknown one ended up treated identically (backlog D1/D2).
+   */
+  contextWindow: number;
+  maxOutputTokens: number;
   curated: boolean;
 }
 
@@ -58,6 +63,7 @@ export const MODEL_CATALOG: Record<ProviderId, ModelCapability[]> = {
       supportsThinking: true,
       supportedEfforts: OPENROUTER_EFFORTS,
       contextWindow: 1_050_000,
+      maxOutputTokens: 128_000,
       curated: true,
     },
     {
@@ -67,6 +73,8 @@ export const MODEL_CATALOG: Record<ProviderId, ModelCapability[]> = {
       supportsTools: true,
       supportsThinking: true,
       supportedEfforts: OPENROUTER_EFFORTS,
+      contextWindow: 200_000,
+      maxOutputTokens: 64_000,
       curated: true,
     },
     {
@@ -76,6 +84,8 @@ export const MODEL_CATALOG: Record<ProviderId, ModelCapability[]> = {
       supportsTools: true,
       supportsThinking: true,
       supportedEfforts: OPENROUTER_EFFORTS,
+      contextWindow: 164_000,
+      maxOutputTokens: 8_192,
       curated: true,
     },
     {
@@ -99,6 +109,7 @@ export const MODEL_CATALOG: Record<ProviderId, ModelCapability[]> = {
       supportsThinking: true,
       supportedEfforts: OPENAI_EFFORTS,
       contextWindow: 1_050_000,
+      maxOutputTokens: 128_000,
       curated: true,
     },
   ],
@@ -110,6 +121,8 @@ export const MODEL_CATALOG: Record<ProviderId, ModelCapability[]> = {
       supportsTools: true,
       supportsThinking: true,
       supportedEfforts: ANTHROPIC_EFFORTS,
+      contextWindow: 200_000,
+      maxOutputTokens: 64_000,
       curated: true,
     },
   ],
@@ -121,6 +134,8 @@ export const MODEL_CATALOG: Record<ProviderId, ModelCapability[]> = {
       supportsTools: true,
       supportsThinking: true,
       supportedEfforts: DEEPSEEK_EFFORTS,
+      contextWindow: 164_000,
+      maxOutputTokens: 8_192,
       curated: true,
     },
   ],
@@ -195,6 +210,17 @@ export function getModelCapability(providerId: string, modelId: string): ModelCa
   return MODEL_CATALOG[providerId as ProviderId]?.find((model) => model.id === modelId);
 }
 
+/**
+ * Conservative fallback used for anything not in the catalog (custom/BYOK endpoints).
+ * Deliberately tiny: under-estimating the window only means the agent evicts and
+ * compacts earlier than it had to; over-estimating is what corrupts sessions with a
+ * provider 400. Unverified numbers here are the Claude Sonnet 5 and DeepSeek V4
+ * windows plus the `maxOutputTokens` of every OpenRouter route — confirm them
+ * against provider documentation before relying on long-context behaviour.
+ */
+export const CONSERVATIVE_CONTEXT_WINDOW = 32_768;
+export const CONSERVATIVE_MAX_OUTPUT_TOKENS = 8_192;
+
 export function resolveModelCapability(providerId: string, modelId: string): ModelCapability {
   return getModelCapability(providerId, modelId) || {
     id: modelId,
@@ -203,8 +229,74 @@ export function resolveModelCapability(providerId: string, modelId: string): Mod
     supportsTools: false,
     supportsThinking: false,
     supportedEfforts: ["none"],
+    contextWindow: CONSERVATIVE_CONTEXT_WINDOW,
+    maxOutputTokens: CONSERVATIVE_MAX_OUTPUT_TOKENS,
     curated: false,
   };
+}
+
+/**
+ * The limits to enforce for one (provider, model) pair, plus how they were obtained.
+ *
+ * Resolution order: an explicit BYOK declaration, then the curated catalog, then the
+ * conservative fallback. It never guesses upward, because an over-large assumption is
+ * what ends a session with a provider 400.
+ */
+export interface ContextLimits {
+  contextWindow: number;
+  maxOutputTokens: number;
+  /** False when the conservative fallback stood in for a known figure. */
+  curated: boolean;
+}
+
+export function resolveContextLimits(
+  providerId: string,
+  modelId: string,
+  custom?: { contextWindow?: number; maxOutputTokens?: number }
+): ContextLimits {
+  if (custom?.contextWindow && custom.contextWindow > 0) {
+    const window = custom.contextWindow;
+    const output =
+      custom.maxOutputTokens && custom.maxOutputTokens > 0
+        ? Math.min(custom.maxOutputTokens, window)
+        : Math.min(CONSERVATIVE_MAX_OUTPUT_TOKENS, window);
+    return { contextWindow: window, maxOutputTokens: output, curated: true };
+  }
+
+  const capability = resolveModelCapability(providerId, modelId);
+  const contextWindow = capability.contextWindow > 0 ? capability.contextWindow : CONSERVATIVE_CONTEXT_WINDOW;
+  const maxOutputTokens =
+    capability.maxOutputTokens > 0
+      ? Math.min(capability.maxOutputTokens, contextWindow)
+      : Math.min(CONSERVATIVE_MAX_OUTPUT_TOKENS, contextWindow);
+  return { contextWindow, maxOutputTokens, curated: capability.curated };
+}
+
+/**
+ * How hard the agent may work to stay inside the window it was just given.
+ *
+ * - `off`     never touches history. Debugging aid; a long session will overflow.
+ * - `evict`   drops stale tool output only. Free, and lossless for anything the
+ *             model already acted on. **Default.**
+ * - `compact` also folds the oldest turns into a generated summary. Costs a model
+ *             call and changes what the model remembers, so it stays opt-in until
+ *             the Phase 45 evals measure whether it hurts task success.
+ */
+export const CONTEXT_STRATEGIES = ["off", "evict", "compact"] as const;
+export type ContextStrategy = (typeof CONTEXT_STRATEGIES)[number];
+
+export const DEFAULT_CONTEXT_STRATEGY: ContextStrategy = "evict";
+
+/** Reads `INFLYNX_CONTEXT_STRATEGY`. An unrecognised value is reported, not ignored. */
+export function resolveContextStrategy(env: NodeJS.ProcessEnv = process.env): ContextStrategy {
+  const raw = (env.INFLYNX_CONTEXT_STRATEGY || "").trim().toLowerCase();
+  if (!raw) return DEFAULT_CONTEXT_STRATEGY;
+  if ((CONTEXT_STRATEGIES as readonly string[]).includes(raw)) return raw as ContextStrategy;
+  console.warn(
+    `[config] INFLYNX_CONTEXT_STRATEGY="${raw}" is not one of ${CONTEXT_STRATEGIES.join("|")}; ` +
+    `using ${DEFAULT_CONTEXT_STRATEGY}.`
+  );
+  return DEFAULT_CONTEXT_STRATEGY;
 }
 
 export function supportsReasoningEffort(

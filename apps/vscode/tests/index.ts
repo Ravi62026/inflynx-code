@@ -3,6 +3,7 @@
  */
 
 import { InflynxService } from "../src/InflynxService.js";
+import { ApprovalRegistry } from "../src/approval-registry.js";
 import type {
   BudgetStatePayload,
   ModelsResponse,
@@ -171,6 +172,7 @@ async function runTests() {
   console.log("\nTest Group 5: Tool Approval Policy Evaluation");
   {
     const readonlyRequest: ToolApprovalRequestPayload = {
+      sessionId: "session_a",
       toolCallId: "tc_read_1",
       toolName: "read_file",
       permissionLevel: "readonly",
@@ -178,13 +180,15 @@ async function runTests() {
     };
 
     const mutatingRequest: ToolApprovalRequestPayload = {
+      sessionId: "session_a",
       toolCallId: "tc_write_1",
       toolName: "patch_file",
       permissionLevel: "readwrite",
-      args: { targetFile: "src/index.ts", replacementSnippet: "new code" },
+      args: { path: "src/index.ts", target_code: "old", replacement_code: "new code" },
     };
 
     const shellRequest: ToolApprovalRequestPayload = {
+      sessionId: "session_a",
       toolCallId: "tc_shell_1",
       toolName: "execute_shell",
       permissionLevel: "shell",
@@ -194,6 +198,58 @@ async function runTests() {
     assert(readonlyRequest.permissionLevel === "readonly", "Readonly tools correctly classified");
     assert(mutatingRequest.permissionLevel === "readwrite", "File mutation correctly classified as readwrite");
     assert(shellRequest.permissionLevel === "shell", "Terminal execution correctly classified as shell");
+  }
+
+  // ─── Test Group 6: Approval Registry (single resolution, per-session keys) ───
+  console.log("\nTest Group 6: ApprovalRegistry Idempotency & Session Scoping");
+  {
+    const registry = new ApprovalRegistry();
+
+    assert(
+      registry.track({ sessionId: "sess_1", toolCallId: "tc_1", toolName: "write_file", permissionLevel: "readwrite" }),
+      "a new request is tracked"
+    );
+    assert(
+      !registry.track({ sessionId: "sess_1", toolCallId: "tc_1", toolName: "write_file", permissionLevel: "readwrite" }),
+      "a duplicate event for the same request is rejected"
+    );
+
+    const first = registry.resolve("sess_1", "tc_1", true);
+    assert(first.status === "resolved" && first.approved === true, "the first answer settles the request");
+
+    // This is the double-prompt bug: webview and native both answering one request.
+    const second = registry.resolve("sess_1", "tc_1", false);
+    assert(
+      second.status === "already-settled" && second.approved === true,
+      "a second, contradictory answer is reported as already settled — it cannot flip the decision"
+    );
+    assert(registry.pendingCount === 0, "nothing stays pending after settlement");
+
+    // Same toolCallId, different session: must not collide.
+    registry.track({ sessionId: "sess_A", toolCallId: "shared_id", toolName: "execute_shell", permissionLevel: "shell" });
+    registry.track({ sessionId: "sess_B", toolCallId: "shared_id", toolName: "execute_shell", permissionLevel: "shell" });
+    assert(registry.resolve("sess_A", "shared_id", true).status === "resolved", "session A answers its own request");
+    assert(registry.isPending("sess_B", "shared_id"), "session B's identically-named request is untouched");
+    assert(
+      registry.resolve("sess_A", "shared_id", true).status === "already-settled",
+      "answering session A twice does not leak into session B"
+    );
+
+    // An abandoned request (abort / switched session) is a denial, permanently.
+    const orphan = new ApprovalRegistry();
+    orphan.track({ sessionId: "sess_C", toolCallId: "tc_c1", toolName: "write_file", permissionLevel: "readwrite" });
+    orphan.track({ sessionId: "sess_C", toolCallId: "tc_c2", toolName: "write_file", permissionLevel: "readwrite" });
+    orphan.forgetSession("sess_C");
+    assert(orphan.pendingCount === 0, "forgetSession clears the session's pending set");
+    const late = orphan.resolve("sess_C", "tc_c1", true);
+    assert(
+      late.status === "already-settled" && late.approved === false,
+      "a late answer to an abandoned request stays a denial"
+    );
+    assert(
+      new ApprovalRegistry().resolve("nope", "nope", true).status === "unknown-request",
+      "an answer for an unknown request is reported as such"
+    );
   }
 
   console.log("\n================================================================");

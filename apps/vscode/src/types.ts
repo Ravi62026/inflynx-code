@@ -4,16 +4,50 @@
 
 export type AgentMode = "ask" | "plan" | "agent" | "debug";
 export type AgentBudgetLevel = "low" | "medium" | "high" | "max";
+// NOTE: intentionally narrower than the backend's 7 levels — see backlog K5 /
+// Phase 35, which widens this union together with the effort pickers.
 export type ReasoningEffort = "none" | "low" | "medium" | "high" | "max";
 
+/** Normalized, display-ready model descriptor used across the extension UI. */
 export interface ModelInfo {
   id: string;
   name: string;
   provider: string;
-  contextWindow: number;
+  /** Not every model advertises a window yet; callers must handle `undefined`. */
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  supportsTools?: boolean;
+  supportedEfforts?: string[];
   description?: string;
   tier?: string;
 }
+
+/**
+ * One raw catalog entry as served by `GET /api/models` (the server forwards
+ * `@inflynx/config`'s `MODEL_CATALOG`, which is keyed by provider id and uses
+ * `label`, not `name`). Optional `name`/`provider` keep older flat-array
+ * payloads structurally assignable while the wire contract settles (Phase 47).
+ */
+export interface ModelCatalogEntry {
+  id: string;
+  label?: string;
+  name?: string;
+  provider?: string;
+  description?: string;
+  adapter?: string;
+  supportsTools?: boolean;
+  supportsThinking?: boolean;
+  supportedEfforts?: string[];
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  tier?: string;
+  curated?: boolean;
+}
+
+export type ModelsCatalogPayload =
+  | ModelCatalogEntry[]
+  | Record<string, ModelCatalogEntry[]>;
+
 
 export interface ProviderInfo {
   id: string;
@@ -23,7 +57,7 @@ export interface ProviderInfo {
 }
 
 export interface ModelsResponse {
-  catalog: ModelInfo[] | Record<string, ModelInfo[]>;
+  catalog: ModelsCatalogPayload;
   providers: ProviderInfo[];
   supportedEfforts: ReasoningEffort[];
 }
@@ -80,6 +114,12 @@ export interface SessionHydration {
 }
 
 export interface ToolApprovalRequestPayload {
+  /**
+   * The session the request belongs to, echoed by whoever answers it. Approval
+   * used to be resolved against "the session the UI is showing", which is not
+   * necessarily the same one (backlog K9).
+   */
+  sessionId: string;
   toolCallId: string;
   toolName: string;
   permissionLevel: "readonly" | "readwrite" | "shell";
@@ -134,7 +174,7 @@ export type ToWebviewMessage =
   | { type: "mode.changed"; payload: { mode: AgentMode } }
   | { type: "model.changed"; payload: { model: string; provider: string } }
   | { type: "effort.changed"; payload: { effort: ReasoningEffort } }
-  | { type: "config.updated"; payload: { autoApproveReadonly: boolean; autoApproveAll: boolean; showThinking: boolean; theme: string } };
+  | { type: "config.updated"; payload: { autoApproveAll: boolean; showThinking: boolean; theme: string } };
 
 export interface AttachmentPayload {
   name: string;
@@ -149,7 +189,7 @@ export type FromWebviewMessage =
   | { type: "abort.turn" }
   | { type: "create.session"; payload?: { mode?: AgentMode; model?: string; provider?: string; budget?: AgentBudgetLevel; effort?: ReasoningEffort } }
   | { type: "resume.session"; payload: { sessionId: string } }
-  | { type: "approve.tool"; payload: { toolCallId: string; approved: boolean } }
+  | { type: "approve.tool"; payload: { sessionId: string; toolCallId: string; approved: boolean } }
   | { type: "set.mode"; payload: { mode: AgentMode } }
   | { type: "set.model"; payload: { model: string; provider?: string } }
   | { type: "set.effort"; payload: { effort: ReasoningEffort } }

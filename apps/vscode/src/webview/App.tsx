@@ -7,6 +7,7 @@ import { InputBox } from "./components/InputBox.js";
 import { ModeSelector } from "./components/ModeSelector.js";
 import { ModelBadge } from "./components/ModelBadge.js";
 import { BudgetMeter } from "./components/BudgetMeter.js";
+import { normalizeModelsCatalog } from "../models.js";
 import type {
   AgentMode,
   BudgetStatePayload,
@@ -236,14 +237,7 @@ export const App: React.FC = () => {
           break;
 
         case "models.loaded": {
-          const raw = msg.payload.catalog;
-          let list: ModelInfo[] = [];
-          if (Array.isArray(raw)) {
-            list = raw;
-          } else if (raw && typeof raw === "object") {
-            list = Object.values(raw).flat() as ModelInfo[];
-          }
-          setModelsCatalog(list);
+          setModelsCatalog(normalizeModelsCatalog(msg.payload.catalog));
           break;
         }
 
@@ -532,15 +526,16 @@ export const App: React.FC = () => {
     post({ type: "set.effort", payload: { effort } });
   }, [post]);
 
-  const handleApproveTool = useCallback((toolCallId: string) => {
-    setPendingApproval(null);
-    post({ type: "approve.tool", payload: { toolCallId, approved: true } });
-  }, [post]);
-
-  const handleDenyTool = useCallback((toolCallId: string) => {
-    setPendingApproval(null);
-    post({ type: "approve.tool", payload: { toolCallId, approved: false } });
-  }, [post]);
+  const answerApproval = useCallback(
+    (request: ToolApprovalRequestPayload, approved: boolean) => {
+      setPendingApproval(null);
+      post({
+        type: "approve.tool",
+        payload: { sessionId: request.sessionId, toolCallId: request.toolCallId, approved },
+      });
+    },
+    [post]
+  );
 
   const handleOpenFile = useCallback((filePath: string) => {
     post({ type: "open.file", payload: { filePath } });
@@ -652,8 +647,8 @@ export const App: React.FC = () => {
         {pendingApproval && (
           <ApprovalDialog
             request={pendingApproval}
-            onApprove={handleApproveTool}
-            onDeny={handleDenyTool}
+            onApprove={() => answerApproval(pendingApproval, true)}
+            onDeny={() => answerApproval(pendingApproval, false)}
           />
         )}
 

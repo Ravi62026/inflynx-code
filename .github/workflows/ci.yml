@@ -62,9 +62,15 @@ jobs:
       - name: Monorepo Typecheck
         run: pnpm run typecheck
 
+      - name: Monorepo Build
+        run: pnpm run build
+
       - name: Run Unit & Security Test Suites
         run: pnpm run test:unit
 
       - name: Run PostgreSQL & Redis Integration Suite
         run: pnpm run test:integration
+
+      - name: Package VS Code Extension
+        run: pnpm run package:vscode
 

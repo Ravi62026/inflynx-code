@@ -71,18 +71,39 @@ async function runSessionRecoveryTests() {
       context.addMessage({ role: "tool", content: "file content", tool_call_id: "call_orphaned_1" });
 
       assert.equal(context.history.length, 3);
-      context.ensureHistoryIntegrity();
+      const synthesized = context.ensureHistoryIntegrity();
 
-      // ensureHistoryIntegrity must synthesize the missing response for call_orphaned_2
+      // ensureHistoryIntegrity() synthesized the missing response for call_orphaned_2
       assert.equal(context.history.length, 4);
       const repaired = context.history[3];
       assert.equal(repaired.role, "tool");
       assert.equal(repaired.tool_call_id, "call_orphaned_2");
       assert.ok(repaired.content?.includes("interrupted or failed"));
-      console.log("✓ Test 1 Passed: ensureHistoryIntegrity() synthesized missing tool response for interrupted tool call.");
+      assert.equal(synthesized.length, 1, "integrity pass should report exactly one stub");
+      assert.equal(synthesized[0].tool_call_id, "call_orphaned_2");
+
+      // Idempotent, and repairs a *middle* round too — the old implementation only
+      // ever inspected the last assistant message.
+      assert.equal(context.ensureHistoryIntegrity().length, 0, "second run should be a no-op");
+      context.addMessage({ role: "user", content: "again" });
+      context.addMessage({
+        role: "assistant",
+        content: "one more",
+        tool_calls: [{ id: "call_orphaned_3", type: "function", function: { name: "read_file", arguments: "{}" } }],
+      });
+      const secondRound = context.ensureHistoryIntegrity();
+      assert.equal(secondRound.length, 1);
+      assert.equal(secondRound[0].tool_call_id, "call_orphaned_3");
+      assert.equal(secondRound[0].is_error, true, "synthesized stubs must be marked as errors");
+      // The new stub sits immediately after its own assistant message.
+      assert.equal(context.history[context.history.length - 1].role, "tool");
+      console.log("✓ Test 1 Passed: ensureHistoryIntegrity() repairs every round, is idempotent, and reports its stubs.");
     }
 
-    // ── Test 2: AbortController reset allows consecutive operations ─────────────
+    // ── Test 2: cancellation generations (Phase 6 semantics) ──────────────────
+    // This previously asserted that abort() handed out a fresh, un-aborted signal
+    // and called that "correct". It was the bug: a turn re-reading context.signal
+    // after an abort saw `false` and kept executing the remaining tool calls.
     {
       const context = new ExecutionContext({
         workspaceRoot: tmpDir,
@@ -91,11 +112,17 @@ async function runSessionRecoveryTests() {
         apiKey: "mock_key",
       });
 
-      assert.equal(context.signal.aborted, false);
+      const turnSignal = context.beginGeneration();
+      assert.equal(turnSignal.aborted, false);
+
       context.abort();
-      // After abort(), the old signal was aborted, but context now has a fresh signal
-      assert.equal(context.signal.aborted, false);
-      console.log("✓ Test 2 Passed: ExecutionContext.abort() refreshed AbortController for subsequent turns.");
+      assert.equal(turnSignal.aborted, true, "the in-flight generation must stay cancelled");
+      assert.equal(context.signal.aborted, true, "context.signal must report the same cancellation");
+
+      const nextTurn = context.beginGeneration();
+      assert.equal(nextTurn.aborted, false, "a new turn must start with a live signal");
+      assert.equal(turnSignal.aborted, true, "the abandoned signal must remain cancelled");
+      console.log("✓ Test 2 Passed: abort() cancels the current generation; beginGeneration() starts a clean one.");
     }
 
     // ── Test 3: Resume interrupted session and successfully run next turn ───────
@@ -116,13 +143,18 @@ async function runSessionRecoveryTests() {
 
       process.env.OPENAI_API_KEY = "mock_key";
       const eventBus = new AgentEventBus();
+      // This suite imports workspace packages from `src` while AgentOrchestrator
+      // types them through their published `dist/*.d.ts`, so classes with private
+      // fields are nominally distinct (backlog M8). Deriving the parameter types
+      // from the callee keeps this honest instead of using `any`.
+      type ResumeArgs = Parameters<typeof AgentOrchestrator.resumeSession>;
       const resumedOrchestrator = await AgentOrchestrator.resumeSession(
         tmpDir,
         sessionId,
-        registry,
-        eventBus,
+        registry as unknown as ResumeArgs[2],
+        eventBus as unknown as ResumeArgs[3],
         async () => true,
-        store
+        store as unknown as ResumeArgs[5]
       );
 
       assert.ok(resumedOrchestrator);

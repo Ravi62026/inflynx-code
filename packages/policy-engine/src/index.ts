@@ -1,33 +1,44 @@
 /**
  * @inflynx/policy-engine
- * Sandbox execution profiles, canonical symlink-safe path guards, and command policies.
+ * Canonical symlink-safe path guards, shell command review, and execution audit.
  */
 
 export { CanonicalPathGuard } from "./path-guard.js";
 export { CommandPolicy } from "./command-policy.js";
 export { validatePublicUrl } from "./ssrf-guard.js";
 
-export type SandboxProfile = "read-only" | "workspace-write" | "full-access";
+export {
+  auditFieldsFromReview,
+  appendShellAudit,
+  getShellAuditPath,
+  hashShellOutput,
+  readShellAudit,
+  SHELL_AUDIT_RELATIVE_PATH,
+  type ShellApprovalSource,
+  type ShellAuditEntry,
+  type ShellAuditRecord,
+} from "./shell-audit.js";
 
-export interface PolicyRule {
-  name: string;
-  sandboxProfile: SandboxProfile;
-  allowedPaths: string[];
-  blockedCommands: RegExp[];
-  requireConfirmationOnWrite: boolean;
-}
+export {
+  formatReviewForUser,
+  getUserShellRulesPath,
+  loadUserShellRules,
+  parseShellSegments,
+  reviewShellCommand,
+  setUserShellRules,
+  type JoinOperator,
+  type SegmentVerdict,
+  type ShellCommandReview,
+  type ShellDecision,
+  type ShellFeatures,
+  type ShellSegment,
+  type UserShellRules,
+} from "./shell-rules.js";
 
-/**
- * Symlink-safe workspace boundary validator (backward compatible interface).
- * Uses realpath resolution under the hood.
- */
-export function validateWorkspaceBoundary(targetPath: string, workspaceRoot: string): boolean {
-  try {
-    const { CanonicalPathGuard } = require("./path-guard.js");
-    const guard = new CanonicalPathGuard(workspaceRoot);
-    guard.validateAndResolve(targetPath);
-    return true;
-  } catch {
-    return false;
-  }
-}
+// NOTE: this file used to export `validateWorkspaceBoundary()` and the
+// `SandboxProfile` / `PolicyRule` types. Nothing called them, the function used
+// `require()` inside an ES module (so it would have thrown the first time anyone did),
+// and the types described an OS-sandbox feature the product does not have — which is
+// the worst kind of dead code, because it advertises a security boundary that is not
+// there. The real boundaries are `CanonicalPathGuard` (paths), `reviewShellCommand`
+// (commands) and the approval flow (intent). Backlog Phase 20.

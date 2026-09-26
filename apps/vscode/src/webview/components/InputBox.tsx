@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import type { AgentMode, ModelInfo, ReasoningEffort, AttachmentPayload } from "../../types.js";
+import { describeModelLabel } from "../../models.js";
 import { ModelEffortPopover } from "./ModelEffortPopover.js";
 import { ModePopover } from "./ModePopover.js";
 import { ContextActionPopover } from "./ContextActionPopover.js";
@@ -233,23 +234,7 @@ export const InputBox: React.FC<InputBoxProps> = ({
     setAttachments((prev) => prev.filter((_, idx) => idx !== idxToRemove));
   };
 
-  const getCleanModelLabel = (id?: string): string => {
-    if (!id) return "Select Model";
-    const catalogList: ModelInfo[] = Array.isArray(modelsCatalog)
-      ? modelsCatalog
-      : modelsCatalog && typeof modelsCatalog === "object"
-      ? Object.values(modelsCatalog).flat()
-      : [];
-
-    const found = catalogList.find((m) => m?.id === id);
-    if (found?.name) return found.name;
-    const parts = (id || "").split("/");
-    const raw = parts.length > 1 ? parts[1] : parts[0];
-    return (raw || "")
-      .replace(/-/g, " ")
-      .replace(/\b\w/g, (c) => c.toUpperCase())
-      .replace("Gpt", "GPT");
-  };
+  const getCleanModelLabel = (id?: string): string => describeModelLabel(modelsCatalog, id);
 
   const effortCapitalized = activeEffort
     ? String(activeEffort).charAt(0).toUpperCase() + String(activeEffort).slice(1)

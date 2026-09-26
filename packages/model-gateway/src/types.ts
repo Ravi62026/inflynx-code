@@ -47,11 +47,25 @@ export interface Message {
   tool_call_id?: string;
   tool_calls?: ToolCallMessage[];
   provider_metadata?: ProviderMetadata;
+  /**
+   * Set when a `tool` message reports a failure or a policy denial. Adapters
+   * must not infer this from the content prefix: gateway refusals such as
+   * "Security Policy Violation …" do not start with "Error:", and were being
+   * handed to the model as successful tool results (backlog G4).
+   */
+  is_error?: boolean;
 }
 
 export interface CustomModelCapabilities {
   supportsTools: boolean;
   supportedEfforts: readonly ReasoningEffort[];
+  /**
+   * BYOK endpoints must declare these, because a wrong guess in the unsafe
+   * direction (too large) ends the session with a provider 400. When absent, the
+   * conservative fallback in `@inflynx/config` applies.
+   */
+  contextWindow?: number;
+  maxOutputTokens?: number;
 }
 
 export interface ModelRequest {

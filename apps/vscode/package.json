@@ -319,11 +319,6 @@
           "default": "none",
           "description": "Reasoning effort level for supported models."
         },
-        "inflynx.autoApproveReadonly": {
-          "type": "boolean",
-          "default": true,
-          "description": "Automatically approve read-only tools without user confirmation."
-        },
         "inflynx.autoApproveAll": {
           "type": "boolean",
           "default": false,
@@ -364,8 +359,9 @@
   },
   "scripts": {
     "vscode:prepublish": "pnpm run build",
-    "build": "node esbuild.config.mjs",
+    "build": "pnpm run typecheck && node esbuild.config.mjs",
     "dev": "node esbuild.config.mjs --watch",
+    "dev:sync": "node esbuild.config.mjs --sync-installed",
     "test": "tsx tests/index.ts",
     "typecheck": "tsc --noEmit",
     "package": "vsce package --no-dependencies"

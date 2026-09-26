@@ -4,10 +4,22 @@ import fs from "node:fs";
 import os from "node:os";
 import type { InflynxService } from "./InflynxService.js";
 import type { ToolApprovalRequestPayload } from "./types.js";
+import { ApprovalRegistry } from "./approval-registry.js";
 
+/**
+ * Owns the approval decision path.
+ *
+ * Exactly one surface prompts per request, and exactly one call can settle it:
+ * previously the native notification *and* the webview dialog both fired for the
+ * same request, each could answer it, and both resolved against
+ * "the session the UI is showing" rather than the session that asked (backlog K9).
+ */
 export class ApprovalManager {
-  private alwaysApprovedSessions = new Set<string>();
-  private pendingApprovals = new Map<string, ToolApprovalRequestPayload>();
+  private readonly registry = new ApprovalRegistry();
+  private readonly alwaysApprovedSessions = new Set<string>();
+  private lastSessionId: string | null = null;
+  /** Registered by the chat webview when it is live; returns whether it displayed. */
+  private webviewPrompt: ((request: ToolApprovalRequestPayload) => boolean) | null = null;
 
   constructor(
     private readonly service: InflynxService,
@@ -22,86 +34,83 @@ export class ApprovalManager {
         console.error("[Inflynx ApprovalManager] Error handling approval request:", err);
       });
     });
+
+    // Unanswered approvals from a previous session must not be answerable later.
+    const onSessionChange = (next: string | null) => {
+      if (this.lastSessionId && this.lastSessionId !== next) {
+        this.registry.forgetSession(this.lastSessionId);
+      }
+      this.lastSessionId = next;
+    };
+    this.service.on("session.started", () => onSessionChange(this.service.getCurrentSessionId()));
+    this.service.on("session.hydrated", () => onSessionChange(this.service.getCurrentSessionId()));
+  }
+
+  setWebviewPrompt(prompt: ((request: ToolApprovalRequestPayload) => boolean) | null): void {
+    this.webviewPrompt = prompt;
   }
 
   async handleApprovalRequest(payload: ToolApprovalRequestPayload): Promise<void> {
-    const sessionId = this.service.getCurrentSessionId();
-    if (!sessionId) return;
-
-    // Check if auto-approve-all is configured or session is marked always-approved
-    const config = vscode.workspace.getConfiguration("inflynx");
-    const autoApproveAll = config.get<boolean>("autoApproveAll", false);
-
-    if (autoApproveAll || this.alwaysApprovedSessions.has(sessionId)) {
-      await this.service.approveToolCall(sessionId, payload.toolCallId, true);
+    const sessionId = payload.sessionId || this.service.getCurrentSessionId();
+    if (!sessionId) {
+      console.warn("[Inflynx ApprovalManager] approval event had no session; ignoring");
       return;
     }
 
-    this.pendingApprovals.set(payload.toolCallId, payload);
-
-    if (payload.toolName === "patch_file" || payload.toolName === "write_file") {
-      await this.handleFileEditApproval(sessionId, payload);
-    } else if (payload.toolName === "execute_shell") {
-      await this.handleShellApproval(sessionId, payload);
-    } else {
-      await this.handleGenericApproval(sessionId, payload);
+    const request: ToolApprovalRequestPayload = { ...payload, sessionId };
+    if (!this.registry.track(request)) {
+      console.warn(
+        `[Inflynx ApprovalManager] duplicate approval event for ${sessionId}/${request.toolCallId}; ignoring`
+      );
+      return;
     }
+
+    const config = vscode.workspace.getConfiguration("inflynx");
+    if (config.get<boolean>("autoApproveAll", false) || this.alwaysApprovedSessions.has(sessionId)) {
+      await this.answer({ sessionId, toolCallId: request.toolCallId, approved: true });
+      return;
+    }
+
+    // Prefer the chat webview; only fall back to a native notification when it is
+    // not on screen. Both prompting is what produced two buttons for one decision.
+    if (this.webviewPrompt?.(request)) return;
+
+    await this.promptNatively(request);
   }
 
-  private async handleFileEditApproval(sessionId: string, payload: ToolApprovalRequestPayload): Promise<void> {
-    const args = payload.args as Record<string, any>;
-    const targetFile = String(args.targetFile || args.path || args.file || "unknown_file");
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
-    const resolvedPath = path.isAbsolute(targetFile) ? targetFile : path.join(workspaceRoot, targetFile);
-
-    // If diff preview is desired, create temporary file with replacement content and open diff
-    let diffOpened = false;
-    if (payload.toolName === "patch_file" && args.replacementSnippet) {
-      try {
-        const originalContent = fs.existsSync(resolvedPath) ? fs.readFileSync(resolvedPath, "utf8") : "";
-        const targetSnippet = String(args.targetSnippet || "");
-        const replacementSnippet = String(args.replacementSnippet || "");
-        const patchedContent = originalContent.includes(targetSnippet)
-          ? originalContent.replace(targetSnippet, replacementSnippet)
-          : replacementSnippet;
-
-        const tmpFile = path.join(os.tmpdir(), `inflynx_preview_${path.basename(resolvedPath)}`);
-        fs.writeFileSync(tmpFile, patchedContent, "utf8");
-
-        const originalUri = vscode.Uri.file(resolvedPath);
-        const previewUri = vscode.Uri.file(tmpFile);
-
-        await vscode.commands.executeCommand("vscode.diff", originalUri, previewUri, `Inflynx Diff: ${path.basename(resolvedPath)} (Proposed Edit)`);
-        diffOpened = true;
-      } catch (err) {
-        console.warn("[Inflynx ApprovalManager] Could not open diff editor:", err);
-      }
+  /** The single place that settles a request and tells the server about it. */
+  async answer(input: { sessionId: string; toolCallId: string; approved: boolean }): Promise<boolean> {
+    const outcome = this.registry.resolve(input.sessionId, input.toolCallId, input.approved);
+    if (outcome.status === "already-settled") {
+      console.warn(
+        `[Inflynx ApprovalManager] ${input.sessionId}/${input.toolCallId} was already ` +
+        `answered (${outcome.approved ? "approved" : "denied"}); the second answer was ignored.`
+      );
+      return false;
     }
-
-    const choice = await vscode.window.showInformationMessage(
-      `Inflynx AI requests approval to modify: ${path.basename(resolvedPath)} (${payload.toolName})`,
-      { modal: false },
-      "Approve",
-      "Deny",
-      "Always Approve for Session"
-    );
-
-    const approved = choice === "Approve" || choice === "Always Approve for Session";
-    if (choice === "Always Approve for Session") {
-      this.alwaysApprovedSessions.add(sessionId);
+    if (outcome.status === "unknown-request") {
+      console.warn(
+        `[Inflynx ApprovalManager] no pending approval ${input.sessionId}/${input.toolCallId}; ` +
+        "it may belong to a different session or already timed out."
+      );
+      return false;
     }
-
-    this.pendingApprovals.delete(payload.toolCallId);
-    await this.service.approveToolCall(sessionId, payload.toolCallId, approved);
+    return await this.service.approveToolCall(input.sessionId, input.toolCallId, input.approved);
   }
 
-  private async handleShellApproval(sessionId: string, payload: ToolApprovalRequestPayload): Promise<void> {
-    const args = payload.args as Record<string, any>;
-    const command = String(args.command || "");
+  private async promptNatively(request: ToolApprovalRequestPayload): Promise<void> {
+    const args = request.args as Record<string, any>;
 
+    if (request.toolName === "patch_file" || request.toolName === "write_file") {
+      this.openDiffPreview(request, args);
+    }
+
+    const command =
+      request.toolName === "execute_shell" ? `\n\n$ ${String(args.command || "")}` : "";
     const choice = await vscode.window.showWarningMessage(
-      `Inflynx AI requests permission to execute terminal command:\n\n${command}`,
-      { modal: true },
+      `Inflynx requests permission to run ${request.toolName} on session ` +
+      `${request.sessionId.slice(-8)}${command}`,
+      { modal: request.permissionLevel === "shell" },
       "Approve",
       "Deny",
       "Always Approve for Session"
@@ -109,39 +118,61 @@ export class ApprovalManager {
 
     const approved = choice === "Approve" || choice === "Always Approve for Session";
     if (choice === "Always Approve for Session") {
-      this.alwaysApprovedSessions.add(sessionId);
+      this.alwaysApprovedSessions.add(request.sessionId);
     }
-
-    this.pendingApprovals.delete(payload.toolCallId);
-    await this.service.approveToolCall(sessionId, payload.toolCallId, approved);
+    await this.answer({
+      sessionId: request.sessionId,
+      toolCallId: request.toolCallId,
+      approved,
+    });
   }
 
-  private async handleGenericApproval(sessionId: string, payload: ToolApprovalRequestPayload): Promise<void> {
-    const choice = await vscode.window.showInformationMessage(
-      `Inflynx AI requests permission to execute tool: ${payload.toolName}`,
-      "Approve",
-      "Deny"
-    );
+  /**
+   * Uses the tool's real argument names. This previously read
+   * `targetSnippet`/`replacementSnippet`, which `patch_file` never sends (it takes
+   * `target_code`/`replacement_code`), so the preview silently never appeared and
+   * users approved blind edits (backlog K6).
+   */
+  private openDiffPreview(request: ToolApprovalRequestPayload, args: Record<string, any>): void {
+    try {
+      const targetFile = String(args.path || args.targetFile || "");
+      if (!targetFile) return;
 
-    const approved = choice === "Approve";
-    this.pendingApprovals.delete(payload.toolCallId);
-    await this.service.approveToolCall(sessionId, payload.toolCallId, approved);
-  }
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+      const resolvedPath = path.isAbsolute(targetFile) ? targetFile : path.join(workspaceRoot, targetFile);
+      const original = fs.existsSync(resolvedPath) ? fs.readFileSync(resolvedPath, "utf8") : "";
 
-  async resolveApprovalFromWebview(toolCallId: string, approved: boolean): Promise<boolean> {
-    const sessionId = this.service.getCurrentSessionId();
-    if (!sessionId) return false;
+      let preview = "";
+      if (request.toolName === "patch_file") {
+        const target = String(args.target_code || "");
+        const replacement = String(args.replacement_code || "");
+        preview = target && original.includes(target)
+          ? original.replace(target, replacement)
+          : `${original}\n\n— — — proposed replacement — — —\n${replacement}\n`;
+      } else {
+        preview = String(args.content ?? "");
+      }
 
-    this.pendingApprovals.delete(toolCallId);
-    return await this.service.approveToolCall(sessionId, toolCallId, approved);
+      const tmpFile = path.join(os.tmpdir(), `inflynx_preview_${path.basename(resolvedPath)}`);
+      fs.writeFileSync(tmpFile, preview, "utf8");
+      void vscode.commands.executeCommand(
+        "vscode.diff",
+        vscode.Uri.file(resolvedPath),
+        vscode.Uri.file(tmpFile),
+        `Inflynx: ${path.basename(resolvedPath)} (proposed edit)`
+      );
+    } catch (err) {
+      console.warn("[Inflynx ApprovalManager] Could not open diff editor:", err);
+    }
   }
 
   clearSessionState(sessionId?: string): void {
     if (sessionId) {
       this.alwaysApprovedSessions.delete(sessionId);
+      this.registry.forgetSession(sessionId);
     } else {
       this.alwaysApprovedSessions.clear();
+      this.registry.clear();
     }
-    this.pendingApprovals.clear();
   }
 }

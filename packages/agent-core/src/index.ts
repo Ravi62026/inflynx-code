@@ -71,22 +71,33 @@ export const MODE_CONFIGS: Record<AgentMode, ModeConfig> = {
  * Returns only the tools allowed for the given mode.
  */
 export function filterToolsForMode(
-  tools: Array<{ name: string; permissionLevel: string; isMutating?: boolean }>,
+  tools: Array<{ name: string; permissionLevel: string; isMutating?: boolean; origin?: string }>,
   mode: AgentMode
-): Array<{ name: string; permissionLevel: string; isMutating?: boolean }> {
+): Array<{ name: string; permissionLevel: string; isMutating?: boolean; origin?: string }> {
   const config = MODE_CONFIGS[mode];
 
   return tools.filter((tool) => {
     // Shell tools blocked in ask and plan modes
     if (tool.permissionLevel === "shell" && !config.allowShell) return false;
 
+    // External tools (MCP servers, plugins) are not offered in ask/plan at all.
+    // `ask` promises "read-only, nothing happens" and `plan` promises "only
+    // .inflynx/PLAN.md changes" — a third-party process breaks both however harmless
+    // its self-declared `readOnlyHint` is, since that hint comes from the very party
+    // being trusted (backlog B9). Gated on `allowMutating`, i.e. only the modes that
+    // genuinely mean "go and do things".
+    const external = tool.origin === "mcp" || tool.origin === "plugin";
+    if (external && !config.allowMutating) return false;
+
     // Mutating tools blocked in ask mode entirely
     if (tool.isMutating && !config.allowMutating && !config.allowPlanWrite) return false;
 
-    // In plan mode, write_file is allowed but only for plan files
-    // The tool itself handles the path restriction via the system prompt
+    // In plan mode the model still needs `write_file`, because producing
+    // .inflynx/PLAN.md is the entire purpose of the mode. The restriction to
+    // `.inflynx/**` is enforced by `ToolExecutionGateway` (backlog B8), NOT by an
+    // instruction in the system prompt — model instructions are not security
+    // boundaries, as this project's own maturity plan puts it.
     if (tool.isMutating && config.allowPlanWrite && !config.allowMutating) {
-      // Allow write_file in plan mode (system prompt restricts it to .inflynx/PLAN.md)
       if (tool.name === "write_file") return true;
       return false; // Block patch_file, execute_shell, etc.
     }
@@ -95,33 +106,14 @@ export function filterToolsForMode(
   });
 }
 
-export type AgentState =
-  | "idle"
-  | "planning"
-  | "exploring"
-  | "implementing"
-  | "verifying"
-  | "debugging"
-  | "reviewing"
-  | "completed"
-  | "waiting_for_approval"
-  | "cancelled"
-  | "failed";
-
-export interface TaskStep {
-  id: number;
-  description: string;
-  status: "pending" | "in_progress" | "completed" | "failed";
-  targetFile?: string;
-  verificationCmd?: string;
-}
-
-export interface TaskPlan {
-  taskId: string;
-  goal: string;
-  status: AgentState;
-  steps: TaskStep[];
-}
+/**
+ * `AgentState` has exactly one definition — the one the StateMachine enforces
+ * (see `orchestrator/StateMachine.ts`). This file used to declare a second,
+ * different `AgentState` union alongside it, so `TurnResult.state` and the type
+ * exported from the barrel disagreed (backlog C8). The dead `TaskPlan`/`TaskStep`
+ * interfaces that consumed the duplicate are removed with it; `PlanEngine`'s
+ * `ActivePlan`/`PlanStep` are the real, used types.
+ */
 
 
 export function computeRelevanceScore(
@@ -134,8 +126,13 @@ export function computeRelevanceScore(
 }
 
 // ─── Shared Orchestrator & State Machine ──────────────────────────────────────
-export { AgentOrchestrator, type TurnResult } from "./orchestrator/AgentOrchestrator.js";
-export { StateMachine, LEGAL_STATE_TRANSITIONS } from "./orchestrator/StateMachine.js";
+export {
+  AgentOrchestrator,
+  type TurnResult,
+  type VerificationReport,
+  type VerificationOutcome,
+} from "./orchestrator/AgentOrchestrator.js";
+export { StateMachine, LEGAL_STATE_TRANSITIONS, type AgentState } from "./orchestrator/StateMachine.js";
 export {
   BudgetManager,
   DEFAULT_EFFORT_PROFILES,
@@ -144,14 +141,22 @@ export {
   type EffortProfile,
   type BudgetState,
 } from "./orchestrator/BudgetManager.js";
-export { ExecutionContext, type ExecutionOptions } from "./orchestrator/ExecutionContext.js";
+export {
+  ExecutionContext,
+  type ExecutionOptions,
+  type ContextStrategy,
+  type CompactionPlan,
+} from "./orchestrator/ExecutionContext.js";
 export { ApprovalProvider, type ToolApprovalRequest, type ApprovalHandler } from "./orchestrator/ApprovalProvider.js";
 
-// ─── Planning Engine & Context Manager ────────────────────────────────────────
+// ─── Planning Engine ─────────────────────────────────────────────────────────
 export { PlanEngine } from "./planning/PlanEngine.js";
 export type { ActivePlan, PlanStep, PlanStatus } from "./planning/PlanEngine.js";
 export { TaskClassifier, type TaskCategory, type TaskClassificationResult } from "./planning/TaskClassifier.js";
-export { ContextManager, type ContextItem } from "./context/ContextManager.js";
+// NOTE: `ContextManager`/`ContextItem` were retired here (backlog Phase 15). It kept a
+// separate `ContextItem[]` bag that nothing in the agent ever fed, while real window
+// management lives in `ExecutionContext` (eviction + compaction) and `BudgetManager`
+// (occupancy). Two competing "context managers" was the bug, not the design.
 export { StructuredPlanEngine, type StructuredStepSpec, type StructuredPlanSpec } from "./planning/StructuredPlan.js";
 
 // ─── Debug & Review Engine ───────────────────────────────────────────────────
@@ -160,7 +165,16 @@ export type { DebugReportSummary } from "./debug/DebugEngine.js";
 export { FindingEngine, type BugFinding, type FindingSeverity, type FindingCategory, type FindingEvidence } from "./debug/FindingEngine.js";
 
 // ─── Verification Engine & Failure Repair Loop ────────────────────────────────
-export { VerificationEngine, type VerificationCheck, type VerificationResult, type SuiteSummary } from "./verification/VerificationEngine.js";
+export {
+  VerificationEngine,
+  resolvePackageManager,
+  type VerificationCheck,
+  type VerificationResult,
+  type VerificationDepth,
+  type VerificationEngineOptions,
+  type PackageManagerResolution,
+  type SuiteSummary,
+} from "./verification/VerificationEngine.js";
 export { FailureParser, type DiagnosticError } from "./verification/FailureParser.js";
 export { RepairLoop, type RepairSafetyCheckResult } from "./verification/RepairLoop.js";
 

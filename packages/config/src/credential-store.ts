@@ -27,11 +27,15 @@ export interface CredentialProfile {
   allowLocalEndpoint?: boolean;
   /**
    * Custom endpoints start with no assumed capabilities. An advanced user may
-   * explicitly declare the endpoint's supported tool/reasoning surface.
+   * explicitly declare the endpoint's supported tool/reasoning surface. The two
+   * window fields matter: without them the conservative fallback is used, which is
+   * safe but wastes context the endpoint may actually have.
    */
   customCapabilities?: {
     supportsTools: boolean;
     supportedEfforts: ReasoningEffort[];
+    contextWindow?: number;
+    maxOutputTokens?: number;
   };
   /** An env-var-backed profile never writes a secret to the keychain. */
   credentialSource: "keychain" | "environment";

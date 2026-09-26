@@ -4,8 +4,8 @@ import { DiffPreview } from "./DiffPreview.js";
 
 interface ApprovalDialogProps {
   request: ToolApprovalRequestPayload;
-  onApprove: (toolCallId: string) => void;
-  onDeny: (toolCallId: string) => void;
+  onApprove: () => void;
+  onDeny: () => void;
 }
 
 export const ApprovalDialog: React.FC<ApprovalDialogProps> = ({ request, onApprove, onDeny }) => {
@@ -29,18 +29,20 @@ export const ApprovalDialog: React.FC<ApprovalDialogProps> = ({ request, onAppro
       {isFileEdit && (
         <div style={{ margin: "6px 0" }}>
           <DiffPreview
-            targetSnippet={String(args.targetSnippet || "")}
-            replacementSnippet={String(args.replacementSnippet || args.content || "")}
-            filePath={String(args.targetFile || args.path || "")}
+            // `patch_file` sends target_code/replacement_code and `write_file` sends
+            // path/content. The old names meant this preview was always empty.
+            targetSnippet={String(args.target_code || "")}
+            replacementSnippet={String(args.replacement_code ?? args.content ?? "")}
+            filePath={String(args.path || args.targetFile || "")}
           />
         </div>
       )}
 
       <div className="approval-actions">
-        <button className="approve-btn" onClick={() => onApprove(request.toolCallId)}>
+        <button className="approve-btn" onClick={() => onApprove()}>
           ✓ Approve
         </button>
-        <button className="deny-btn" onClick={() => onDeny(request.toolCallId)}>
+        <button className="deny-btn" onClick={() => onDeny()}>
           ✕ Deny
         </button>
       </div>
