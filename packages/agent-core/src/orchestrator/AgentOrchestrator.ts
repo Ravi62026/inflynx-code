@@ -1,5 +1,5 @@
 import path from "node:path";
-import { AgentEventBus, type PublicAgentEvent } from "@inflynx/protocol";
+import { AgentEventBus, type PublicAgentEvent, type BudgetSnapshot } from "@inflynx/protocol";
 import { streamModel, toProviderError, type FinishReason, type Message, type ModelEvent, type ReasoningEffort, type TokenUsage } from "@inflynx/model-gateway";
 import {
   assertSupportedReasoningEffort,
@@ -11,6 +11,7 @@ import {
 } from "@inflynx/config";
 import { ToolRegistry, safeParseJsonArgs, reviewMutatingPatchForSafety, classifyGitInvocation, type ToolCall, type ToolResult } from "@inflynx/tool-runtime";
 import { ToolExecutionGateway } from "@inflynx/tool-runtime";
+import { waitOutRateLimit } from "@inflynx/cache";
 import type { PatchSafetyReview, PatchSafetyViolation } from "@inflynx/patch-engine";
 import { reviewShellCommand, type CanonicalPathGuard } from "@inflynx/policy-engine";
 import { createSessionStore, generateSessionId, type SessionStore } from "@inflynx/session-store";
@@ -182,6 +183,8 @@ export class AgentOrchestrator {
     this.budgetManager = new BudgetManager(budgetLevel, this.context.sessionId, this.eventBus);
     this.registry = registry;
     this.gateway = new ToolExecutionGateway(this.context.workspaceRoot);
+    // Phase 19: let the `delegate` tool run a nested sub-agent bound to *this* session's context.
+    this.gateway.setSubAgentRunner((task: string) => this.runSubAgent(task));
     this.approvalProvider = new ApprovalProvider(approvalHandler);
     this.approvalHandler = approvalHandler;
     this.sessionStore = sessionStore || createSessionStore(this.context.workspaceRoot);
@@ -261,6 +264,27 @@ export class AgentOrchestrator {
   get budget(): BudgetState {
     // History is passed in so the context numbers describe the *current* window.
     return this.budgetManager.getBudgetState(this.context.history);
+  }
+
+  /**
+   * Phase 47 (K3): the normalized budget payload for the wire. The raw `BudgetState` has no maxima,
+   * which is what made the extension status bar render `undefined/undefined` and the context meter
+   * compute `NaN%`. This pairs each used-count with its effort-profile maximum.
+   */
+  get budgetSnapshot(): BudgetSnapshot {
+    const s = this.budgetManager.getBudgetState(this.context.history);
+    const p = this.budgetManager.getEffortProfile();
+    return {
+      level: s.level,
+      turnsUsed: s.modelTurns,
+      maxTurns: p.maxModelTurns,
+      toolCallsUsed: s.toolCalls,
+      maxToolCalls: p.maxToolCalls,
+      tokensUsed: s.promptTokens + s.completionTokens,
+      maxTokens: s.contextWindow || 0,
+      contextUtilizationPercent: s.contextUtilizationPercent,
+      exhausted: this.budgetManager.checkLimits().isExhausted,
+    };
   }
 
   /** The execution mode currently in force. Needed to compare before changing it. */
@@ -604,13 +628,18 @@ export class AgentOrchestrator {
 
       const modelRateLimit = await this.budgetManager.checkModelRateLimit();
       if (!modelRateLimit.allowed) {
-        const reason =
-          `Model rate limit reached (${modelRateLimit.limit} calls/60s). ` +
-          `Retry in ${modelRateLimit.resetInSec}s.`;
-        this.eventBus.emit("session.failed", this.context.sessionId, { reason });
-        this.transitionTo("failed", reason);
-        void this.sessionStore.updateSessionStatus?.(this.context.sessionId, "failed").catch(() => {});
-        break;
+        // H6 (Phase 42): a model rate limit is a *pause*, not a failure. The old code threw
+        // `session.failed` on a 60s window — one busy minute killed the whole session. Wait out
+        // the window (bounded budget + jitter), then only fail if it is still blocked or Redis
+        // fail-closed. `waitOutRateLimit` re-checks the same limiter.
+        const final = await waitOutRateLimit(() => this.budgetManager.checkModelRateLimit(), { signal });
+        if (!final.allowed) {
+          const reason = `Model rate limit still reached after waiting (${final.limit} calls/60s).`;
+          this.eventBus.emit("session.failed", this.context.sessionId, { reason });
+          this.transitionTo("failed", reason);
+          void this.sessionStore.updateSessionStatus?.(this.context.sessionId, "failed").catch(() => {});
+          break;
+        }
       }
 
       // Stay inside the model's window *before* spending a turn on a request that
@@ -1138,6 +1167,55 @@ export class AgentOrchestrator {
         `). Discard any earlier assumption about those paths and re-read them if needed.`,
     });
     return { turnId: outcome.turnId, restored: outcome.restored, conflicts: outcome.conflicts };
+  }
+
+  /**
+   * Phase 19 — sub-agent context isolation.
+   *
+   * Runs a nested, budget-limited orchestrator that explores with its OWN session/history and a
+   * read-only tool subset, then returns a distilled summary capped at `SUBAGENT_SUMMARY_LIMIT`
+   * bytes. This is how a "find all call sites of X" task costs the parent *one* result instead of
+   * 40 reads polluting the main window: the exploration happens in the child's context and only the
+   * conclusion comes back. The child cannot mutate or run the shell, and cannot itself `delegate`
+   * (no recursive fan-out). `.start` is used so the child's session row exists before any turn.
+   */
+  static readonly SUBAGENT_SUMMARY_LIMIT = 2048;
+
+  async runSubAgent(task: string): Promise<string> {
+    const readOnlyTools = this.registry.list().filter(
+      (t) => !t.isMutating && t.permissionLevel !== "shell" && t.name !== "delegate"
+    );
+    if (readOnlyTools.length === 0) {
+      return "(sub-agent unavailable: no read-only tools in the registry)";
+    }
+    const childRegistry = new ToolRegistry(readOnlyTools);
+    const child = await AgentOrchestrator.start(
+      {
+        workspaceRoot: this.context.workspaceRoot,
+        providerId: this.context.providerId,
+        model: this.context.model,
+        apiKey: this.context.apiKey,
+        credentialProfileId: this.context.credentialProfileId,
+        baseURL: this.context.baseURL,
+        modelAdapter: this.context.modelAdapter,
+        reasoningEffort: this.context.reasoningEffort,
+        activeMode: "agent",
+        allowUnauthenticated: this.context.allowUnauthenticated,
+        allowLocalEndpoint: this.context.allowLocalEndpoint,
+        customCapabilities: this.context.customCapabilities,
+        maxTokens: this.context.maxTokens,
+      },
+      childRegistry,
+      new AgentEventBus(),
+      undefined,
+      "low", // tight budget: a bounded explorer, not another full session
+      this.sessionStore
+    );
+    const result = await child.runTurn(task);
+    const summary = (result.finalText || "").trim();
+    const limit = AgentOrchestrator.SUBAGENT_SUMMARY_LIMIT;
+    if (summary.length <= limit) return summary;
+    return summary.slice(0, limit - 1).trimEnd() + "\u2026";
   }
 
   /**

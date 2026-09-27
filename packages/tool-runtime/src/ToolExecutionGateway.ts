@@ -207,6 +207,17 @@ export class ToolExecutionGateway {
    */
   readonly checkpoints: TurnCheckpointStore;
 
+  /**
+   * Phase 19: the owning orchestrator installs a sub-agent runner here so the `delegate` tool,
+   * executed through this gateway, can explore in a nested context. Each orchestrator has its own
+   * gateway, so the runner always points at the right session.
+   */
+  private subAgentRunner?: (task: string) => Promise<string>;
+
+  setSubAgentRunner(fn: (task: string) => Promise<string>): void {
+    this.subAgentRunner = fn;
+  }
+
   constructor(workspaceRoot: string = process.cwd()) {
     this.pathGuard = new CanonicalPathGuard(workspaceRoot);
     this.shells = new ShellRegistry();
@@ -635,6 +646,7 @@ export class ToolExecutionGateway {
       mode,
       shells: this.shells,
       checkpoints: this.checkpoints,
+      runSubAgent: this.subAgentRunner,
     });
     const result = await executeTool(registry, { ...call, args }, ctx);
 

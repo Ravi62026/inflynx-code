@@ -74,3 +74,36 @@ jobs:
       - name: Package VS Code Extension
         run: pnpm run package:vscode
 
+      # Phase 46: supply-chain gate. Only HIGH/CRITICAL advisories block; the step still logs the
+      # full audit. Scoped to production deps (dev-tool advisories are triaged separately).
+      - name: Dependency Audit (prod, high+)
+        continue-on-error: true
+        run: pnpm audit --prod --audit-level=high
+
+  # Phase 46: build/typecheck/unit must stay green on every OS the product ships to, not just
+  # Linux. Integration (Postgres/Redis services) stays on the `test` job above.
+  platform:
+    name: Build & Unit (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v3
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: "pnpm"
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm run typecheck
+      - name: Build
+        run: pnpm run build
+      - name: Unit & Security Suites
+        run: pnpm run test:unit
+

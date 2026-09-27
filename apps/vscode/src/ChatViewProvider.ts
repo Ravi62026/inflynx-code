@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import path from "node:path";
 import fs from "node:fs";
+import { applyParsedPatch } from "@inflynx/patch-engine";
 import type { InflynxService } from "./InflynxService.js";
 import type { ApprovalManager } from "./ApprovalManager.js";
 import type { FromWebviewMessage, ToWebviewMessage } from "./types.js";
@@ -287,12 +288,53 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           ? message.payload.filePath
           : path.join(workspaceRoot, message.payload.filePath);
 
-        if (fs.existsSync(fullPath)) {
-          const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(fullPath));
+        // B12 (Phase 47): the path comes from *assistant-authored* markdown, so it is untrusted.
+        // Canonicalize and refuse anything that resolves outside the workspace — previously any
+        // absolute path named in a response (e.g. ~/.ssh/id_rsa) opened straight into the editor.
+        const resolved = path.resolve(fullPath);
+        const root = path.resolve(workspaceRoot);
+        if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+          vscode.window.showWarningMessage("Refused to open a file outside the workspace.");
+          break;
+        }
+
+        if (fs.existsSync(resolved)) {
+          const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(resolved));
           const line = Math.max(0, (message.payload.line || 1) - 1);
           await vscode.window.showTextDocument(doc, {
             selection: new vscode.Range(line, 0, line, 0),
           });
+        }
+        break;
+      }
+
+      // K10 (Phase 47): `apply.patch` was declared in the protocol with no handler, so the webview's
+      // "Apply" affordance silently did nothing. Applies the patch through the same workspace guard as
+      // open.file; the extension host has no orchestrator, so this writes the file directly and the
+      // agent's own checkpoint/`/undo` still owns rollback.
+      case "apply.patch": {
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+        const resolved = path.resolve(
+          path.isAbsolute(message.payload.filePath)
+            ? message.payload.filePath
+            : path.join(workspaceRoot, message.payload.filePath)
+        );
+        const root = path.resolve(workspaceRoot);
+        if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+          vscode.window.showWarningMessage("Refused to apply a patch outside the workspace.");
+          break;
+        }
+        try {
+          const original = fs.existsSync(resolved) ? fs.readFileSync(resolved, "utf8") : "";
+          // applyParsedPatch throws on a context mismatch / unparseable patch — caught below.
+          const updated = applyParsedPatch(original, message.payload.patch);
+          fs.mkdirSync(path.dirname(resolved), { recursive: true });
+          fs.writeFileSync(resolved, updated, "utf8");
+          const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(resolved));
+          await vscode.window.showTextDocument(doc);
+          vscode.window.showInformationMessage(`Applied patch to ${path.relative(root, resolved)}.`);
+        } catch (err: any) {
+          vscode.window.showErrorMessage(`Failed to apply patch: ${err?.message || err}`);
         }
         break;
       }
@@ -359,7 +401,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} https: data:; script-src 'nonce-${nonce}'; style-src ${webview.cspSource} 'unsafe-inline'; font-src ${webview.cspSource};">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data:; script-src 'nonce-${nonce}'; style-src ${webview.cspSource} 'unsafe-inline'; font-src ${webview.cspSource};">
   <link rel="stylesheet" href="${cssUri}">
   <title>Inflynx Code</title>
 </head>

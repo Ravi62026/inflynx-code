@@ -62,6 +62,10 @@ const unitTestFiles = [
   "tests/unit/phase41-single-source.test.ts",
   "tests/unit/phase37-usage-cost.test.ts",
   "tests/tool-contracts/tool-contract.test.ts",  // Phase 38: schema + argument-validation drift guard for every tool
+  "tests/unit/phase42-rate-limit.test.ts",  // Phase 42: atomic window, fail-open/closed, wait-out-not-fail
+  "tests/unit/phase19-subagent.test.ts",  // Phase 19: nested read-only sub-agent, context isolation
+  "tests/unit/phase44-skills.test.ts",  // Phase 44: real SKILL.md frontmatter parser (I5)
+  "tests/unit/phase47-parity.test.ts",  // Phase 47: normalized wire BudgetSnapshot (K3) + shared protocol types
   "tests/unit/session-store.test.ts",
   "tests/unit/session-recovery.test.ts",
   "tests/unit/gateway-bypass.test.ts",
@@ -76,6 +80,8 @@ const unitTestFiles = [
 const integrationTestFiles = [
   "tests/unit/postgres-store.test.ts",
   "tests/integration/concurrency-postgres.test.ts",
+  "tests/integration/phase41-single-source-pg.test.ts",   // Phase 41: per-session pinning / no-fork on real Postgres
+  "tests/integration/phase42-redis-ratelimit.test.ts",    // Phase 42: atomic INCR+EXPIRE window on real Redis
   "tests/e2e/live-e2e-demo.test.ts",
 ];
 

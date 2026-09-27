@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import fs from "node:fs";
 import path from "node:path";
-import { parsePlanMarkdown } from "@inflynx/protocol";
+import { parsePlanMarkdown, deserializePlan, PLAN_SIDECAR_RELATIVE_PATH } from "@inflynx/protocol";
 import type { InflynxService } from "../InflynxService.js";
 
 export interface PlanStep {
@@ -90,17 +90,22 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem> {
     }
 
     const planPath = path.join(workspaceRoot, ".inflynx", "PLAN.md");
-    if (!fs.existsSync(planPath)) {
-      this.steps = [];
-      return;
-    }
+    const sidecarPath = path.join(workspaceRoot, PLAN_SIDECAR_RELATIVE_PATH);
 
     try {
-      const content = fs.readFileSync(planPath, "utf8");
-      // Through the shared parser. This file had its own regex, and it was the one place
-      // that mapped `[ ]`/`[x]` plus `-`→in progress; `/` (in progress) fell through to
-      // pending, so the sidebar showed the current step as not started.
-      const { plan } = parsePlanMarkdown(content);
+      // K8 (Phase 47): prefer the machine-readable JSON sidecar; fall back to the human markdown.
+      // Either way the STRUCTURE is produced by the single shared parser, so the sidebar and the
+      // CLI can never disagree about which glyph means "in progress" again.
+      let plan = fs.existsSync(sidecarPath)
+        ? deserializePlan(fs.readFileSync(sidecarPath, "utf8"))
+        : null;
+      if (!plan && fs.existsSync(planPath)) {
+        plan = parsePlanMarkdown(fs.readFileSync(planPath, "utf8")).plan;
+      }
+      if (!plan) {
+        this.steps = [];
+        return;
+      }
       this.steps = (plan?.steps ?? []).map((s) => ({
         id: `step_${s.id}`,
         title: `${s.title || s.description}`,

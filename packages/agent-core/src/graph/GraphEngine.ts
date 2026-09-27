@@ -28,15 +28,9 @@ export class GraphEngine {
     fs.writeFileSync(svgPath, result.svgContent, "utf-8");
     fs.writeFileSync(htmlPath, result.htmlContent, "utf-8");
 
-    // Optional async fetch to save PNG image from mermaid.ink
-    const pngPath = path.join(this.inflynxDir, "graph.png");
-    try {
-      const res = await fetch(result.imageUrl);
-      if (res.ok) {
-        const arrayBuf = await res.arrayBuffer();
-        fs.writeFileSync(pngPath, Buffer.from(arrayBuf));
-      }
-    } catch { /* graceful fallback */ }
+    // B15 (Phase 47): removed the "fetch mermaid.ink to render a PNG" step. It sent the base64 of the
+    // entire repo module/dependency graph to a third party. The local `graph.svg` above is the vector
+    // rendering; no PNG-via-remote-service and no network call here.
 
     return {
       graphMdPath,

@@ -312,14 +312,19 @@ export class BudgetManager {
   }
 
   /**
-   * Applies a Redis-backed per-session model-call bucket. Redis is optional
-   * and `checkRateLimit()` fails open when it is not configured or unavailable.
+   * Applies a Redis-backed per-session model-call bucket. Redis is optional.
+   *
+   * H5 (Phase 42): the server sets `INFLYNX_RATE_LIMIT_FAIL_CLOSED=1` so a configured-but-broken
+   * Redis *denies* rather than silently allowing everything (the limiter is a control there). The
+   * CLI leaves it unset → fail-open, so a missing Redis never wedges a single-user session.
    */
   async checkModelRateLimit(): Promise<RateLimitResult> {
+    const failClosed = /^(1|true|yes)$/i.test(process.env.INFLYNX_RATE_LIMIT_FAIL_CLOSED || "");
     return checkRateLimit(
       `model:${this.sessionId}`,
       this.profile.maxModelTurns,
-      60
+      60,
+      { failClosed }
     );
   }
 

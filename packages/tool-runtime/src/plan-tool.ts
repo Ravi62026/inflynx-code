@@ -22,6 +22,8 @@ import {
   parsePlanMarkdown,
   planProgress,
   renderPlanMarkdown,
+  serializePlan,
+  PLAN_SIDECAR_RELATIVE_PATH,
   PLAN_STEP_STATES,
   type PlanSpec,
   type PlanStep,
@@ -345,6 +347,9 @@ export const UPDATE_PLAN_TOOL: ToolDefinition = {
     try {
       fs.mkdirSync(path.dirname(planPath), { recursive: true });
       fs.writeFileSync(planPath, markdown, "utf-8");
+      // K8 (Phase 47): also write the machine-readable JSON sidecar next to the markdown, so the
+      // sidebar tree and the CLI read a structure instead of each re-inventing a glyph parser.
+      fs.writeFileSync(path.join(ctx.workspaceRoot, PLAN_SIDECAR_RELATIVE_PATH), serializePlan(built.plan), "utf-8");
     } catch (err: any) {
       return {
         output: `Error: the plan validated but could not be written to ${PLAN_RELATIVE_PATH}: ${err?.message || err}`,

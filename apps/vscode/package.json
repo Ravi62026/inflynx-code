@@ -368,6 +368,8 @@
   },
   "devDependencies": {
     "@inflynx/protocol": "workspace:*",
+    "@inflynx/patch-engine": "workspace:*",
+    "dompurify": "^3.2.4",
     "@types/node": "^25.5.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",

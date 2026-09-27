@@ -65,7 +65,13 @@ export async function refreshModelCatalog(
   }
 
   const headers: Record<string, string> = {};
-  if (apiKey && providerId !== "google") headers.Authorization = `Bearer ${apiKey}`;
+  if (apiKey) {
+    // B14 (Phase 47): Google authenticates with the `x-goog-api-key` header, NOT a `?key=` query
+    // string — a URL with the key embedded lands in proxy logs, error text and history. All other
+    // providers use a bearer token.
+    if (providerId === "google") headers["x-goog-api-key"] = apiKey;
+    else headers.Authorization = `Bearer ${apiKey}`;
+  }
   const response = await fetcher(endpoint, { headers, redirect: "error" });
   if (!response.ok) {
     throw new Error(`${providerId} model catalog request failed with HTTP ${response.status}.`);
@@ -107,8 +113,10 @@ function discoveryEndpoint(providerId: ProviderId, apiKey?: string): string | un
     case "openai":
       return "https://api.openai.com/v1/models";
     case "google":
+      // No key in the URL (B14); it is sent as the `x-goog-api-key` header above. Still require a
+      // key, since Google's model list is authenticated.
       return apiKey
-        ? `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`
+        ? "https://generativelanguage.googleapis.com/v1beta/models"
         : undefined;
     case "deepseek":
       return "https://api.deepseek.com/models";

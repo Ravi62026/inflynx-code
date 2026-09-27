@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from "react";
-import { marked } from "marked";
+import { renderMarkdown } from "../markdown.js";
 import type { ToolCallState } from "./ToolCallCard.js";
 
 interface ThinkingIndicatorProps {
@@ -40,7 +40,7 @@ export const ThinkingIndicator: React.FC<ThinkingIndicatorProps> = ({
   const renderedHtml = useMemo(() => {
     if (!thought) return "";
     try {
-      return marked.parse(thought) as string;
+      return renderMarkdown(thought);
     } catch {
       return thought;
     }

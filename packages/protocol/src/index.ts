@@ -5,6 +5,7 @@
 
 export * from "./plan.js";
 export * from "./untrusted.js";
+export * from "./wire.js";
 
 export type AgentEventType =
   | "session.started"

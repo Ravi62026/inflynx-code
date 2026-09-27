@@ -137,6 +137,12 @@ export interface ToolExecutionContext {
    * `/verify`) simply does not checkpoint, and nothing about tool behaviour changes.
    */
   checkpoints?: TurnCheckpointStore;
+  /**
+   * Phase 19: the owning session's sub-agent runner. Present only when the orchestrator supplied
+   * one; the `delegate` tool calls it to explore in a nested, budget-limited context and get a
+   * distilled summary back. Optional so tests/plugins/embedded contexts simply have no delegation.
+   */
+  runSubAgent?: (task: string) => Promise<string>;
 }
 
 /**
@@ -211,6 +217,7 @@ export function createToolExecutionContextFromGuard(
     mode?: ToolExecutionMode;
     shells?: ShellRegistry;
     checkpoints?: TurnCheckpointStore;
+    runSubAgent?: (task: string) => Promise<string>;
   } = {}
 ): ToolExecutionContext {
   return {
@@ -222,6 +229,7 @@ export function createToolExecutionContextFromGuard(
     mode: options.mode,
     shells: options.shells ?? new ShellRegistry(),
     checkpoints: options.checkpoints,
+    runSubAgent: options.runSubAgent,
   };
 }
 
@@ -1471,6 +1479,41 @@ export const CORE_TOOLS: ToolDefinition[] = [
         `✓ Stopped ${shellId} — ${existing.command}\n` +
         `  its process group was signalled; allow a moment for the port to be released.`
       );
+    },
+  },
+
+  {
+    // Phase 19: sub-agent delegation. Runs a nested, budget-limited, read-only exploration in its
+    // own context and returns a distilled summary, so "find all call sites of X" costs the parent
+    // one result instead of dozens of reads in the main window. The runner is supplied by the
+    // owning orchestrator via the execution context — the tool itself is stateless and shared-safe.
+    name: "delegate",
+    description:
+      "Delegate a self-contained exploration/research sub-task to a bounded sub-agent that reads " +
+      "files in its own context and returns a short distilled summary (≤ 2 KB). Use it for " +
+      "'find all call sites of X', 'summarize how this module works', or any investigation whose " +
+      "intermediate reads would bloat the main transcript. The sub-agent cannot edit or run the shell.",
+    permissionLevel: "readonly",
+    isMutating: false,
+    cacheable: false,
+    parameters: {
+      type: "object",
+      properties: {
+        task: {
+          type: "string",
+          description: "A precise, self-contained question or exploration task for the sub-agent.",
+        },
+      },
+      required: ["task"],
+    },
+    execute: async (args, ctx) => {
+      if (!ctx.runSubAgent) {
+        return { output: "Error: delegation is unavailable in this execution context.", isError: true };
+      }
+      const task = String(args.task ?? "").trim();
+      if (!task) return { output: "Error: delegate requires a non-empty `task`.", isError: true };
+      const summary = await ctx.runSubAgent(task);
+      return `Delegated sub-task complete. Distilled result:\n\n${summary}`;
     },
   },
 

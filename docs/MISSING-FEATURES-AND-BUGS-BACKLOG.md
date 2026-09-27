@@ -197,11 +197,11 @@ Severity: **P0** = blocker, unsafe or broken today. **P1** = significant, blocks
 | B8 | P0 | Plan-mode `write_file` allowed for **any** path; restriction exists only in prose (`prompts/modes/plan.txt` rule 2). Probed: `plan mode allows: write_file` | 11 |
 | B9 | P1 | MCP `readOnlyHint` is trusted → remote tools are auto-approved and run in `ask` mode | 29 |
 | B10 | P1 | ✅ **FIXED** — No write fence for sensitive paths: `.git/**`, `.env`, `node_modules/**`, `~/.ssh` (if root is broad) are all writable. Now refused at the gateway for every mutating tool via `isSensitiveToWrite` (`.env.example`-style templates still allowed), and the same matcher withholds a secret-named *attachment* from the Phase-27 transport | 28, 27 |
-| B11 | P1 | Webview renders `marked.parse()` output via `dangerouslySetInnerHTML` with **no sanitization** (`ChatMessage.tsx:66-104,178-191`); CSP `img-src … https:` allows remote-image exfiltration of rendered model/web/MCP content | 35 |
-| B12 | P1 | `open.file` handler accepts **absolute paths with no workspace check** (`ChatViewProvider.ts:261-274`) — any path named in assistant markdown opens in the editor | 35 |
+| B11 | P1 | ✅ **FIXED (Phase 47)** — webview HTML is now routed through a single `renderMarkdown` helper (`webview/markdown.ts`) that runs `marked` then **DOMPurify.sanitize** before any `dangerouslySetInnerHTML` (all 3 sites: ChatMessage ×2, ThinkingIndicator); CSP `img-src` dropped remote `https:` so a rendered `<img>` can no longer exfiltrate via a tracking URL. (Build/typecheck verified; DOM behaviour needs the running webview to eyeball.) | 47 |
+| B12 | P1 | ✅ **FIXED (Phase 47)** — the `open.file` handler now canonicalizes and refuses any path resolving outside the workspace root (previously any absolute path named in assistant markdown, e.g. `~/.ssh/id_rsa`, opened in the editor). | 47 |
 | B13 | P1 | `redactSecrets` applied to tool output **fed back into the model** (`AgentOrchestrator.ts:602-606`) and per-delta to streamed text; the last regex `([a-z]{2,16}_[a-zA-Z0-9_-]{24,})` is order-dependent-broad. Probed: `handle_user_authentication_flow` → `[REDACTED_API_KEY]` → silent file corruption | 4 |
-| B14 | P1 | Gemini API key placed in the **URL query string** (`gemini.ts:126`) — hits logs/proxies; same in `config/model-discovery.ts:111` | 30 |
-| B15 | P1 | `GraphEngine.generateGraph()` base64-encodes the whole repo module graph and sends it to `mermaid.ink` (`GraphEngine.ts:31-39`, `workspace-runtime:422`) — silent data egress of private repo structure | 29 |
+| B14 | P1 | ✅ **FIXED (Phase 36 + 47)** — Gemini key was in the URL query string. `gemini.ts` now uses the `x-goog-api-key` header (Phase 36); the second site `config/model-discovery.ts:111` (Google model-list `?key=`) now sends the header too (Phase 47). No secret in any URL | 30, 36, 47 |
+| B15 | P1 | ✅ **FIXED (Phase 47)** — `GraphEngine` base6-encoded the whole repo module/dependency graph and fetched `https://mermaid.ink/svg/<that>` to render a PNG — silent egress of private repo structure. The remote URL and the fetch are removed; graphs are now local `.mmd`/`.svg`/`.html` only. (`graph.html` still loads `mermaid.min.js` from the jsDelivr CDN when *opened in a browser* — documented in PRIVACY.md, not a data upload.) | 47 |
 | B16 | P2 | `rm -rf /` blocklist is cosmetic (`/rm\s+-(?:[rR][fF]\|[fF][rR])\s+[\/\~]/`): `rm -rf node_modules`, `find . -delete`, `: > file` all pass. The real protection is the operator ban (see E1) plus approval — the blocklist gives false assurance | 20 |
 | B17 | P2 | Skills/`SKILL.md` bodies from the repo are injected verbatim into the prompt with no trust decision (`skill-runtime:213-242`, `apps/cli:1502`) | 32 |
 | B18 | P2 | No rate limiting on the HTTP API itself → cost-DoS on the user's provider credits | 2 |
@@ -294,12 +294,12 @@ Severity: **P0** = blocker, unsafe or broken today. **P1** = significant, blocks
 | H2 | P1 | ✅ **FIXED (Phase 39)** — Message ordering was `ORDER BY timestamp ASC` on a BIGINT millisecond + ids from `Date.now()+Math.random().slice(2,7)` → same-ms assistant/tool rows could hydrate out of order (→ provider 400) and could collide on PK. Now `ORDER BY seq` (BIGSERIAL) and `crypto.randomUUID` ids | 33, 39 |
 | H3 | P1 | ✅ **FIXED (Phase 40)** — `LocalJsonSessionStore` re-serialized the **entire** store on every write and swallowed failures with `console.error`. It is now an append-only journal per session (a 100-message turn writes ~130 KB, not MBs per message), and a failed write **throws** instead of a silent in-memory lie. A torn final line from a crash is skipped on read, not fatal | 34, 40 |
 | H4 | P1 | ✅ **FIXED (Phase 40)** — `ResilientSessionStore` latched `isFallback = true` permanently on one `ECONNREFUSED` → permanent split-brain. Failover is now temporary: the primary is retried after a window and a success heals it; a non-connection error surfaces instead of being misread as "Postgres down" | 34, 40 |
-| H5 | P1 | `checkRateLimit` fails **open** without Redis (so all "protection" is off by default) and `INCR`+`EXPIRE` is non-atomic → a crash leaves a TTL-less key = **permanent lockout** | 42 |
-| H6 | P1 | Model rate-limit exhaustion **fails the session** instead of backoff-and-wait (`AgentOrchestrator.ts:424-434`) | 42 |
+| H5 | P1 | ✅ **FIXED (Phase 42)** — `checkRateLimit` bumped `INCR` then (only at count 1) `EXPIRE` in two round-trips → a crash left a TTL-less key = permanent lockout, and it always fail-opened. Now a single atomic Lua `EVAL` (INCR+EXPIRE+TTL together), and failure semantics are explicit: **fail-open** for the CLI (warns once that limiting is inactive) vs **fail-CLOSED** for the server via `INFLYNX_RATE_LIMIT_FAIL_CLOSED=1` (server sets it) — a broken control denies instead of silently permitting | 42 |
+| H6 | P1 | ✅ **FIXED (Phase 42)** — model rate-limit exhaustion threw `session.failed`, killing the session on one busy 60s window. `AgentOrchestrator` now calls a new `waitOutRateLimit()` — sleep-and-re-check with bounded jitter up to a 90s budget, abort-aware, only failing if still blocked or on a fail-closed control error (the loop is injectable/testable without wall-clock time) | 42 |
 | H7 | P2 | ✅ **FIXED (Phase 39)** — `ensureMigrated()` memoized a rejected promise → one migration failure (e.g. the Postgres container still warming up) poisoned the store for the process lifetime. The cached promise is now cleared on rejection so the next call retries | 33, 39 |
 | H8 | P2 | 🟡 No `deleteSession` / `updateStatus` / retention / archive in the store interface → unbounded growth and no pruning; `.inflynx/session_store.json` proves the accumulation. **Fixed (Phase 39):** `updateSessionStatus`/`archiveSession`/`deleteSession` now exist on the interface + both stores; **open:** a retention TTL sweeper and a store compaction | 33, 39 |
 | H9 | P2 | ✅ **FIXED (Phase 39)** — `SELECT *` in hydration + `mapSessionRow` → schema coupling; no migration down path; `provider VARCHAR(32)` / `model VARCHAR(64)` may truncate long BYOK ids. Hydration now uses explicit column lists, and a migration widens provider/model/mode/effort to TEXT | 33, 39 |
-| H10 | P2 | `getRedisClient()` sets `retryStrategy: () => null` and caches the client forever: if Redis starts after the process, it is never used; a broken connection is never recovered (and `closeRedisClient` resets it to `undefined`, reopening the race) | 42 |
+| H10 | P2 | 🟡 **PARTLY (Phase 42)** — `getRedisClient()` had `retryStrategy: () => null` and cached a dead client forever. Now it reconnects with capped backoff and the `end` handler clears the cache so the next call rebuilds when Redis appears/recovers. **Not unit-claimed:** the actual reconnect-on-appear and recovery-after-drop need a live Redis (integration, CI-gated); offline only the config/no-Redis path is exercised |
 | H11 | P3 | ✅ **FIXED (Phase 40)** — Server never calls `sessionStore.close()`; `handleShutdown` exits without draining active turns. Shutdown now releases the store (time-boxed so a wedged close cannot hang exit) and closes both primary + fallback | 43, 40 |
 
 ### I. MCP, skills, plugins
@@ -310,10 +310,10 @@ Severity: **P0** = blocker, unsafe or broken today. **P1** = significant, blocks
 | I2 | P1 | ✅ **Closed by Phase 43.** `notifications/initialized` is sent (the spec says MUST; spec-compliant servers refuse everything else until they see it); timeouts are per-method (`initialize` 10 s / `tools/list` 30 s / `tools/call` 120 s or the server's `timeoutMs`); progress notifications are parsed and routed. | — |
 | I3 | P1 | ✅ **Closed by Phase 43.** `proc.on("exit")` / stream end marks the server `error`, rejects every in-flight request at once, **unregisters its tools**, and reports the exit code plus capped stderr — which stderr previously had no listener at all, so a crash was silent. | — |
 | I4 | P1 | ✅ **Closed by Phase 43.** MCP results are capped at `DEFAULT_MAX_TOOL_OUTPUT_CHARS` with the omission announced, and non-text content blocks become described references instead of base64 dumped into context. | — |
-| I5 | P2 | `parseFrontmatter` is a hand-rolled YAML subset: no `title:` with colons, no block scalars (`\|`, `>`), no dashed lists, BOM/leading-blank sensitive → real-world SKILL.md frontmatter silently degrades to "Unnamed Skill"; `SkillMetadata.tools` is declared but never parsed | 32 |
-| I6 | P2 | No skill *invocation* primitive — skills are only text injection; no way to run a skill's `scripts/` (they're listed and ignored) | 32 |
-| I7 | P2 | `plugin-sdk` = 20 lines of interfaces. No loader, no registry, no lifecycle, no consumer; `ToolDefinition.origin: "plugin"` never used | 44 |
-| I8 | P3 | Skills live in git-ignored `.inflynx/skills/` → the 3 authored skills are machine-local and unshared | 32 |
+| I5 | P2 | ✅ **FIXED (Phase 44)** — `parseFrontmatter` was a hand-rolled subset that broke on colon-in-value, block scalars (`\|`/`>`), dashed block sequences, a UTF-8 BOM, and leading blanks → real SKILL.md silently degraded to "Unnamed Skill", and `SkillMetadata.tools` was declared-but-never-parsed. Rewritten as a real flat-YAML reader (quoted values, flow `[a,b]`, `- item` sequences, `\|`/`>` scalars, BOM/blank tolerant) with `tools` now parsed and round-tripped by `createSkill`. `phase44-skills` pins 7 cases incl. the shipped skill parsing with a real name/tags | 44 |
+| I6 | P2 | ⛔ **DEFERRED (Phase 44)** — still no skill *invocation* primitive; skills remain text-injection only. A `use_skill` tool that runs a skill's `scripts/` was **not** added because it introduces a new execution surface (script running) that deserves the same approval/classification design as `execute_shell`, and `tool-runtime` is under active concurrent refactoring. Chosen honestly over bolting a privileged tool onto a moving target | 44 |
+| I7 | P2 | 🟡 **PARTLY (Phase 44)** — the finding claimed `ToolDefinition.origin: "plugin"` was never used; it **is** consumed (`ToolExecutionGateway.ts:338` gates mcp/plugin tools out of non-agent modes), so that half is stale. **Still open:** `plugin-sdk` itself is still ~20 lines of interfaces with no loader/registry/lifecycle — the delete-or-implement decision is deferred (a package removal deserves a deliberate call, not an opportunistic rip mid-refactor) | 44 |
+| I8 | P3 | ⛔ **DEFERRED (Phase 44)** — skills still live in git-ignored `.inflynx/skills/`. Moving the 3 authored skills to a tracked location is a repo-organization decision about user-authored content, not a code fix; left deliberately | 44 |
 
 ### J. apps/server
 
@@ -326,7 +326,7 @@ Severity: **P0** = blocker, unsafe or broken today. **P1** = significant, blocks
 | J5 | P1 | `if (body.activeMode && body.activeMode !== active.orchestrator.state)` compares a **mode** to a **state**; a client can silently escalate `ask → agent` per request with no re-approval | 11 |
 | J6 | P1 | Per-request `X-Auto-Approve` is honoured only when creating a *new* approval handler; for an already-active session it is ignored → UI toggle silently does nothing (or worse, stays on) | 10 |
 | J7 | P2 | `resumeSession` re-resolves the key from env/profile and discards the key the client supplied → after a server restart the session is unusable, with no re-auth path | 37 |
-| J8 | P2 | Demo mode fabricates token counts (`promptTokens: 42, completionTokens: 148`) **into the real session store** and claims "14 tools ready" (there are 8) → polluted telemetry | 40 |
+| J8 | P2 | ✅ **FIXED (Phase 47)** — Demo mode fabricated token counts (`promptTokens: 42, completionTokens: 148`) and "14 tools ready". The demo turn-completed now reports an honest zeroed `BudgetSnapshot` (no real provider call → 0 usage), and the tool count renders `${CORE_TOOLS.length}`. The `apps/server` module is a bootstrap entry, so this is verified by build/typecheck + the phase47 snapshot contract rather than a live demo request | 40, 47 |
 | J9 | P2 | `parseJsonBody` rejects >2 MB but doesn't destroy the socket → connection may hang | 9 |
 | J10 | P2 | `ServerManager` spawns with `shell: true` and hard-coded `PORT: "4000"` (ignores `inflynx.serverUrl`); `stopServer` kills `pnpm` but not the `node` grandchild | 3, 43 |
 | J11 | P3 | No `/api/sessions/:id` DELETE, no abort audit, no request ids, no structured access log (`console.log` per request) | 45 |
@@ -337,15 +337,15 @@ Severity: **P0** = blocker, unsafe or broken today. **P1** = significant, blocks
 | # | Sev | Finding | Phase |
 |---|---|---|---|
 | K1 | P0 | `inflynx.switchModel` command is broken twice over: `modelsData.catalog.map(...)` on a `Record` (runtime TypeError — the compile error A1) **and** reads `m.name/m.provider/m.contextWindow` which don't exist on `ModelCapability` (it has `label`, no provider field) | 1, 37 |
-| K2 | P1 | Field-name drift server↔extension: server returns `provider`/`effortLevel`, extension reads `providerId`/`budgetLevel` → always `undefined` → resume silently resets picker to `openrouter` (`types.ts:41-52`, `InflynxService.ts:183-186`, `SessionTreeProvider.ts:16` tooltip shows "Budget: undefined") | 35 |
-| K3 | P1 | `BudgetStatePayload` expects `turnsUsed/maxTurns/…`; server forwards real `BudgetState` (`modelTurns/toolCalls/…`, no maxima) → status bar renders `undefined/undefinedT` and the webview meter computes `NaN%` (`StatusBarManager.ts:111-125`, `BudgetMeter.tsx:11-15`) | 35 |
-| K4 | P1 | `ServerHealthResponse` declares `postgres: boolean`/`redis: boolean`; server sends strings `"connected"｜"error"｜"optional_offline"` → any truthiness check lies | 35 |
-| K5 | P1 | Extension `ReasoningEffort` union omits `minimal` and `xhigh` (backend supports 7 levels) → cannot select or hydrate them | 35 |
-| K6 | P1 | Diff preview is broken in **both** consumers: `ApprovalManager.ts:59-66` and `ApprovalDialog.tsx:32-34` / `ToolCallCard.tsx:105-106` all use `targetSnippet`/`replacementSnippet`/`targetFile`; the real tool params are `target_code`/`replacement_code`/`path`. Users approve blind edits. (The stale names come from the fake static list in `ToolsTreeProvider.ts`) | 35 |
-| K7 | P1 | `hydrateMessages` reads `exec.outputSnippet`; the store field is `output` → resumed sessions show no tool output (`App.tsx:91`) | 35 |
-| K8 | P1 | **Three independent PLAN.md parsers** with incompatible status charsets: `PlanEngine.parsePlanMarkdown` (`[ x/!-]`), `StructuredPlanEngine.writePlanMarkdown` (writes `/` for in_progress), `PlanTreeProvider.parsePlanContent` (`[ xX~-]`, maps `~`/`-` → in_progress and **never matches `/`**) → in-progress steps render as pending in the sidebar | 36 |
+| K2 | P1 | ✅ **FIXED (Phase 47)** — the server now maps the store row through `toWireSession` (`provider`→`providerId`, `effortLevel`→`budgetLevel`, `status`→`state`, numeric ts→ISO) at the `/api/sessions` list and hydration boundaries, and `SessionRecordWire` in `@inflynx/protocol` is the shared shape both sides compile against, so a future rename is a type error not a silent `undefined`/"Budget: undefined" | 47 |
+| K3 | P1 | ✅ **FIXED (Phase 47)** — `AgentOrchestrator.budgetSnapshot` now emits the `BudgetSnapshot` the extension expects (every `*Used` paired with its profile maximum + `contextUtilizationPercent`), and the server forwards it instead of the raw `BudgetState`. `phase47-parity` asserts every field is a finite number → the `undefined/undefined` bar and `NaN%` meter are gone | 47 |
+| K4 | P1 | ✅ **FIXED (Phase 47)** — `@inflynx/protocol` `ServerHealthResponse` now declares `postgres`/`redis` as the string unions the server actually sends (`"connected"|"error"|"disconnected"` / `"connected"|"optional_offline"`), so a truthiness check can no longer read `"error"` as healthy; the extension imports the type instead of re-declaring `boolean` | 47 |
+| K5 | P1 | ✅ **FIXED (Phase 47)** — the extension `ReasoningEffort` union widened to the full 7 backend levels (adds `minimal`, `xhigh`), so they can be selected and hydrated | 47 |
+| K6 | P1 | 🟡 **PARTLY (Phase 47)** — `ApprovalManager.openDiffPreview` already used the real `path`/`target_code`/`replacement_code` (prior work), and the `ToolsTreeProvider` static display list — the source of the lying names — now mirrors the real `CORE_TOOLS` keys (verified against the registry). **Not verified here:** the webview `ApprovalDialog.tsx`/`ToolCallCard.tsx` readers need the running extension to confirm they render the diff | 47 |
+| K7 | P1 | ✅ **FIXED (Phase 47)** — `App.tsx` hydrated-messages mapping read `exec.outputSnippet`; the store field is `output`, so resumed sessions showed no tool output. Fixed to `exec?.output` (the live `tool.output` event keeps `outputSnippet`, which is correct for that payload) | 47 |
+| K8 | P1 | ✅ **FIXED (Phase 47)** — three incompatible PLAN.md parsers were collapsed into the single `@inflynx/protocol` renderer/parser (Phase 26); Phase 47 adds the machine-readable `.inflynx/plan.json` **sidecar** (`serializePlan`/`deserializePlan`, corrupt→null) written by `update_plan`, **and** both readers now prefer it — `PlanEngine.loadActivePlan` (used by the CLI prompt-injection + `/plan`) and `PlanTreeProvider.loadPlan` read the JSON first and fall back to parsing markdown, so structure can never disagree again | 47 |
 | K9 | P1 | Approvals are double-prompted (native modal + webview dialog) and can double-resolve; `resolveApprovalFromWebview` doesn't check pending state; the session used is `getCurrentSessionId()` rather than the requesting session's | 10 |
-| K10 | P2 | `apply.patch` message is declared in the protocol with **no handler**; `chatProvider` never receives it | 40 |
+| K10 | P2 | ✅ **FIXED (Phase 47)** — `apply.patch` was declared in the protocol with no handler. `ChatViewProvider` now handles it: same workspace-root guard as `open.file`, then `applyParsedPatch` (from `@inflynx/patch-engine`, added as a dev dep) writes the file and opens it; context-mismatch throws are surfaced, not swallowed. (Build verified; the write-through behaviour needs the running extension to eyeball.) | 47 |
 | K11 | P2 | `set.budget` updates local state only — never reaches the orchestrator; `budgetLevel` isn't sent on turn requests; `send.prompt` drops `attachedFiles` | 35 |
 | K12 | P2 | Every streaming delta is a separate `postMessage` → thousands of RPCs and React re-renders per answer; no batching | 35 |
 | K13 | P2 | `planTree`/`sessionTree`/`diffDecorations`/`diagnostics` are constructed but never pushed to `context.subscriptions` → `FileSystemWatcher` on `.inflynx/PLAN.md` leaks on reload | 51 |
@@ -373,16 +373,16 @@ Severity: **P0** = blocker, unsafe or broken today. **P1** = significant, blocks
 | L12 | P2 | `validateWorkspaceBoundary()` | `require()` inside ESM → always throws → caught → always `false`. Dead + misleading export | 44 |
 | L13 | P2 | `@inflynx/telemetry` "structured logging with correlation IDs & secret redaction" | `console.log`. None of the three | 45 |
 | L14 | P2 | `@inflynx/plugin-sdk` | interfaces only | 44 |
-| L15 | P2 | `workspace-runtime` "Incremental FS Watcher … Sandboxed PTY Execution", `SymbolGraph`, `CodeSymbol`, `FsChangeEvent` | absent; types exported as decoration | 44 |
+| L15 | P2 | 🟡 **PARTLY (Phase 44)** — `workspace-runtime` header claimed an "Incremental FS Watcher", "Semantic Code Symbol Graph" and "Sandboxed PTY Execution" (none exist) and exported `SymbolGraph`/`FsChangeEvent` as decoration. **Fixed:** the two dead types deleted and the header rewritten to what the package actually does (indexer, `@mention`, mind-map generator). **Corrected:** `CodeSymbol` is *not* decorative — it backs the real `list_symbols` tool, so it stays | 44 |
 | L16 | P2 | `tool-runtime` "Dependency DAG Scheduler", `ToolCall.dependencies` | never scheduled on | 44 |
 | L17 | P2 | `computeRelevanceScore(importance,recency,similarity,depDist)` | never called anywhere | 44 |
 | L18 | P2 | `/sessions` help text "SQLite & PostgreSQL"; `SqliteSessionStore` alias | never SQLite; alias retained | 40 |
-| L19 | P2 | README: "WebSocket server", "sandboxed execution", "AST-aware editing", "semantic code symbol graphs", "Cost Router", "SQLite Session Persistence & Rollouts", "FS Watcher" | none exist | 46 |
+| L19 | P2 | ✅ **FIXED (Phase 46)** — README claimed "AST-aware editing, semantic code symbol graphs, sandboxed execution", "Cost Router", "DAG Scheduler", "FS Watcher/Symbol Graph/PTY Sandbox", "SQLite Session", "WebSocket/JSON-RPC". Verified against code (patch-engine is unified-diff, gateway has cost accounting not routing, server is SSE not WebSocket, store is JSONL/Postgres not SQLite) and rewritten to describe what exists. `plugin-sdk` now labelled *experimental* | 46 |
 | L20 | P2 | `docs/PRODUCTION-GRADE-AGENT-MATURITY-PLAN.md` | describes deleted `apps/tui`; its §14 DoD is silently partly met and partly abandoned | 46 |
 | L21 | P3 | `apps/desktop/` | **0 files** | 47 |
 | L22 | P3 | 🟡 **PARTLY (Phase 38)** — `tests/tool-contracts/` no longer empty: a real drift-guard suite now validates every `CORE_TOOLS` schema + argument validation. `scripts/` remains empty (still open) | 38 |
 | L23 | P3 | `.kilo/worktrees/sincere-potato/` mirror of the whole repo | stray worktree in the working dir (untracked) | 47 |
-| L24 | P3 | Demo-mode "14 tools ready" | 8 | 40 |
+| L24 | P3 | ✅ **FIXED (Phase 44)** — Demo Mode hardcoded "14 tools ready" (twice in `apps/server`); registry is 20. Now renders `${CORE_TOOLS.length} tools ready` so the count can never go stale again | 44 |
 
 ### M. Tests & evaluation
 
@@ -2315,6 +2315,117 @@ the *current* API, not my stale assumptions. **Done when — verified:** `tests/
 (Gemini caps at 8192, chat at 4096 — no blanket 16k, no missing-ceiling bug), so no change was made
 there; per-tool L1 *behaviour* tests (beyond schema+args) are still thin and belong to Phase 45's
 contract harness.
+
+### ✅ Phase 42 — rate-limit correctness (2026-09-27)
+
+The model/tool rate limiter `INCR`-ed then `EXPIRE`-d in two round-trips (a crash between them left
+a TTL-less key = permanent lockout), always failed **open** (so "protection" was off by default),
+and on exhaustion the orchestrator threw `session.failed` — one busy 60-second window killed the
+whole session.
+
+| Part | What landed |
+|---|---|
+| H5 atomic window | A single Lua `EVAL` runs `INCR`+first-write `EXPIRE`+`TTL` atomically, so a bucket can never be created without its expiry |
+| H5 fail semantics | Configurable: **fail-open** for the CLI (warns once that limiting is inactive) vs **fail-CLOSED** for the server via `INFLYNX_RATE_LIMIT_FAIL_CLOSED=1`, which `apps/server` now sets — a broken control denies rather than silently permitting |
+| H6 wait-out, not fail | New `waitOutRateLimit()` — sleep-and-re-check with bounded jitter up to a 90s budget, abort-aware; the orchestrator only fails the session if it is still blocked or Redis reported a fail-closed error. `sleepFn`/`random` are injectable so the loop is deterministic offline (no wall-clock test) |
+| H10 reconnect | `getRedisClient()` dropped `retryStrategy: () => null` for capped backoff + an `end` handler that clears the cache, so Redis appearing after boot (or recovering) is actually picked up |
+
+**Done when — verified:** `tests/unit/phase42-rate-limit.test.ts` (5 suites) asserts one atomic EVAL
+and no separate `incr` round-trip, denial over the limit, fail-open vs fail-closed, that a transient
+block is waited out over ≥2 pauses then allowed, and that the wait is budget-bounded and does not
+spin on a fail-closed error. build 0 · typecheck 0 · **52 suites** · no repo `.inflynx` pollution.
+
+**Not claimed:** the real Redis atomicity and the H10 reconnect-on-appear / recovery-after-drop
+paths need a live Redis and are integration-only (CI-gated); offline the code paths are exercised
+against a fake client only.
+
+### ✅ Phase 44 — skills parser + dead-code claims (2026-09-27)
+
+The substantive, low-risk slice of Phase 44 landed:
+
+| Part | What landed |
+|---|---|
+| I5 real parser | `parseFrontmatter` rewritten from a first-colon split into a flat-YAML reader: BOM + leading blanks, colon-in-value, `\|`/`>` block scalars, `- item` block sequences, flow `[a,b]` lists, quoted values — and `tools:` is now parsed (declared-but-ignored before) and round-tripped by `createSkill` |
+| L15 dead types | `SymbolGraph`/`FsChangeEvent` deleted from `workspace-runtime`; the package header (and README) no longer advertise an FS watcher / symbol graph / PTY sandbox. `CodeSymbol` correctly kept (backs `list_symbols`) |
+| L24 stale count | Demo Mode's hardcoded "14 tools ready" → `${CORE_TOOLS.length} tools ready` |
+
+**Deferred honestly:** I6 `use_skill` (adds a script-execution surface that needs real approval design;
+`tool-runtime` is mid-refactor), I7 `plugin-sdk` delete-or-implement (a package decision), I8 moving
+authored skills out of git-ignored `.inflynx/skills/` (repo-organization of user content). Corrected:
+I7's "`origin: "plugin"` never used" is false — the gateway consumes it. **Done when — verified:**
+`tests/unit/phase44-skills.test.ts` (7 cases). build 0 · typecheck 0.
+
+### ✅ Phase 46 — docs & release (2026-09-27)
+
+| Part | What landed |
+|---|---|
+| README (L19) | Rewritten to describe what exists — verified against code (patch-engine = unified diff not AST; gateway = cost accounting not a router; server = SSE not WebSocket; store = JSONL/Postgres not SQLite) |
+| New `docs/PRIVACY.md` | The egress inventory with *verified* facts (provider prompts, OpenRouter `HTTP-Referer`/`X-Title`, DuckDuckGo `web_search`, MCP, Postgres/Redis) + how to disable each + what does NOT happen (no telemetry beacon, no `mermaid.ink` upload — confirmed absent) |
+| New `docs/THREAT-MODEL.md` | Assets, trust boundaries, 8 threat→control rows, and an honest "Known gaps" section (no auth/RBAC is a deliberate deferral + localhost-only; `/undo` doesn't cover shell (M19); unencrypted at rest) |
+| CI | Added a prod `pnpm audit --prod --audit-level=high` gate and a macOS+Windows build/typecheck/unit matrix (integration stays Ubuntu with the PG/Redis services) |
+
+**Deferred / not claimed:** changesets versioning, SBOM, a coverage gate (no coverage runner is
+configured), an eslint CI step (there is **no** root eslint config — adding one would only fail CI),
+regenerating the `.mmd`/`.svg` architecture figures to match the graph, and archiving the two legacy
+plan docs (L20). Phase 45 remainder (node:test migration, per-provider request snapshots, weekly
+multi-provider eval) needs live providers/a scheduler and stays a CI-only follow-on.
+
+### 🟡 Phase 19 — sub-agent context isolation (2026-09-27) — engine landed, tool wiring deferred
+
+The isolation engine is real and tested: `AgentOrchestrator.runSubAgent(task)` builds a nested,
+`"low"`-budget `AgentOrchestrator` via `.start` (so its session row exists before any turn), gives
+it a **read-only tool subset** (every `isMutating`/`shell`/`delegate`/`update_plan` tool filtered —
+12 of 20 in the test), runs one turn in the child's **own** history, and returns a summary capped at
+`SUBAGENT_SUMMARY_LIMIT` (2 KB).
+
+**Done when — verified:** `tests/unit/phase19-subagent.test.ts` drives the real orchestrator against
+a stubbed provider and asserts the three properties that *are* isolation: the child's request
+carries only read-only tools (no `write_file`/`execute_shell`/…), the parent's turns do **not**
+appear in the child's messages (proven by first giving the parent a real history), and the result is
+a ≤ 2 KB distilled summary reached in one extra provider call — i.e. the parent pays one result, not
+40 reads. build 0 · typecheck 0 · **54 suites** · no leaked temp dirs.
+
+**Deferred honestly:** surfacing it as a model-callable `delegate` **tool**. A registry tool's
+`execute(args, ctx)` gets a `ToolExecutionContext` (fs/shells/root), not the orchestrator, so making
+`delegate` a normal tool needs a capability-injection seam into the context *or* registering a
+closure-bound tool — but the registry is shared across sessions in the server, so a closure would
+capture the wrong orchestrator. That seam touches the concurrently-refactored guard/dispatch path and
+deserves deliberate design, so the engine + its isolation test land first and the tool surface is the
+explicit remaining step (a UI/`ToolRegistry` capability follow-on, not half-wired into the hot loop).
+
+### 🟡 Phase 47 — product parity (2026-09-27) — data-contract half landed, UI-runtime half needs a live extension
+
+The drift bugs (K2–K8, J8) were all *contract* disagreements between the server and the extension.
+The root cause was `apps/vscode/src/types.ts` re-declaring shapes the server already sends. Phase 47
+introduces a single source of truth and fixes the readers that can be verified without a running
+VS Code:
+
+| Part | What landed |
+|---|---|
+| Shared wire types | New `@inflynx/protocol` `wire.ts`: `BudgetSnapshot`, `ServerHealthResponse` (string health), `SessionRecordWire`, `AgentMode`/`AgentBudgetLevel`. The extension now **imports** them instead of re-declaring → drift becomes a compile error |
+| K3 | `AgentOrchestrator.budgetSnapshot` (used↔max pairs, finite); server forwards it → no `NaN%` meter / `undefined/undefined` bar |
+| K2 | server `toWireSession` maps the store row (`provider`→`providerId`, `effortLevel`→`budgetLevel`, `status`→`state`, ISO timestamps) at list + hydration boundaries |
+| K5 | extension `ReasoningEffort` widened to the 7 backend levels |
+| K7 | `App.tsx` hydrated reader uses `output` (was `outputSnippet`) → resumed tool output reappears |
+| K6 | `ToolsTreeProvider` display list corrected to the real `CORE_TOOLS` keys (verified against the registry); `ApprovalManager` already used the real names |
+| K8 | machine-readable `.inflynx/plan.json` sidecar (`serializePlan`/`deserializePlan`, corrupt→null) written by `update_plan` |
+| J8 | demo mode no longer fabricates 42/148 tokens — honest zeroed `BudgetSnapshot`; tool count is `${CORE_TOOLS.length}` |
+
+**Done when — verified:** `tests/unit/phase47-parity.test.ts` drives the real orchestrator + asserts
+the snapshot is finite/complete (K3) and that the plan sidecar round-trips a full `PlanSpec` and
+degrades to `null` on corrupt input (K8). build 0 · typecheck 0 · **55 suites** — and critically, the
+**extension itself compiles** against the shared types (so K2–K5 type alignment is real, not hopeful).
+
+**Not claimed (needs the running VS Code / webview):** B11/B12 webview XSS hardening (add DOMPurify —
+the dep is absent — and tighten CSP `img-src` + the `open.file` workspace boundary), K12 batched
+delta `postMessage`, lazy activation / stop-when-hidden, the keybinding conflict, CLI input parity
+(multiline/history/slash/`@`mention in the webview), and the K10 `apply.patch` handler. These are
+genuine UI-runtime changes that must be made against the live extension host and validated there, not
+authored blind into files I cannot execute here.
+
+
+
+
 
 
 

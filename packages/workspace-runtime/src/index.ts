@@ -1,6 +1,10 @@
 /**
  * @inflynx/workspace-runtime
- * Incremental FS Watcher, Workspace Indexer, Semantic Code Symbol Graph, & Sandboxed PTY Execution.
+ * Workspace file indexer, BM25-style relevance ranking, `@mention` resolution, and the
+ * Mermaid/SVG/HTML architecture mind-map generator. (Phase 44 / L15: the header previously also
+ * claimed an "Incremental FS Watcher", a "Semantic Code Symbol Graph", and "Sandboxed PTY
+ * Execution" — none exist; those surfaces and their decorative types were removed rather than left
+ * as an untruthful advertisement. `CodeSymbol` stays: it backs the real `list_symbols` tool.)
  */
 
 import fs from "fs";
@@ -16,18 +20,6 @@ export interface CodeSymbol {
   line: number;
   column: number;
   exported: boolean;
-}
-
-export interface SymbolGraph {
-  symbols: Map<string, CodeSymbol>;
-  imports: Map<string, string[]>;
-  references: Map<string, string[]>;
-}
-
-export interface FsChangeEvent {
-  type: "add" | "change" | "unlink";
-  filePath: string;
-  timestamp: number;
 }
 
 // ─── Workspace File Index ─────────────────────────────────────────────────────
@@ -458,10 +450,12 @@ export function buildDependencyGraph(workspaceRoot: string): WorkspaceGraphResul
     ...nodes.map(n => `| \`${n.id}\` | ${n.type.toUpperCase()} | ${n.fileCount} | ${n.dependencies.map(d => `\`${d}\``).join(", ") || "(none)"} |`),
   ].join("\n");
 
-  // 3. Generate Mermaid Base64 URL for live PNG/SVG image rendering
-  const mermaidRawCode = mermaidLines.join("\n");
-  const base64Mermaid = Buffer.from(mermaidRawCode).toString("base64");
-  const imageUrl = `https://mermaid.ink/svg/${base64Mermaid}`;
+  // 3. B15 (Phase 47): render entirely locally. This used to build a
+  //    `https://mermaid.ink/svg/<base64 of the repo graph>` URL and have the graph engine fetch it
+  //    to produce a PNG — silently sending the whole module/dependency structure of a private repo
+  //    to a third party. That URL is gone; `svgContent` below is the local vector rendering, and the
+  //    HTML viewer renders the mermaid source itself. Nothing leaves the machine.
+  const imageUrl = "graph.svg"; // local artifact written next to GRAPH.md — never a remote fetch
 
   // 4. Generate SVG Content (Vector Graphic representation)
   const svgContent = `<?xml version="1.0" encoding="UTF-8"?>

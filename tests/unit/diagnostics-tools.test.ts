@@ -219,7 +219,7 @@ async function runPhase25Tests(): Promise<void> {
     assert.deepEqual(
       tools.map((t) => t.name).sort(),
       [
-        "delete_path", "edit_file", "execute_shell", "fetch_url", "find_definition", "git", "glob_files",
+        "delegate", "delete_path", "edit_file", "execute_shell", "fetch_url", "find_definition", "git", "glob_files",
         "list_diagnostics", "list_directory", "list_symbols", "move_path", "patch_file", "read_file",
         "search_files", "shell_list", "shell_output", "shell_stop", "update_plan", "web_search", "write_file",
       ].sort(),

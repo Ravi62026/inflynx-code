@@ -338,3 +338,52 @@ export function derivePlanStatus(plan: PlanSpec): PlanStatus {
   if (p.settled === p.total) return "COMPLETED";
   return p.settled === 0 && p.inProgress === 0 ? "PENDING_APPROVAL" : "IN_PROGRESS";
 }
+
+// ─── Machine-readable sidecar (Phase 47 / K8) ────────────────────────────────
+
+/**
+ * The JSON sibling of `.inflynx/PLAN.md`, written by `update_plan` alongside the markdown so the
+ * sidebar tree and the CLI read a structure instead of each re-parsing glyphs — the K8 drift (four
+ * readers disagreeing on the checkbox format) came precisely from markdown being the only machine
+ * format. Pure (no `fs`) so the webview can use it too; the file I/O stays with the callers.
+ */
+export const PLAN_SIDECAR_RELATIVE_PATH = ".inflynx/plan.json";
+
+export function serializePlan(plan: PlanSpec): string {
+  return JSON.stringify({ ...plan, _kind: "inflynx.plan", _v: 1 }, null, 2) + "\n";
+}
+
+const RISKS = new Set<PlanRisk>(["LOW", "MEDIUM", "HIGH"]);
+const PLAN_STATUSES = new Set<PlanStatus>(["PENDING_APPROVAL", "IN_PROGRESS", "COMPLETED", "ABORTED"]);
+
+/** Returns `null` (never throws) on malformed/incompatible JSON, so a corrupt sidecar falls back to
+ * the human-authored markdown rather than blanking the plan view. */
+export function deserializePlan(raw: string): PlanSpec | null {
+  try {
+    const o = JSON.parse(raw);
+    if (!o || typeof o !== "object" || o._kind !== "inflynx.plan") return null;
+    if (!Array.isArray(o.steps) || typeof o.goal !== "string") return null;
+    for (const s of o.steps) {
+      if (typeof s?.id !== "number" || typeof s?.title !== "string" || !Array.isArray(s.dependencies)) return null;
+      if (!PLAN_STEP_STATES.includes(s.status)) return null;
+    }
+    return {
+      goal: o.goal,
+      complexity: RISKS.has(o.complexity) ? o.complexity : "MEDIUM",
+      generatedAt: typeof o.generatedAt === "string" ? o.generatedAt : "",
+      status: PLAN_STATUSES.has(o.status) ? o.status : "PENDING_APPROVAL",
+      steps: o.steps.map((s: any) => ({
+        id: s.id,
+        title: s.title,
+        description: String(s.description ?? ""),
+        targetFiles: Array.isArray(s.targetFiles) ? s.targetFiles : [],
+        verificationCommand: typeof s.verificationCommand === "string" ? s.verificationCommand : undefined,
+        risk: RISKS.has(s.risk) ? s.risk : "LOW",
+        dependencies: s.dependencies,
+        status: s.status,
+      })),
+    };
+  } catch {
+    return null;
+  }
+}

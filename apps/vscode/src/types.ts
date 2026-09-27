@@ -1,12 +1,22 @@
 /**
  * Core type definitions for Inflynx Code VS Code Extension
+ *
+ * Phase 47 (K2–K7): the shapes the server sends are now *imported* from `@inflynx/protocol` instead
+ * of re-declared here. Re-declaring is exactly what let `providerId`/`turnsUsed`/`postgres: boolean`
+ * drift from what the server emits; a shared type turns that drift into a compile error.
  */
+import type {
+  BudgetSnapshot,
+  ServerHealthResponse as ProtocolServerHealthResponse,
+  AgentMode as ProtocolAgentMode,
+  AgentBudgetLevel as ProtocolAgentBudgetLevel,
+} from "@inflynx/protocol";
 
-export type AgentMode = "ask" | "plan" | "agent" | "debug";
-export type AgentBudgetLevel = "low" | "medium" | "high" | "max";
-// NOTE: intentionally narrower than the backend's 7 levels — see backlog K5 /
-// Phase 35, which widens this union together with the effort pickers.
-export type ReasoningEffort = "none" | "low" | "medium" | "high" | "max";
+export type AgentMode = ProtocolAgentMode;
+export type AgentBudgetLevel = ProtocolAgentBudgetLevel;
+// K5: this was narrower than the backend (missing `minimal` and `xhigh`), so those levels could not
+// be selected or hydrated. It must track `REASONING_EFFORTS` in `@inflynx/config`.
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 /** Normalized, display-ready model descriptor used across the extension UI. */
 export interface ModelInfo {
@@ -62,15 +72,7 @@ export interface ModelsResponse {
   supportedEfforts: ReasoningEffort[];
 }
 
-export interface ServerHealthResponse {
-  status: "ok" | "degraded";
-  server: string;
-  version: string;
-  postgres: boolean;
-  redis: boolean;
-  uptimeSeconds: number;
-  timestamp: string;
-}
+export interface ServerHealthResponse extends ProtocolServerHealthResponse {}
 
 export interface SessionRecord {
   sessionId: string;
@@ -126,16 +128,7 @@ export interface ToolApprovalRequestPayload {
   args: Record<string, unknown>;
 }
 
-export interface BudgetStatePayload {
-  level: AgentBudgetLevel;
-  turnsUsed: number;
-  maxTurns: number;
-  toolCallsUsed: number;
-  maxToolCalls: number;
-  tokensUsed: number;
-  maxTokens: number;
-  exhausted: boolean;
-}
+export interface BudgetStatePayload extends BudgetSnapshot {}
 
 export interface ToolResultPayload {
   toolCallId: string;

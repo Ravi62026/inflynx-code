@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from "react";
 import { marked } from "marked";
+import { renderMarkdown } from "../markdown.js";
 import { ThinkingIndicator } from "./ThinkingIndicator.js";
 import type { ToolCallState } from "./ToolCallCard.js";
 import type { AttachmentPayload } from "../../types.js";
@@ -66,7 +67,7 @@ const ChatMessageComponent: React.FC<ChatMessageProps> = ({
   const renderedSystemHtml = useMemo(() => {
     if (!isSystem || !content) return "";
     try {
-      return marked.parse(content) as string;
+      return renderMarkdown(content);
     } catch {
       return content;
     }
@@ -75,7 +76,7 @@ const ChatMessageComponent: React.FC<ChatMessageProps> = ({
   const renderedHtml = useMemo(() => {
     if (!displayContent) return "";
     try {
-      return marked.parse(displayContent) as string;
+      return renderMarkdown(displayContent);
     } catch {
       return displayContent;
     }

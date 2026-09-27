@@ -89,7 +89,7 @@ function hydrateMessages(loadedMsgs: any[], toolExecutions: any[] = []): Message
                 permissionLevel: "readonly" as const,
                 args: parsedArgs || {},
                 status: "completed" as const,
-                output: exec?.outputSnippet || undefined,
+                output: exec?.output || undefined,
                 durationMs: exec?.durationMs || undefined,
                 isError: exec?.isError || false,
               };

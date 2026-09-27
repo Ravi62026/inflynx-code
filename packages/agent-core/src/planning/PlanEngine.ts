@@ -4,6 +4,8 @@ import {
   derivePlanStatus,
   parsePlanMarkdown,
   renderPlanMarkdown,
+  deserializePlan,
+  PLAN_SIDECAR_RELATIVE_PATH,
   type PlanStep,
   type PlanStatus,
 } from "@inflynx/protocol";
@@ -26,17 +28,35 @@ export interface ActivePlan {
 
 export class PlanEngine {
   private planPath: string;
+  private sidecarPath: string;
   private archiveDir: string;
 
   constructor(workspaceRoot: string) {
     this.planPath = path.join(workspaceRoot, ".inflynx", "PLAN.md");
+    this.sidecarPath = path.join(workspaceRoot, PLAN_SIDECAR_RELATIVE_PATH);
     this.archiveDir = path.join(workspaceRoot, ".inflynx", "plans");
   }
 
-  /** Load and parse the current PLAN.md if it exists */
+  /**
+   * Load the active plan, preferring the machine-readable `.inflynx/plan.json` sidecar (K8) and
+   * falling back to parsing `PLAN.md`. Both paths yield the SAME `PlanSpec` from the shared parser,
+   * so the CLI prompt and the sidebar can never disagree about step state again.
+   */
   loadActivePlan(): ActivePlan | null {
+    if (fs.existsSync(this.sidecarPath)) {
+      try {
+        const spec = deserializePlan(fs.readFileSync(this.sidecarPath, "utf-8"));
+        if (spec) {
+          const raw = fs.existsSync(this.planPath) ? fs.readFileSync(this.planPath, "utf-8") : renderPlanMarkdown(spec);
+          return {
+            goal: spec.goal, generatedAt: spec.generatedAt, status: spec.status,
+            complexity: spec.complexity, steps: spec.steps, rawMarkdown: raw,
+            planPath: this.planPath, warnings: [],
+          };
+        }
+      } catch { /* corrupt sidecar → fall through to markdown */ }
+    }
     if (!fs.existsSync(this.planPath)) return null;
-
     const raw = fs.readFileSync(this.planPath, "utf-8");
     return this.parsePlanMarkdown(raw);
   }

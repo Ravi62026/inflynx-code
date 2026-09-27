@@ -29,6 +29,11 @@ import { getRedisClient } from "@inflynx/cache";
 
 loadEnv();
 
+// H5 (Phase 42): this is a multi-tenant server, so when Redis is configured the rate limiter is a
+// real control — a broken/unreachable Redis must DENY (fail closed), not silently permit every call
+// the way the single-user CLI is allowed to. A deployment can still opt out by setting the var.
+process.env.INFLYNX_RATE_LIMIT_FAIL_CLOSED ||= "1";
+
 const PORT = Number(process.env.PORT || 4000);
 
 // ─── Local-first posture (backlog Phase 2) ─────────────────────────────────────
@@ -255,6 +260,30 @@ function parseJsonBody(req: http.IncomingMessage): Promise<Record<string, any>> 
 const sessionHydrationCache = new Map<string, { data: any; time: number }>();
 let listSessionsCache: { data: any; time: number } | null = null;
 
+/**
+ * K2 (Phase 47): the store names these `provider` / `effortLevel` / `status` with numeric
+ * timestamps; the extension reads `providerId` / `budgetLevel` / `state` with ISO strings. Reading
+ * the wrong names is what made a resumed session silently reset the provider picker and the sidebar
+ * tooltip show "Budget: undefined". This mapper is the single wire contract (`SessionRecordWire` in
+ * @inflynx/protocol) so both sides agree by construction.
+ */
+function toWireSession(r: any) {
+  if (!r) return r;
+  return {
+    sessionId: r.sessionId,
+    providerId: r.provider,
+    model: r.model,
+    activeMode: r.activeMode,
+    budgetLevel: r.effortLevel,
+    reasoningEffort: r.reasoningEffort,
+    state: r.status,
+    title: r.title,
+    cwd: r.cwd,
+    createdAt: typeof r.createdAt === "number" ? new Date(r.createdAt).toISOString() : r.createdAt,
+    updatedAt: typeof r.updatedAt === "number" ? new Date(r.updatedAt).toISOString() : r.updatedAt,
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   applyCorsHeaders(req, res);
 
@@ -318,11 +347,11 @@ const server = http.createServer(async (req, res) => {
       const now = Date.now();
       const limit = Number(reqUrl.searchParams.get("limit") || "50");
       if (listSessionsCache && (now - listSessionsCache.time) < 800) {
-        return sendJson(res, 200, { sessions: listSessionsCache.data.slice(0, limit) });
+        return sendJson(res, 200, { sessions: listSessionsCache.data.slice(0, limit).map(toWireSession) });
       }
       const allSessions = await sessionStore.listSessions(WORKSPACE_ROOT);
       listSessionsCache = { data: allSessions, time: now };
-      const sessions = allSessions.slice(0, limit);
+      const sessions = allSessions.slice(0, limit).map(toWireSession);
       return sendJson(res, 200, { sessions });
     }
 
@@ -425,8 +454,10 @@ const server = http.createServer(async (req, res) => {
       if (!hydration) {
         return sendJson(res, 404, { error: `Session "${sessionId}" not found.` });
       }
-      sessionHydrationCache.set(sessionId, { data: hydration, time: now });
-      return sendJson(res, 200, { session: hydration });
+      // K2: normalize the inner session row so the extension reads real providerId/budgetLevel/state.
+      const wireHydration = { ...hydration, session: toWireSession(hydration.session) };
+      sessionHydrationCache.set(sessionId, { data: wireHydration, time: now });
+      return sendJson(res, 200, { session: wireHydration });
     }
 
     // ─── POST /api/sessions/:id/turns (SSE Streaming) ───────────────────────
@@ -471,7 +502,7 @@ const server = http.createServer(async (req, res) => {
           };
           sseWrite("turn.started", { turnNumber: 1 });
           sseWrite("model.thought_delta", {
-            delta: "Analyzing workspace environment and reviewing active capabilities in Demo Mode...\nInspecting local tool registry: 14 tools ready.",
+            delta: `Analyzing workspace environment and reviewing active capabilities in Demo Mode...\nInspecting local tool registry: ${CORE_TOOLS.length} tools ready.`,
           });
           await new Promise((r) => setTimeout(r, 300));
 
@@ -493,18 +524,14 @@ const server = http.createServer(async (req, res) => {
             toolResults: [],
             budgetState: {
               level: "medium",
-              startedAt: Date.now(),
-              modelTurns: 1,
-              toolCalls: 0,
-              readonlyToolCalls: 0,
-              mutatingToolCalls: 0,
-              shellCalls: 0,
-              retries: 0,
-              verificationRuns: 0,
-              promptTokens: 42,
-              completionTokens: 148,
-              reasoningTokens: 20,
-              estimatedCostUsd: 0,
+              turnsUsed: 0,
+              maxTurns: 45,
+              toolCallsUsed: 0,
+              maxToolCalls: 90,
+              tokensUsed: 0,
+              maxTokens: 0,
+              contextUtilizationPercent: 0,
+              exhausted: false,
             },
             isCompleted: true,
           });
@@ -598,7 +625,7 @@ const server = http.createServer(async (req, res) => {
       if (prompt.toLowerCase().startsWith("/demo") || provId === "demo") {
         sseWrite("turn.started", { turnNumber: 1 });
         sseWrite("model.thought_delta", {
-          delta: "Analyzing workspace environment and reviewing active capabilities in Demo Mode...\nInspecting local tool registry: 14 tools ready.",
+          delta: `Analyzing workspace environment and reviewing active capabilities in Demo Mode...\nInspecting local tool registry: ${CORE_TOOLS.length} tools ready.`,
         });
         await new Promise((r) => setTimeout(r, 300));
 
@@ -620,18 +647,14 @@ const server = http.createServer(async (req, res) => {
           toolResults: [],
           budgetState: {
             level: "medium",
-            startedAt: Date.now(),
-            modelTurns: 1,
-            toolCalls: 0,
-            readonlyToolCalls: 0,
-            mutatingToolCalls: 0,
-            shellCalls: 0,
-            retries: 0,
-            verificationRuns: 0,
-            promptTokens: 42,
-            completionTokens: 148,
-            reasoningTokens: 20,
-            estimatedCostUsd: 0,
+            turnsUsed: 0,
+            maxTurns: 45,
+            toolCallsUsed: 0,
+            maxToolCalls: 90,
+            tokensUsed: 0,
+            maxTokens: 0,
+            contextUtilizationPercent: 0,
+            exhausted: false,
           },
           isCompleted: true,
         });
@@ -657,7 +680,7 @@ const server = http.createServer(async (req, res) => {
         sseWrite("turn.completed", {
           finalText: "",
           toolResults: [],
-          budgetState: active.orchestrator.budget,
+          budgetState: active.orchestrator.budgetSnapshot,
           isCompleted: false,
         });
         res.write("data: [DONE]\n\n");
@@ -703,7 +726,7 @@ const server = http.createServer(async (req, res) => {
         sseWrite("turn.completed", {
           finalText: turnResult.finalText,
           toolResults: turnResult.toolResults,
-          budgetState: turnResult.budgetState,
+          budgetState: active.orchestrator.budgetSnapshot,
           isCompleted: turnResult.isCompleted,
         });
         res.write("data: [DONE]\n\n");
@@ -724,7 +747,7 @@ const server = http.createServer(async (req, res) => {
         sseWrite("turn.completed", {
           finalText: "",
           toolResults: [],
-          budgetState: active.orchestrator.budget,
+          budgetState: active.orchestrator.budgetSnapshot,
           isCompleted: false,
         });
         res.write("data: [DONE]\n\n");
