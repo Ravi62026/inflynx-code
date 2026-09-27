@@ -2386,4 +2386,9 @@ async function main() {
   }
 }
 
-main().catch(console.error);
+// A startup crash (bad DATABASE_URL, unreadable workspace) must not exit 0 — scripts
+// and git hooks branch on the exit code, and `catch(console.error)` loses it.
+main().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});
