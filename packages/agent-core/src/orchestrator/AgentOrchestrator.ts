@@ -48,6 +48,9 @@ const CONTEXT_COMPACT_LIMIT = 0.92;
  */
 const CONTEXT_PROTECTION_LADDER = [12, 6, 2];
 
+/** Upper bound on image parts one tool result may inject (context-window protection). */
+const MAX_IMAGES_PER_TOOL_RESULT = 4;
+
 /**
  * Instructions for the compaction pass. It is a *memory* request, not a chat: the
  * things listed here are the ones a model cannot reconstruct and will otherwise
@@ -804,10 +807,135 @@ export class AgentOrchestrator {
         if (pendingToolCalls.length > 0) {
           this.transitionTo("implementing", "Executing proposed tool calls");
 
-          for (const tc of pendingToolCalls) {
+          // ── Phase 28: parallel read-only reads ─────────────────────────────
+          // Consecutive *concurrently-safe* calls (cacheable, core, read-only — read
+          // / list / glob / search, never shell, never mutating, never delegate) run
+          // as one batch. Mixed sequences keep their ordering semantics: only the
+          // leading run of such calls batches, everything else executes one-by-one
+          // exactly as before. Budget, events, context and persistence are applied
+          // in call order after the batch settles, so nothing downstream can tell
+          // the difference except wall-clock time.
+          const isParallelSafeRead = (call: ToolCall): boolean => {
+            const def = this.registry.get(call.name);
+            return Boolean(
+              def &&
+                def.origin === "core" &&
+                def.cacheable === true &&
+                def.permissionLevel === "readonly" &&
+                !def.isMutating &&
+                def.name !== "delegate"
+            );
+          };
+          const handledInBatch = new Set<number>();
+          const parallelRuns = new Map<number, number[]>();
+          for (let i = 0; i < pendingToolCalls.length; i++) {
+            if (!isParallelSafeRead(pendingToolCalls[i])) continue;
+            const run: number[] = [i];
+            let j = i + 1;
+            while (j < pendingToolCalls.length && isParallelSafeRead(pendingToolCalls[j])) {
+              run.push(j);
+              j++;
+            }
+            if (run.length >= 2) parallelRuns.set(i, run);
+            i = j;
+          }
+
+          for (let tcIndex = 0; tcIndex < pendingToolCalls.length; tcIndex++) {
             if (signal.aborted) {
               keepLooping = false;
               break;
+            }
+            if (handledInBatch.has(tcIndex)) continue;
+            const tc = pendingToolCalls[tcIndex];
+            const batchRun = parallelRuns.get(tcIndex);
+
+            if (batchRun) {
+              for (const idx of batchRun) {
+                pendingToolCalls[idx].args = safeParseJsonArgs(pendingToolCalls[idx].args);
+              }
+              // Proposals/approvals emit in call order before anything starts, so the
+              // UI transcript stays ordered even though execution overlaps.
+              for (const idx of batchRun) {
+                const call = pendingToolCalls[idx];
+                this.eventBus.emit("tool.proposed", this.context.sessionId, {
+                  toolCallId: call.id,
+                  toolName: call.name,
+                  permissionLevel: "readonly" as const,
+                  origin: "core" as const,
+                  args: call.args,
+                });
+                this.eventBus.emit("tool.approved", this.context.sessionId, {
+                  toolCallId: call.id,
+                  toolName: call.name,
+                });
+                this.eventBus.emit("tool.started", this.context.sessionId, {
+                  toolCallId: call.id,
+                  toolName: call.name,
+                });
+              }
+              const settled = await Promise.all(
+                batchRun.map(async (idx) => {
+                  const call = pendingToolCalls[idx];
+                  try {
+                    const result = await this.gateway.executeGuarded(
+                      this.registry,
+                      call as ToolCall,
+                      {
+                        activeMode: this.context.activeMode,
+                        sessionId: this.context.sessionId,
+                      },
+                      signal
+                    );
+                    return { call, result };
+                  } catch (err: any) {
+                    // The gateway turns tool errors into results; this only trips on
+                    // an infrastructure-level surprise, which must not abort the turn.
+                    return {
+                      call,
+                      result: {
+                        toolCallId: call.id,
+                        toolName: call.name,
+                        output: `Error: ${err?.message || String(err)}`,
+                        isError: true,
+                        durationMs: 0,
+                      } as ToolResult,
+                    };
+                  }
+                })
+              );
+              for (const { call, result } of settled) {
+                this.budgetManager.recordToolCall("readonly");
+                toolResultsAcc.push(result);
+                this.eventBus.emit("tool.output", this.context.sessionId, {
+                  toolCallId: call.id,
+                  toolName: call.name,
+                  isError: result.isError,
+                  durationMs: result.durationMs,
+                  outputSnippet: redactSecrets(result.output).slice(0, 300),
+                });
+                await this.sessionStore.saveToolExecution(this.context.sessionId, {
+                  toolCallId: call.id,
+                  toolName: call.name,
+                  argsJson: JSON.stringify(call.args),
+                  output: redactSecrets(result.output),
+                  isError: Boolean(result.isError),
+                  durationMs: result.durationMs,
+                });
+                this.context.addMessage({
+                  role: "tool",
+                  content: result.output,
+                  tool_call_id: call.id,
+                  is_error: Boolean(result.isError),
+                });
+                await this.sessionStore.saveMessage(this.context.sessionId, {
+                  role: "tool",
+                  content: redactSecrets(result.output),
+                  toolCallId: call.id,
+                });
+                await this.injectToolResultImages(call, result);
+              }
+              for (const idx of batchRun) handledInBatch.add(idx);
+              continue;
             }
 
             tc.args = safeParseJsonArgs(tc.args);
@@ -977,6 +1105,8 @@ export class AgentOrchestrator {
                 content: redactSecrets(result.output),
                 toolCallId: tc.id,
               });
+
+              await this.injectToolResultImages(tc, result);
             } else {
               // "Error: " prefix keeps the semantics correct for transcripts stored
               // before Message.is_error existed, and for providers without an
@@ -1280,6 +1410,41 @@ export class AgentOrchestrator {
    * back to the model. Bounded by the effort profile's `maxVerificationRuns` so a
    * repo that simply does not build cannot trap the agent in a loop.
    */
+  /**
+   * Images a tool result carries (read_file on a .png) cannot ride inside the tool
+   * message: providers refuse images in tool_result / function roles. They are
+   * delivered as an immediately-following user turn, which every adapter renders as
+   * native image blocks — the Phase 27 carrier, reused end to end. Shared by the
+   * sequential path and the Phase 28 parallel batch.
+   */
+  private async injectToolResultImages(tc: ToolCall, result: ToolResult): Promise<void> {
+    if (result.isError || !result.images?.length) return;
+    const injectable = result.images.slice(0, MAX_IMAGES_PER_TOOL_RESULT);
+    const dropped = result.images.length - injectable.length;
+    const requestedPath =
+      typeof (tc.args as Record<string, unknown> | undefined)?.path === "string"
+        ? ((tc.args as Record<string, unknown>).path as string)
+        : "the requested path";
+    this.context.addMessage({
+      role: "user",
+      content:
+        `[Images returned by ${tc.name} for "${requestedPath}"` +
+        (dropped > 0
+          ? ` — ${dropped} further image(s) withheld to protect the context window`
+          : "") +
+        `]`,
+      images: injectable,
+    });
+    // The store's message shape has no image column (a deliberate size trade-off),
+    // so the persisted transcript keeps an honest text marker.
+    await this.sessionStore.saveMessage(this.context.sessionId, {
+      role: "user",
+      content: redactSecrets(
+        `[Image attached from ${tc.name}: ${injectable.map((i) => i.name ?? i.mediaType).join(", ")}]`
+      ),
+    });
+  }
+
   private async runVerificationGate(
     signal: AbortSignal,
     touchedSourceFiles: Set<string>,

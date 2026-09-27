@@ -115,3 +115,36 @@ export function describeWorkspaceRootSource(dir: string = process.cwd()): string
   if (has(".inflynx")) return ".inflynx (no stronger marker found above it)";
   return "outermost package.json";
 }
+
+const MAX_PROJECT_INSTRUCTION_CHARS = 32_000;
+
+/**
+ * Repository-level agent instructions (`AGENTS.md` at the workspace root, or
+ * `.inflynx/AGENTS.md`), loaded once per session and injected into the system prompt.
+ * Returns the content plus which file it came from, or null when the workspace declares
+ * none — an absent file must be indistinguishable from "no instructions", not an empty
+ * prompt section. Size-capped: a 2 MB README pasted into every turn is exactly the
+ * context-pressure problem the eviction ladder exists for.
+ */
+export function loadProjectInstructions(
+  workspaceRoot: string
+): { content: string; source: string } | null {
+  const candidates = ["AGENTS.md", path.join(".inflynx", "AGENTS.md")];
+  for (const rel of candidates) {
+    try {
+      const abs = path.join(workspaceRoot, rel);
+      if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) continue;
+      let content = fs.readFileSync(abs, "utf-8").trim();
+      if (!content) continue;
+      if (content.length > MAX_PROJECT_INSTRUCTION_CHARS) {
+        content =
+          content.slice(0, MAX_PROJECT_INSTRUCTION_CHARS) +
+          `\n\n[… ${rel} truncated at ${MAX_PROJECT_INSTRUCTION_CHARS} characters]`;
+      }
+      return { content, source: rel };
+    } catch {
+      continue; // unreadable file counts as absent, same rule as the markers above
+    }
+  }
+  return null;
+}

@@ -5,6 +5,10 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  # Phase 45: weekly full run so detector regressions that surface slowly (corpus drift,
+  # dependency updates) are caught even when no one touches the repo.
+  schedule:
+    - cron: "0 3 * * 1"
 
 jobs:
   test:
@@ -106,4 +110,35 @@ jobs:
         run: pnpm run build
       - name: Unit & Security Suites
         run: pnpm run test:unit
+
+  # Phase 45: the eval suites also run inside `pnpm test:unit` (they can fail the build);
+  # this dedicated job exists so the *numbers* — recall/precision per detector — are printed,
+  # archived as artifacts, and visible over time instead of collapsing into pass/fail.
+  evals:
+    name: Detector Eval Reports
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v3
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: "pnpm"
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run Detector & Property Evals
+        run: |
+          set -o pipefail
+          pnpm --filter inflynx-agent exec tsx ../../tests/evals/detector-eval.test.ts 2>&1 | tee eval-report-detector.txt
+          pnpm --filter inflynx-agent exec tsx ../../tests/evals/bug-eval.test.ts 2>&1 | tee eval-report-bug.txt
+      - name: Upload Eval Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-reports
+          path: eval-report-*.txt
+          retention-days: 90
 

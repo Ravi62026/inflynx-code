@@ -73,6 +73,81 @@ export function renderTerminalMarkdown(content: string): string {
   }
 }
 
+/**
+ * Incremental markdown rendering for streaming model output.
+ *
+ * Rendering every delta would repaint the screen; rendering only at the end loses the
+ * streaming feel. This splits the stream at markdown *block boundaries* (blank lines),
+ * rendering each completed block as it closes. An unclosed code fence holds its block
+ * until the fence closes, so a fenced snippet is never rendered as two broken halves.
+ * `render` is injectable so the caller can sanitize untrusted source *before* it is
+ * turned into terminal output — sanitizing after rendering would strip the ANSI codes
+ * the renderer itself adds.
+ */
+export function createMarkdownStreamRenderer(options: {
+  write: (chunk: string) => void;
+  render?: (block: string) => string;
+}): { push(delta: string): void; end(): void } {
+  const render = options.render ?? renderTerminalMarkdown;
+  let buffer = "";
+
+  const fenceLineRe = /^[ \t]*(?:```|~~~)/;
+
+  /**
+   * First blank-line boundary that lies OUTSIDE any code fence, or -1. Fence state is
+   * walked per line from the buffer start, so a blank line *inside* a fenced snippet
+   // is never a split point — the fence (however many paragraphs it spans) stays one block.
+   */
+  const findSafeBoundary = (buf: string): number => {
+    let fence = false;
+    let offset = 0;
+    const lines = buf.split("\n");
+    // The final element may be an incomplete line (no trailing \n yet) — never a boundary.
+    for (let i = 0; i < lines.length - 1; i++) {
+      const line = lines[i];
+      const lineLen = line.length + 1;
+      if (fenceLineRe.test(line)) fence = !fence;
+      if (!fence && lines[i + 1] === "" && i + 2 <= lines.length - 1) {
+        return offset + lineLen + lines[i + 1].length + 1;
+      }
+      offset += lineLen;
+    }
+    return -1;
+  };
+
+  const emit = (block: string) => {
+    if (!block.trim()) return;
+    try {
+      options.write(render(block) + "\n\n");
+    } catch {
+      options.write(block + "\n\n");
+    }
+  };
+
+  const flush = (final = false) => {
+    for (;;) {
+      const boundary = findSafeBoundary(buffer);
+      if (boundary === -1) break;
+      emit(buffer.slice(0, boundary));
+      buffer = buffer.slice(boundary);
+    }
+    if (final && buffer.trim()) {
+      emit(buffer);
+      buffer = "";
+    }
+  };
+
+  return {
+    push(delta: string) {
+      buffer += delta;
+      flush();
+    },
+    end() {
+      flush(true);
+    },
+  };
+}
+
 export function displayWelcomeBanner(model: string, provider: string, cwd: string): void {
   const shortCwd = cwd.length > 38 ? "..." + cwd.slice(-35) : cwd;
 

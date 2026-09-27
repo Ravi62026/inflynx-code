@@ -307,6 +307,13 @@ export interface ToolExecuteResult {
    * and this package's `plan-tool.ts` imports it from there.
    */
   plan?: import("@inflynx/protocol").PlanSpec;
+  /**
+   * Images the tool result carries (e.g. `read_file` on a .png — `ToolResultImage`).
+   * `executeTool` copies these onto the `ToolResult` it returns; the orchestrator
+   * delivers them as a follow-up user turn because providers refuse images inside
+   * tool_result / function roles.
+   */
+  images?: ToolResultImage[];
 }
 
 export interface ToolResult {
@@ -344,6 +351,22 @@ export interface ToolResult {
    * the protocol and emitted by nothing since the event list existed.
    */
   plan?: import("@inflynx/protocol").PlanSpec;
+  /**
+   * Images this tool result carries (e.g. `read_file` on a .png). Structural twin of the
+   * gateway's `MessageImage`: tool-runtime deliberately does not depend on model-gateway,
+   * so the shape is fixed here and the orchestrator maps it onto the message. Never
+   * base64-in-`output` — that is the Phase 27 mistake the adapters had to un-scrape.
+   */
+  images?: ToolResultImage[];
+}
+
+/** A provider-neutral image carried on a tool result. See `ToolResult.images`. */
+export interface ToolResultImage {
+  /** e.g. `image/png`. Only types every provider accepts: png/jpeg/webp/gif. */
+  mediaType: string;
+  /** Raw base64, no `data:` prefix. */
+  dataBase64: string;
+  name?: string;
 }
 
 // ─── Core Tool Implementations ────────────────────────────────────────────────
@@ -376,6 +399,20 @@ function stripHtmlTags(html: string): string {
  * `start_line`/`end_line` is always honoured in full.
  */
 export const DEFAULT_READ_WINDOW_LINES = 1_000;
+
+/** Image extensions `read_file` can return visually — exactly the set every adapter renders. */
+export const READABLE_IMAGE_MEDIA_TYPES: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+};
+
+/** ~5 MB base64 is the strictest provider image limit (Anthropic); stay under it. */
+export const MAX_READABLE_IMAGE_BYTES = 4_000_000;
+
+const IMAGE_MEDIA_TYPES = READABLE_IMAGE_MEDIA_TYPES;
 
 /**
  * Shell timeouts. The previous default of 30 s made `pnpm install`, a real build and
@@ -534,7 +571,38 @@ export const CORE_TOOLS: ToolDefinition[] = [
         throw new Error(`File too large (${(stat.size / 1024).toFixed(0)} KB). Use search_files to locate specific sections.`);
       }
 
-      const content = fs.readFileSync(absPath, "utf-8");
+      // Images are returned as structured image parts, not base64-in-text (Phase 27's
+      // lesson: a data-URL in prose is unreadable to three of four adapters). The
+      // orchestrator attaches them to a follow-up user message so every provider sees a
+      // native image block. Cap: ~5 MB base64 is the strictest provider limit; stay under.
+      const mediaType = IMAGE_MEDIA_TYPES[path.extname(absPath).toLowerCase()];
+      if (mediaType) {
+        if (stat.size > MAX_READABLE_IMAGE_BYTES) {
+          throw new Error(
+            `Image too large to read (${(stat.size / 1_048_576).toFixed(1)} MB; limit is ` +
+            `${(MAX_READABLE_IMAGE_BYTES / 1_048_576).toFixed(0)} MB). Resize or crop it first.`
+          );
+        }
+        const buf = fs.readFileSync(absPath);
+        return {
+          output:
+            `Image loaded: ${filePath} (${mediaType}, ${(stat.size / 1024).toFixed(0)} KB). ` +
+            `The image itself is attached to this result — work from what you see, not from the filename.`,
+          images: [{ mediaType, dataBase64: buf.toString("base64"), name: path.basename(absPath) }],
+        };
+      }
+
+      const buf = fs.readFileSync(absPath);
+      // Binary honesty: a NUL in the first 8 KB (git's rule) means UTF-8 decoding would
+      // hand the model mojibake and invite it to "edit" bytes it never understood.
+      if (buf.subarray(0, 8000).includes(0)) {
+        return (
+          `[binary file: ${path.basename(absPath)} — ${(stat.size / 1024).toFixed(0)} KB. Binary ` +
+          `contents are not displayed. If this is an image, only .png/.jpg/.jpeg/.webp/.gif can ` +
+          `be read visually; otherwise use a dedicated tool for this file type.]`
+        );
+      }
+      const content = buf.toString("utf-8");
       const lines = content.split("\n");
       const start = (start_line ?? 1) - 1;
       // A default window instead of "the whole file". `read_file` used to admit up
@@ -1616,6 +1684,9 @@ export async function executeTool(
       // Structured payloads survive to the caller deliberately. The alternative is every
       // consumer parsing `output`, which is written for the model and gets truncated.
       ...(typeof executed === "object" && executed.plan ? { plan: executed.plan } : {}),
+      ...(typeof executed === "object" && Array.isArray(executed.images) && executed.images.length
+        ? { images: executed.images }
+        : {}),
     };
   } catch (err: any) {
     return {

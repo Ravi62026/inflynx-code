@@ -64,7 +64,7 @@ export interface InflynxConfig {
   baseURL?: string;
 }
 
-export { findWorkspaceRoot } from "./workspace-root.js";
+export { findWorkspaceRoot, loadProjectInstructions } from "./workspace-root.js";
 
 export function loadEnv(startDir: string = process.cwd()): void {
   const rootDir = findWorkspaceRoot(startDir);

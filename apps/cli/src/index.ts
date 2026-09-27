@@ -6,6 +6,7 @@
 
 import fs from "fs";
 import path from "path";
+import { createRequire } from "module";
 import { select, input, password, search, confirm } from "@inquirer/prompts";
 import {
   createCredentialProfile,
@@ -24,13 +25,19 @@ import {
   type ProviderInfo,
   type ReasoningEffort,
   findWorkspaceRoot,
+  loadProjectInstructions,
   sanitizeForTerminal,
   getProjectMcpConfigPaths,
   listTrustedMcpServers,
   revokeMcpServer,
   trustMcpServer,
 } from "@inflynx/config";
-import { ToolRegistry, CORE_TOOLS } from "@inflynx/tool-runtime";
+import {
+  ToolRegistry,
+  CORE_TOOLS,
+  MAX_READABLE_IMAGE_BYTES,
+  READABLE_IMAGE_MEDIA_TYPES,
+} from "@inflynx/tool-runtime";
 import {
   type AgentMode,
   type AgentBudgetLevel,
@@ -54,6 +61,7 @@ import {
   CommandPolicy,
   getShellAuditPath,
   getUserShellRulesPath,
+  isSensitiveToRead,
   readShellAudit,
   resolvePreviewPath,
   reviewShellCommand,
@@ -76,6 +84,8 @@ import {
   formatPrompt,
   askUserPrompt,
   renderColorDiff,
+  renderTerminalMarkdown,
+  createMarkdownStreamRenderer,
   colors,
 } from "@inflynx/ui-components";
 
@@ -110,6 +120,7 @@ const SLASH_COMMANDS = [
   { name: "/skills",       value: "/skills",       description: "List & view discovered agent skills (.inflynx/skills)" },
   { name: "/create-skill", value: "/create-skill", description: "Interactively create a new reusable agent skill" },
   { name: "/index",        value: "/index",        description: "View workspace index summary & relevant files" },
+  { name: "/attach",       value: "/attach",       description: "Attach an image or text file to the NEXT prompt: /attach <path> (images become visible to the model)" },
   { name: "/clear",        value: "/clear",        description: "Clear terminal screen & conversation" },
   { name: "/help",         value: "/help",         description: "Show all available commands" },
   { name: "/exit",         value: "/exit",         description: "Exit Inflynx Code CLI agent" },
@@ -255,7 +266,87 @@ async function selectAllModelsDropdown(currentModel: string, currentProviderId: 
 
 // ─── Main REPL ────────────────────────────────────────────────────────────────
 
+/** CLI version for `--version`. Read via createRequire because this file is ESM. */
+const CLI_VERSION = (createRequire(import.meta.url)("../package.json") as { version?: string }).version ?? "0.0.0";
+
+interface HeadlessArgs {
+  prompt: string | null;
+  images: string[];
+  help: boolean;
+  version: boolean;
+  error?: string;
+}
+
+function parseHeadlessArgs(argv: string[]): HeadlessArgs {
+  const out: HeadlessArgs = { prompt: null, images: [], help: false, version: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "-p" || a === "--prompt") {
+      out.prompt = argv[++i] ?? "";
+      if (out.prompt === undefined) out.prompt = "";
+    } else if (a.startsWith("--prompt=")) {
+      out.prompt = a.slice("--prompt=".length);
+    } else if (a === "--image") {
+      const p = argv[++i];
+      if (!p) return { ...out, error: "--image requires a path" };
+      out.images.push(p);
+    } else if (a === "--image=") {
+      return { ...out, error: "--image requires a path" };
+    } else if (a.startsWith("--image=")) {
+      out.images.push(a.slice("--image=".length));
+    } else if (a === "-h" || a === "--help") {
+      out.help = true;
+    } else if (a === "-v" || a === "--version") {
+      out.version = true;
+    } else if (a === "-y" || a === "--yes") {
+      // Accepted for scripting familiarity; auto-approval stays governed by
+      // INFLYNX_AUTO_APPROVE / shell policy, not by a CLI flag (Phase 2 posture).
+    } else if (out.prompt === null) {
+      out.prompt = a;
+    } else {
+      return { ...out, error: `unexpected argument: ${a}` };
+    }
+  }
+  return out;
+}
+
+function printCliHelp(): void {
+  console.log(`Inflynx Code CLI (inflynx-agent v${CLI_VERSION})
+
+Usage: inflynx [options] [prompt]
+
+Interactive (default, with a TTY): starts the REPL. Every command is a slash command — /help.
+
+One-shot / headless:
+  -p, --prompt <text>   Run a single turn, print it, exit (0 completed / 1 failed)
+  --image <path>        Attach an image to the one-shot prompt (repeatable)
+  -h, --help            Show this help
+  -v, --version         Show version
+
+Piped stdin becomes part of the prompt:
+  cat error.log | inflynx "explain this failure"
+  git diff | inflynx -p "review this diff"`);
+}
+
+function readStdinOnce(): Promise<string> {
+  return new Promise((resolve) => {
+    if (process.stdin.isTTY) return resolve("");
+    let data = "";
+    process.stdin.setEncoding("utf-8");
+    process.stdin.on("data", (c) => (data += c));
+    process.stdin.on("end", () => resolve(data));
+    process.stdin.on("error", () => resolve(data));
+  });
+}
+
 async function main() {
+  // Fast exits before any setup: --help / --version / argument errors must not
+  // require a workspace, a keychain read, or a network probe.
+  const headless = parseHeadlessArgs(process.argv.slice(2));
+  if (headless.help) { printCliHelp(); return; }
+  if (headless.version) { console.log(`inflynx-agent v${CLI_VERSION}`); return; }
+  if (headless.error) { console.error(`inflynx: ${headless.error} (see --help)`); process.exitCode = 2; return; }
+
   loadEnv();
 
   // Find true monorepo workspace root. This is now the ONLY root: it is passed to
@@ -328,7 +419,14 @@ async function main() {
       }
     }
 
-    return [modePrompt, skillsBlock, planBlock, debugBlock, `\nCurrent workspace: ${workspaceRoot}`].filter(Boolean).join("");
+    // Repository-level instructions (AGENTS.md / .inflynx/AGENTS.md). Loaded once per
+    // prompt build so edits land next turn; capped upstream at 32k chars.
+    const projectInstructions = loadProjectInstructions(workspaceRoot);
+    const instructionsBlock = projectInstructions
+      ? `\n\nPROJECT INSTRUCTIONS (from ${projectInstructions.source}) — conventions the user wrote for you. Follow them unless they conflict with the safety rules in this prompt:\n${projectInstructions.content}`
+      : "";
+
+    return [modePrompt, skillsBlock, planBlock, debugBlock, instructionsBlock, `\nCurrent workspace: ${workspaceRoot}`].filter(Boolean).join("");
   }
 
   // Determine active provider
@@ -365,7 +463,10 @@ async function main() {
     ? envBudget
     : (activeReasoningEffort === "high" || activeReasoningEffort === "xhigh" || activeReasoningEffort === "max" ? "high" : "medium");
 
-  displayWelcomeBanner(activeModel, activeProvider.id, workspaceRoot);
+  // Headless output must stay pipe-clean: no banner, no interactive-only chrome.
+  if (headless.prompt === null && headless.images.length === 0) {
+    displayWelcomeBanner(activeModel, activeProvider.id, workspaceRoot);
+  }
   const effortBadge = activeReasoningEffort !== "none"
     ? `${colors.brightCyan}${activeReasoningEffort}${colors.reset}`
     : `${colors.dim}off${colors.reset}`;
@@ -557,10 +658,16 @@ async function main() {
     }
   });
 
+  // Model text streams as markdown. Rendering every delta would repaint the screen;
+  // rendering only at the end loses the streaming feel — so blocks render as they close
+  // (see createMarkdownStreamRenderer). The untrusted source is sanitized *before*
+  // rendering; sanitizing after would strip the ANSI codes the renderer adds.
+  const markdownStream = createMarkdownStreamRenderer({
+    write: (chunk) => process.stdout.write(chunk),
+    render: (block) => renderTerminalMarkdown(sanitizeForTerminal(block)),
+  });
   eventBus.on<{ text: string }>("model.text_delta", (evt) => {
-    // The model's own text is untrusted too: it is a transcription of remote content and
-    // can echo a sequence back that it read out of a file.
-    process.stdout.write(sanitizeForTerminal(evt.payload.text));
+    markdownStream.push(evt.payload.text);
   });
 
   eventBus.on<{ thought: string }>("model.thought_delta", (evt) => {
@@ -720,6 +827,85 @@ async function main() {
     activeCredentialProfile = profile;
   };
 
+  // ─── One-shot / headless turn ────────────────────────────────────────────────
+  // `inflynx -p "..."` (plus optional --image and piped stdin) runs a single turn and
+  // exits — the mode CI, scripts and git hooks drive the agent through. The exit code
+  // is the turn's outcome so scripts can branch on it.
+  if (headless.prompt !== null || headless.images.length > 0) {
+    const piped = await readStdinOnce();
+    let headlessPromptText = headless.prompt ?? "";
+    if (piped.trim()) headlessPromptText = headlessPromptText ? `${headlessPromptText}\n\n${piped}` : piped;
+    headlessPromptText = headlessPromptText.trim();
+    if (!headlessPromptText) {
+      console.error("inflynx: no prompt given (-p/--prompt, a positional argument, or piped stdin). See --help.");
+      process.exitCode = 2;
+      return;
+    }
+
+    const headlessImages: Array<{ mediaType: string; dataBase64: string; name?: string }> = [];
+    for (const imgPath of headless.images) {
+      const rawImg = path.isAbsolute(imgPath) ? imgPath : path.join(workspaceRoot, imgPath);
+      let absImg: string;
+      try {
+        absImg = orchestrator.getPathGuard().validateAndResolve(rawImg);
+      } catch (err: any) {
+        console.error(`inflynx: cannot attach ${imgPath}: ${err?.message || String(err)}`);
+        process.exitCode = 2;
+        return;
+      }
+      const verdict = isSensitiveToRead(absImg, workspaceRoot);
+      if (verdict.sensitive) {
+        console.error(`inflynx: refusing to attach ${path.basename(absImg)} — sensitive path (${verdict.rule ?? "secret"}).`);
+        process.exitCode = 2;
+        return;
+      }
+      const media = READABLE_IMAGE_MEDIA_TYPES[path.extname(absImg).toLowerCase()];
+      if (!media) {
+        console.error(`inflynx: --image needs .png/.jpg/.jpeg/.webp/.gif, got ${path.extname(absImg) || "(no extension)"}`);
+        process.exitCode = 2;
+        return;
+      }
+      const st = fs.statSync(absImg);
+      if (st.size > MAX_READABLE_IMAGE_BYTES) {
+        console.error(`inflynx: image too large (${(st.size / 1_048_576).toFixed(1)} MB; limit ${(MAX_READABLE_IMAGE_BYTES / 1_048_576).toFixed(0)} MB).`);
+        process.exitCode = 2;
+        return;
+      }
+      headlessImages.push({ mediaType: media, dataBase64: fs.readFileSync(absImg).toString("base64"), name: path.basename(absImg) });
+    }
+
+    let headlessResult: Awaited<ReturnType<AgentOrchestrator["runTurn"]>> | undefined;
+    try {
+      headlessResult = await orchestrator.runTurn(headlessPromptText, undefined, headlessImages.length ? headlessImages : undefined);
+    } catch (err: any) {
+      console.error(`inflynx: turn error: ${err?.message || String(err)}`);
+    } finally {
+      markdownStream.end();
+    }
+    const headGate = headlessResult?.verification;
+    if (headGate) {
+      console.error(
+        `[verification: ${headGate.outcome} · ${headGate.checksRun} check(s) · ${headGate.sourceFilesChanged.length} file(s) changed` +
+        `${headGate.failedChecks.length ? ` · failing: ${headGate.failedChecks.join(", ")}` : ""}]`
+      );
+    }
+    if (!headlessResult?.isCompleted) {
+      console.error(`inflynx: turn did not complete. Session ${orchestrator.sessionId} retains the transcript for /resume.`);
+      process.exitCode = 1;
+    }
+    try {
+      orchestrator.shutdown({ abortTurn: false });
+    } catch { /* best-effort reap on exit */ }
+    return;
+  }
+
+  // ─── Pending attachments (/attach) ─────────────────────────────────────────
+  // Queued by /attach, consumed by exactly the next prompt, then cleared. Images ride
+  // the same structured channel user attachments use (Phase 27) — never base64-in-text.
+  const pendingImages: Array<{ mediaType: string; dataBase64: string; name?: string }> = [];
+  const pendingTextAttachments: Array<{ name: string; content: string }> = [];
+  const MAX_ATTACH_TEXT_BYTES = 200_000;
+
   // ─── REPL Loop ──────────────────────────────────────────────────────────────
   while (true) {
     // Mode-colored prompt badge
@@ -768,6 +954,64 @@ async function main() {
       const parts = inputStr.slice(1).trim().split(/\s+/);
       const cmd = parts[0]?.toLowerCase();
       const arg = parts[1];
+
+      if (cmd === "attach") {
+        const target = parts.slice(1).join(" ").trim().replace(/^["']+|["']+$/g, "");
+        if (!target) {
+          console.log(
+            `${colors.gray}Usage: /attach <path> — .png/.jpg/.jpeg/.webp/.gif become visible to the model; ` +
+            `other files ride along as content (≤ ${(MAX_ATTACH_TEXT_BYTES / 1024).toFixed(0)} KB).${colors.reset}\n`
+          );
+          continue;
+        }
+        const rawAttachPath = path.isAbsolute(target) ? target : path.join(workspaceRoot, target);
+        let attachAbs: string;
+        try {
+          attachAbs = orchestrator.getPathGuard().validateAndResolve(rawAttachPath);
+        } catch (err: any) {
+          console.log(`${colors.red}✗ cannot attach:${colors.reset} ${sanitizeForTerminal(err?.message || String(err))}\n`);
+          continue;
+        }
+        const sensitiveVerdict = isSensitiveToRead(attachAbs, workspaceRoot);
+        if (sensitiveVerdict.sensitive) {
+          // Same fence as @mentions (B7): an attachment must not be the side door around it.
+          console.log(
+            `${colors.red}✗ refused:${colors.reset} ${colors.bold}${sanitizeForTerminal(path.basename(attachAbs))}${colors.reset} ` +
+            `matches the sensitive-path fence (${sanitizeForTerminal(sensitiveVerdict.rule ?? "sensitive")}). Attaching it would smuggle it past the read fence.\n`
+          );
+          continue;
+        }
+        let attachStat: fs.Stats;
+        try {
+          attachStat = fs.statSync(attachAbs);
+          if (!attachStat.isFile()) throw new Error("not a regular file");
+        } catch (err: any) {
+          console.log(`${colors.red}✗ cannot attach:${colors.reset} ${sanitizeForTerminal(err?.message || String(err))}\n`);
+          continue;
+        }
+        const attachMedia = READABLE_IMAGE_MEDIA_TYPES[path.extname(attachAbs).toLowerCase()];
+        if (attachMedia) {
+          if (attachStat.size > MAX_READABLE_IMAGE_BYTES) {
+            console.log(`${colors.red}✗ too large:${colors.reset} ${(attachStat.size / 1_048_576).toFixed(1)} MB image (limit ${(MAX_READABLE_IMAGE_BYTES / 1_048_576).toFixed(0)} MB). Resize or crop it first.\n`);
+            continue;
+          }
+          pendingImages.push({
+            mediaType: attachMedia,
+            dataBase64: fs.readFileSync(attachAbs).toString("base64"),
+            name: path.basename(attachAbs),
+          });
+          console.log(`📎 ${colors.brightMagenta}${sanitizeForTerminal(path.basename(attachAbs))}${colors.reset} attached (${attachMedia}, ${(attachStat.size / 1024).toFixed(0)} KB) — the model will *see* it with your next prompt.`);
+        } else {
+          if (attachStat.size > MAX_ATTACH_TEXT_BYTES) {
+            console.log(`${colors.red}✗ too large:${colors.reset} text attachments cap at ${(MAX_ATTACH_TEXT_BYTES / 1024).toFixed(0)} KB. Use @${sanitizeForTerminal(target)} for windowed reads instead.\n`);
+            continue;
+          }
+          pendingTextAttachments.push({ name: path.basename(attachAbs), content: fs.readFileSync(attachAbs, "utf-8") });
+          console.log(`📎 ${colors.brightMagenta}${sanitizeForTerminal(path.basename(attachAbs))}${colors.reset} attached (text, ${(attachStat.size / 1024).toFixed(0)} KB) — its content rides with your next prompt.`);
+        }
+        console.log(`${colors.gray}pending: ${pendingImages.length} image(s), ${pendingTextAttachments.length} file(s)${colors.reset}\n`);
+        continue;
+      }
 
       if (cmd === "help") {
         console.log(`\n${colors.bold}Available slash commands:${colors.reset}`);
@@ -2084,6 +2328,17 @@ async function main() {
       attachedContext += (attachedContext ? "\n\n" : "") + `=== Relevant Active Skills ===\n${skillBlocks}`;
     }
 
+    // /attach queues ride with exactly the next prompt, then clear.
+    if (pendingTextAttachments.length > 0) {
+      const blocks = pendingTextAttachments
+        .map((p) => `=== Attached File: ${p.name} ===\n${p.content}`)
+        .join("\n\n");
+      attachedContext += (attachedContext ? "\n\n" : "") + blocks;
+      console.log(`${colors.brightMagenta}📎 Attached Files:${colors.reset} ${pendingTextAttachments.map((p) => p.name).join(", ")}`);
+      pendingTextAttachments.length = 0;
+    }
+    const turnImages = pendingImages.splice(0);
+
     // ─── Agentic Turn ────────────────────────────────────────────────────────────
     // AgentOrchestrator.runTurn() now owns the entire loop: streaming, mode-based
     // tool filtering, approval requests (via `approvalHandler`), guarded execution
@@ -2095,10 +2350,13 @@ async function main() {
     interruptRequested = false;
     let turnResult: Awaited<ReturnType<AgentOrchestrator["runTurn"]>> | undefined;
     try {
-      turnResult = await orchestrator.runTurn(inputStr, attachedContext || undefined);
+      turnResult = await orchestrator.runTurn(inputStr, attachedContext || undefined, turnImages.length ? turnImages : undefined);
     } catch (err: any) {
       console.error(`\n${colors.red}❌ Unexpected orchestrator error:${colors.reset} ${err?.message || String(err)}\n`);
     } finally {
+      // Flush any markdown tail still held by the block streamer (unclosed fence, a
+      // final paragraph with no trailing blank line) before status lines print.
+      markdownStream.end();
       turnInFlight = false;
     }
 
