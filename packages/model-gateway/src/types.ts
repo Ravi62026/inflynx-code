@@ -116,4 +116,9 @@ export interface ModelRequest {
   allowUnauthenticated?: boolean;
   allowLocalEndpoint?: boolean;
   customCapabilities?: CustomModelCapabilities;
+  /**
+   * Some strict OpenAI-compatible servers reject `stream_options` (finding G10). Set true on
+   * a BYOK profile that does, and the chat adapter omits it (losing only streamed usage).
+   */
+  strictStreamOptions?: boolean;
 }

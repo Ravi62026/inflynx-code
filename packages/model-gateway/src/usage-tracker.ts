@@ -48,14 +48,32 @@ export const PROVIDER_PRICING_TABLE: Record<string, ModelPricing> = {
 };
 
 /**
+ * Resolves pricing for a model id. G7 (real bug, was documented but unfixed): the old code did
+ * `PROVIDER_PRICING_TABLE[modelKey] || entries.find(([k]) => modelKey.includes(k))`, which broke
+ * two ways — (a) insertion order meant `"gpt-4o"` was found inside `"gpt-4o-mini-2025"` *before*
+ * the more specific key, charging the wrong (10x) rate; (b) `"default"` is a literal table key,
+ * so any id containing "default" (e.g. an openrouter alias) silently got the default price. Here
+ * an exact hit wins, otherwise the LONGEST substring key matches (most specific first), and the
+ * `default` row is only ever the terminal fallback, never a substring match.
+ */
+export function resolvePricing(model: string): ModelPricing {
+  const modelKey = model.toLowerCase();
+  const exact = PROVIDER_PRICING_TABLE[modelKey];
+  if (exact) return exact;
+  const candidates = Object.keys(PROVIDER_PRICING_TABLE)
+    .filter((k) => k !== "default")
+    .sort((a, b) => b.length - a.length); // longest / most specific key wins
+  for (const k of candidates) {
+    if (modelKey.includes(k)) return PROVIDER_PRICING_TABLE[k];
+  }
+  return PROVIDER_PRICING_TABLE.default;
+}
+
+/**
  * Calculates estimated USD cost for a token usage breakdown.
  */
 export function estimateTokenUsageCost(model: string, usage: TokenUsage): number {
-  const modelKey = model.toLowerCase();
-  const pricing =
-    PROVIDER_PRICING_TABLE[modelKey] ||
-    Object.entries(PROVIDER_PRICING_TABLE).find(([k]) => modelKey.includes(k))?.[1] ||
-    PROVIDER_PRICING_TABLE.default;
+  const pricing = resolvePricing(model);
 
   const promptCost = (usage.promptTokens / 1_000_000) * pricing.promptUsdPer1M;
   const completionCost = (usage.completionTokens / 1_000_000) * pricing.completionUsdPer1M;

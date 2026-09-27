@@ -38,25 +38,26 @@ postponed behind "auth is out of scope".
 
 | | | |
 |---|---|---|
-| **Phases landed** | **32 / 47** | 68% |
-| **Effort-weighted** | **86 / 137** eng-days | 63% |
+| **Phases landed** | **37 / 47** | 79% |
+| **Effort-weighted** | **100 / 137** eng-days | 73% |
 | **P0 (critical)** | **17 / 17** | **100% — nothing critical left** |
-| P1 | 12 / 19 | 63% — open: 34, 35, 36, 39, 40, 45, 46 |
+| P1 | 17 / 19 | 89% — open: 45*, 46 (*45 partial: harness+eval+loop-matrix landed) |
 | P2 | 3 / 11 | open: 19, 28*, 37, 38, 41, 42, 44, 47 (*Phase 28 fence + arg-validation landed; parallel read-only remains) |
-| Findings actually fixed | **≈ 96 / 188** | ~51% — §3 rows are still under-marked (see the bookkeeping note below); verify against §11 before re-implementing anything |
-| Tests | **41 / 41 suites** | baseline at audit time was 17. `grep -rhoE 'assert\.[a-zA-Z]+' tests/unit \| wc -l` → 1,247 *assertion statements* (a size proxy — loop bodies counted once, hand-rolled `if (…) throw` suites undercounted; not a pass criterion) |
+| Findings actually fixed | **≈ 103 / 188** | ~55% — §3 rows are still under-marked (see the bookkeeping note below); verify against §11 before re-implementing anything |
+| Tests | **48 / 48 suites** | baseline at audit time was 17. Eval scoring lives in `tests/evals/` and reports recall/precision numbers. |
 | Build / typecheck | 0 / 0 | `pnpm build`, `pnpm typecheck` |
 
-**Landed:** Phases 1–18, 20–24, 26, 27, 29–33, 43 (plus the fence + arg-validation of Phase 28),
-MCP hygiene B5/B6/B9. Full per-phase detail — including the bug each phase's tests caught — is **§11**.
+**Landed:** Phases 1–18, 20–24, 26, 27, 29–36, 39, 40, 43 (plus the fence + arg-validation of
+Phase 28 and the harness/eval/loop-matrix of Phase 45), MCP hygiene B5/B6/B9. Full per-phase
+detail — including the bug each phase's tests caught — is **§11**.
 **✅ N5–N16 are fixed** (2026-09-27, see §11 for the same date). N5–N9 are the five findings the agent
 raised against itself; N10–N11 surfaced while writing Phase 24's tests and N12–N16 while writing Phase
 26's. Each is closed with a test that pins both directions — the false positive gone *and* the real
 control still biting.
 
-**Next, in order:** **45 → 46 → 34 → 19** (eval harness, release engineering, Anthropic adapter
-correctness, sub-agent isolation). The one deferred sub-item is **Phase 28's parallel read-only
-execution** — it needs a careful restructure of the turn loop's approval/budget/event ordering.
+**Next, in order:** **41 → 37 → 38 → 46 → 42 → 44 → 19 → 28** — failover split-brain (41),
+usage-cost truth + output-token policy (37/38), rate-limit fail-open/backoff (42), skills/plugins
+(44), release/CI (46), then sub-agent isolation (19) and Phase 28 parallel reads.
 
 **Known bookkeeping gap:** when a phase closed findings, the §3 rows were usually not updated. Two
 consequences: (a) §3's marked-closed count understates real progress badly (10 vs ~79); (b) do **not**
@@ -65,8 +66,8 @@ re-implement something because its row still says open — check §11 and the co
 Re-measure with:
 ```bash
 git log --oneline -1 && git status -sb | head -1
-pnpm build && pnpm typecheck && pnpm test:unit      # expect 41/41
-grep -cE '^\| P[0-9] \| ✅' docs/MISSING-FEATURES-AND-BUGS-BACKLOG.md   # landed phase rows (32)
+pnpm build && pnpm typecheck && pnpm test:unit      # expect 48/48
+grep -cE '^\| P[0-9] \| ✅' docs/MISSING-FEATURES-AND-BUGS-BACKLOG.md   # landed phase rows (37)
 grep -E '^\| P[0-9] \| ✅' docs/MISSING-FEATURES-AND-BUGS-BACKLOG.md \
   | awk -F'|' '{gsub(/ /,"",$4); s+=$4} END {print s "/137 eng-days"}'   # effort, summed from the rows
 ```
@@ -217,7 +218,7 @@ Severity: **P0** = blocker, unsafe or broken today. **P1** = significant, blocks
 | C6 | P0 | Aborting mid-tool-loop (`:545-549`) breaks out leaving assistant `tool_calls` with no matching tool responses; `ensureHistoryIntegrity()` runs only in `catch` and `resumeSession` → next request 400s | 6 |
 | C7 | P0 | State machine is permanently dead after turn 1: `completed → classifying` is illegal (`StateMachine.ts:29`) and `runTurn` guards every transition with `canTransitionTo` and silently skips. Probed: `can->classifying=false can->exploring=false can->implementing=false` | 7 |
 | C8 | P1 | `AgentState` is declared **twice with different members** (`agent-core/src/index.ts:98-109` vs `StateMachine.ts:3-16`); the orchestrator exports the second, the barrel file exports the first | 7 |
-| C9 | P1 | `session.completed` is in the event union but never emitted; `sessionStore` never updates `status` (the interface has no such method) → every session is `"active"` forever | 22, 33 |
+| C9 | P1 | 🟡 `session.completed` is in the event union but never emitted; `sessionStore` never updates `status` (the interface has no such method) → every session is `"active"` forever. **Fixed (Phase 39):** the store now has `updateSessionStatus`/`archiveSession`/`deleteSession` and the orchestrator persists `failed` on the two `session.failed` paths; **open:** emitting `completed`/`cancelled` needs a defined session-end (sessions are long-lived across turns), so it stays for the CLI/shutdown work | 22, 33, 39 |
 | C10 | P1 | Tool calls execute strictly sequentially (`for (const tc of pendingToolCalls)`) — no parallel read-only execution, so N file reads cost N loop iterations | 28 |
 | C11 | P1 | `switchModel()` refuses to carry history across providers (correct, deliberate) but there is no in-provider context migration, so `/model` silently loses the conversation for the user | 34 |
 | C12 | P1 | `abort()` immediately re-creates the `AbortController` (`ExecutionContext.ts:86-89`), so in-flight work is not really cancelled; a test currently asserts this behaviour as correct (`session-recovery.test.ts:94-98`) | 6 |
@@ -278,28 +279,28 @@ Severity: **P0** = blocker, unsafe or broken today. **P1** = significant, blocks
 | G4 | P1 | Anthropic `is_error` inferred from `content.startsWith("Error:")` — gateway denials ("Security Policy Violation…", "Tool execution was denied…") are reported to the model as **successes** | 30 |
 | G5 | P2 | Anthropic `thinking:{type:"adaptive"}` + `output_config:{effort}` are asserted-but-unverified API surface; the `thinkingBudget` auto-bump branch is unreachable when `reasoningEffort` is set (the else-if chain wins first) | 30 |
 | G6 | P1 | openai-responses: when a message has both text and `tool_calls`, **the text is discarded** (`:39-55`); no `store:false` (provider-side retention of your prompts); reasoning items replayed without requesting `encrypted_content` | 30 |
-| G7 | P1 | `estimateTokenUsageCost` matches by `modelKey.includes(k)` over an object in insertion order, and `"default"` is a *literal key* → any model whose id contains "default" gets the default price; keys like `gpt-4o` also prefix-match `gpt-4o-mini` variants | 31 |
-| G8 | P2 | Reasoning tokens billed **in addition to** completion tokens although they are a subset (`usage-tracker:62-63`) → cost inflated on every thinking model | 31 |
+| G7 | P1 | ✅ **FIXED (Phase 37)** — pricing resolution used `modelKey.includes(k)` in table-insertion order, so `"gpt-4o"` matched inside `"gpt-4o-mini-…"` before the specific key (10x overcharge), and `"default"` being a literal key caught any id containing "default". `resolvePricing` now: exact hit wins, else LONGEST substring key, `default` only as terminal fallback. `phase37-usage-cost` asserts mini beats the gpt-4o prefix | 37 |
+| G8 | P2 | 🟡 **PARTLY (Phase 37)** — the *unpriced* half is fixed: a model call that returns no usage block is now counted as `unpricedTurns` in `BudgetManager` rather than recorded as a silent 0-token/$0 success. **Still open:** reasoning tokens are added on top of completion tokens although for some providers they are a subset → possible inflation; needs a provider-aware decision on which convention each API uses | 37 |
 | G9 | P2 | `sleep()` adds an `"abort"` listener per retry without removal on the success path (`utils.ts:145-157`); no jitter; retry-after capped at 15 s | 30 |
 | G10 | P2 | `stream_options:{include_usage:true}` always sent — rejected by some OpenAI-compatible servers → whole-session 400 | 30 |
 | G11 | P3 | `providerError`/`networkError` wrap bodies but adapter error shapes differ; `openai-responses` has no `networkError` wrapper (raw fetch errors surface unredacted and unhelpful) | 9 |
-| G12 | P3 | `PROVIDER_PRICING_TABLE` and `MODEL_CATALOG` disagree (pricing lists `gemini-2.5-pro`, `o3-mini`, `claude-3-opus` which the catalog doesn't offer) | 31 |
+| G12 | P3 | 🟡 **PARTLY (Phase 37)** — cache metrics are no longer computed-then-discarded: `BudgetManager.recordUsage` now accumulates `cachedInputTokens`/`cacheCreationInputTokens` into `BudgetState` (G12 data path), so a surface *can* show the real saving. **Still open:** the `PROVIDER_PRICING_TABLE`/`MODEL_CATALOG` list divergence, and the webview actually rendering cached/unpriced (needs the extension surface) | 37 |
 
 ### H. Persistence & runtime infrastructure
 
 | # | Sev | Finding | Phase |
 |---|---|---|---|
 | H1 | P0 | Two workspace roots: gateway validates against the per-session root, tools re-resolve against `process.env.INFLYNX_WORKSPACE_ROOT \|\| process.cwd()` — **only the CLI ever sets it**. Legit paths get rejected; divergence is a bypass | 5 |
-| H2 | P1 | Message ordering is `ORDER BY timestamp ASC` on a BIGINT millisecond + ids from `Date.now()+Math.random().slice(2,7)` → same-ms assistant/tool rows can hydrate out of order (→ provider 400) and can collide on PK | 33 |
-| H3 | P1 | `LocalJsonSessionStore` re-serializes the **entire** store on every write and swallows failures with `console.error`. Your local file is already **4.7 MB / 159 sessions**, so each of ~5 persistence calls per turn rewrites 4.7 MB synchronously | 34 |
-| H4 | P1 | `ResilientSessionStore` latches `isFallback = true` permanently on one `ECONNREFUSED` → permanent split-brain (Postgres holds the prefix, JSON holds the rest; resume reads the wrong one) | 34 |
+| H2 | P1 | ✅ **FIXED (Phase 39)** — Message ordering was `ORDER BY timestamp ASC` on a BIGINT millisecond + ids from `Date.now()+Math.random().slice(2,7)` → same-ms assistant/tool rows could hydrate out of order (→ provider 400) and could collide on PK. Now `ORDER BY seq` (BIGSERIAL) and `crypto.randomUUID` ids | 33, 39 |
+| H3 | P1 | ✅ **FIXED (Phase 40)** — `LocalJsonSessionStore` re-serialized the **entire** store on every write and swallowed failures with `console.error`. It is now an append-only journal per session (a 100-message turn writes ~130 KB, not MBs per message), and a failed write **throws** instead of a silent in-memory lie. A torn final line from a crash is skipped on read, not fatal | 34, 40 |
+| H4 | P1 | ✅ **FIXED (Phase 40)** — `ResilientSessionStore` latched `isFallback = true` permanently on one `ECONNREFUSED` → permanent split-brain. Failover is now temporary: the primary is retried after a window and a success heals it; a non-connection error surfaces instead of being misread as "Postgres down" | 34, 40 |
 | H5 | P1 | `checkRateLimit` fails **open** without Redis (so all "protection" is off by default) and `INCR`+`EXPIRE` is non-atomic → a crash leaves a TTL-less key = **permanent lockout** | 42 |
 | H6 | P1 | Model rate-limit exhaustion **fails the session** instead of backoff-and-wait (`AgentOrchestrator.ts:424-434`) | 42 |
-| H7 | P2 | `ensureMigrated()` memoizes a rejected promise → one migration failure poisons the store for the process lifetime | 33 |
-| H8 | P2 | No `deleteSession` / `updateStatus` / retention / archive in the store interface → unbounded growth and no pruning; `.inflynx/session_store.json` proves the accumulation | 33 |
-| H9 | P2 | `SELECT *` in hydration + `mapSessionRow` → schema coupling; no migration down path; `provider VARCHAR(32)` / `model VARCHAR(64)` may truncate long BYOK ids | 33 |
+| H7 | P2 | ✅ **FIXED (Phase 39)** — `ensureMigrated()` memoized a rejected promise → one migration failure (e.g. the Postgres container still warming up) poisoned the store for the process lifetime. The cached promise is now cleared on rejection so the next call retries | 33, 39 |
+| H8 | P2 | 🟡 No `deleteSession` / `updateStatus` / retention / archive in the store interface → unbounded growth and no pruning; `.inflynx/session_store.json` proves the accumulation. **Fixed (Phase 39):** `updateSessionStatus`/`archiveSession`/`deleteSession` now exist on the interface + both stores; **open:** a retention TTL sweeper and a store compaction | 33, 39 |
+| H9 | P2 | ✅ **FIXED (Phase 39)** — `SELECT *` in hydration + `mapSessionRow` → schema coupling; no migration down path; `provider VARCHAR(32)` / `model VARCHAR(64)` may truncate long BYOK ids. Hydration now uses explicit column lists, and a migration widens provider/model/mode/effort to TEXT | 33, 39 |
 | H10 | P2 | `getRedisClient()` sets `retryStrategy: () => null` and caches the client forever: if Redis starts after the process, it is never used; a broken connection is never recovered (and `closeRedisClient` resets it to `undefined`, reopening the race) | 42 |
-| H11 | P3 | Server never calls `sessionStore.close()`; `handleShutdown` exits without draining active turns | 43 |
+| H11 | P3 | ✅ **FIXED (Phase 40)** — Server never calls `sessionStore.close()`; `handleShutdown` exits without draining active turns. Shutdown now releases the store (time-boxed so a wedged close cannot hang exit) and closes both primary + fallback | 43, 40 |
 
 ### I. MCP, skills, plugins
 
@@ -379,7 +380,7 @@ Severity: **P0** = blocker, unsafe or broken today. **P1** = significant, blocks
 | L19 | P2 | README: "WebSocket server", "sandboxed execution", "AST-aware editing", "semantic code symbol graphs", "Cost Router", "SQLite Session Persistence & Rollouts", "FS Watcher" | none exist | 46 |
 | L20 | P2 | `docs/PRODUCTION-GRADE-AGENT-MATURITY-PLAN.md` | describes deleted `apps/tui`; its §14 DoD is silently partly met and partly abandoned | 46 |
 | L21 | P3 | `apps/desktop/` | **0 files** | 47 |
-| L22 | P3 | `scripts/`, `tests/tool-contracts/` | empty directories | 38 |
+| L22 | P3 | 🟡 **PARTLY (Phase 38)** — `tests/tool-contracts/` no longer empty: a real drift-guard suite now validates every `CORE_TOOLS` schema + argument validation. `scripts/` remains empty (still open) | 38 |
 | L23 | P3 | `.kilo/worktrees/sincere-potato/` mirror of the whole repo | stray worktree in the working dir (untracked) | 47 |
 | L24 | P3 | Demo-mode "14 tools ready" | 8 | 40 |
 
@@ -796,9 +797,9 @@ Legend — **Pri**: P0 blocker / P1 significant / P2 quality / P3 polish. **Est*
 
 | Pri | Phase | Est | Dep | Goal |
 |---|---|---|---|---|
-| P1 | **34. Anthropic adapter correctness** | 3 | 12 | Proxy support, valid requests |
-| P1 | **35. Responses + Chat adapter correctness** | 3 | 12 | No lost text, no retained prompts |
-| P1 | **36. Gemini adapter correctness** | 2 | 12 | Header auth, merged parts |
+| P1 | ✅ **34. Anthropic adapter correctness** | 3 | 12 | Proxy support, valid requests |
+| P1 | ✅ **35. Responses + Chat adapter correctness** | 3 | 12 | No lost text, no retained prompts |
+| P1 | ✅ **36. Gemini adapter correctness** | 2 | 12 | Header auth, merged parts |
 | P2 | **37. Usage & cost truth** | 2 | 13 | Billable numbers you can trust |
 | P2 | **38. Output-token policy per model** | 2 | 12 | No truncated writes |
 
@@ -839,8 +840,8 @@ instead of `?? 4096`; expose `reasoning budget vs output budget` arithmetic in o
 
 | Pri | Phase | Est | Dep | Goal |
 |---|---|---|---|---|
-| P1 | **39. Store correctness (ids, order, lifecycle)** | 3 | 5 | No mis-ordered or colliding rows |
-| P1 | **40. LocalJson store: performance + honesty** | 3 | 39 | No 4.7 MB rewrites per message |
+| P1 | ✅ **39. Store correctness (ids, order, lifecycle)** | 3 | 5 | No mis-ordered or colliding rows |
+| P1 | ✅ **40. LocalJson store: performance + honesty** | 3 | 39 | No 4.7 MB rewrites per message |
 | P2 | **41. Failover / split-brain elimination** | 2 | 40 | One transcript per session |
 | P2 | **42. Rate limiting, caching, lifecycle hardening** | 3 | 2 | Atomic, backoff, bounded |
 
@@ -876,7 +877,7 @@ the claim.
 |---|---|---|---|---|
 | P0 | ✅ **43. MCP real transports + trust model** (client; server side open as M20) | 6 | 5, 28 | MCP stops being a mock and a leak |
 | P2 | **44. Skills, plugins, dead-code resolution** | 4 | 33 | Everything advertised exists, or is deleted |
-| P1 | **45. Test harness + eval corpus that can fail** | 6 | 8, 13 | CI proves agent behaviour, not vibes |
+| P1 | 🟡 **45. Test harness + eval corpus that can fail** | 6 | 8, 13 | harness + real eval + loop matrix landed; node:test migration & weekly multi-provider eval remain |
 | P1 | **46. Truth-in-advertising + release engineering** | 4 | 44 | Docs/CI/artifacts match reality |
 | P2 | **47. Product surface parity & polish** | 6 | 1, 9, 10 | CLI and VS Code agree |
 
@@ -2167,6 +2168,155 @@ session" needs a real API key and was **not run** here — what is verified is t
 cache-*eligible* (stable head + breakpoints) and that cache metrics, when a provider returns them,
 are parsed and costed correctly. CLI `/usage` does not yet break out cached tokens (cosmetic;
 cost is already right).
+
+### 🟡 Phase 45 — test harness + eval corpus that can fail (partial) (2026-09-27)
+
+The Done-when was two sharp things, and both are now true; several listed sub-parts are not.
+
+| Part | Status |
+|---|---|
+| **"the eval reports numbers, not `77`"** | ✅ `tests/evals/bug-eval.test.ts` was a tautology (add two findings, read them back, assert health `=== 77`). It is now a **property** test (score monotone in severity, `fixed` excluded, floored at 0, report counts derived) — no magic constant. A real detector eval `tests/evals/detector-eval.test.ts` scores **recall / precision / F1** against three ground-truth corpora the detector did not author (TS-diagnostics, patch-safety fake-fixes vs clean edits, shell deny-vs-not) with a 0.90 floor that fails CI on regression, and prints a table |
+| **shared harness** | ✅ `tests/helpers/agent-harness.ts` — the fetch stub (recording every outbound body), scripted provider replies, temp workspace + temp store, and `startHarness()` for a real `AgentOrchestrator`. The loop-coverage tests run on it, proving reuse; the older hand-rolled copies can migrate to it incrementally |
+| **loop coverage the matrix asked for** | ✅ `tests/unit/loop-matrix.test.ts`: multi-turn tool chain (both results in context, ordered) · deny-then-recover (file untouched, refusal surfaced — guards N10 from the *turn* side) · three read-only calls in one turn stay aligned to their results |
+| "fails if you disable compaction" | ✅ already true — `planning-context.test.ts` asserts `dropped === plan.messages.length && charsFreed > 0`, so a no-op compaction cannot pass; not duplicated here |
+| node:test migration of all suites | ⛔ not done — mechanical churn across 43 green suites for little functional gain; deferred |
+| per-provider request-shape snapshots · MCP poisoned-config test · weekly multi-provider eval (≥3 providers) · e2e temp-dir enforcement | ⛔ remain — folded into Phase 46's CI work (they need live providers / a scheduler) |
+
+**Verified:** build 0 · typecheck 0 · `pnpm test:unit` **43/43**. The eval prints real numbers:
+```
+detector            expected  caught  flagged  recall  precision     F1
+ts-diagnostics            3       3        3     1.00       1.00  1.000
+patch-safety              6       6        6     1.00       1.00  1.000
+shell-deny                7       7        7     1.00       1.00  1.000
+```
+The corpora are not vacuous: each asserts `expected >= 3`, and the recall/precision floor fails if a
+detector is weakened.
+
+**Not claimed:** no live-model turns-to-green or cost eval (needs a provider key); the snapshot matrix
+and weekly CI job are not built. Phase 45 is deliberately left 🟡 rather than checked off.
+
+### ✅ Phases 34 / 35 / 36 — provider adapter correctness (2026-09-27)
+
+Each adapter had a wire-format bug that a recorded-request test now pins (no live key needed —
+the adapters build the exact body/URL and it is asserted before it would go out).
+
+| Phase | Fix | Recorded-request proof |
+|---|---|---|
+| **34 — Anthropic** (G5) | `thinking:{type:"adaptive"}` + `output_config` were **fabrications** — not in the Messages API, so every reasoning request was a 400. Now maps effort → real `{type:"enabled",budget_tokens}` clamped to `1024 ≤ b < max_tokens`, or `{type:"disabled"}`. Also: honour `baseURL` (proxy/BYOK); never emit `content:[]`; `is_error` from the real `ToolResult` (already present, now asserted) | `phase34-anthropic.test.ts` (5 suites): enabled/disabled shape + no `output_config`; empty assistant → not `[]`; denial reaches the model as `is_error:true`, success as `false`; four `baseURL` shapes resolve right; cache breakpoints intact |
+| **35 — Responses + Chat** (G6, G10) | An assistant turn's **prose was dropped** whenever it also had tool calls; added `store:false`, `include:["reasoning.encrypted_content"]`; the Responses API has no `finish_reason:tool_calls` so it always read `stop` (the loop never sent results back) — now normalised; `stream_options` made opt-out for strict servers via `strictStreamOptions` | `phase35-openai-adapters.test.ts` (4 suites): prose+call both in `input`; `store:false`+`include` on the wire; a function-call turn ends `tool_calls`; `stream_options` present by default, omitted when strict |
+| **36 — Gemini** (B14) | API key was in the **query string** (`?key=…`, into logs/history) → now `x-goog-api-key` header; `thinkingLevel:"none"` (invalid) → `{thinkingBudget:0}`; streamed text was one part per delta → merged to a single part (thought signatures kept); `functionResponse.name` resolved from the originating call | `phase36-gemini.test.ts` (4 suites): key in header not URL; none→budget 0, high→level; multi-chunk text merges to one part while deltas still stream; functionResponse named correctly |
+
+All three registered in the master suite; **46/46** green, build 0, typecheck 0. `ModelRequest` gained
+an optional `strictStreamOptions` field; the OpenAI-chat/Responses/Gemini/Anthropic adapters now
+normalise cache + usage consistently with Phase 18.
+
+**Not claimed:** `thinkingLevel` vs `thinkingBudget` for non-`none` efforts, and Anthropic's exact
+budget defaults, are best-effort against the documented API and not verified against a live key.
+
+### ✅ Phase 39 — store correctness (ids, order, lifecycle) (2026-09-27)
+
+Message/tool ids were `prefix_${Date.now()}_${5 random base36}` and hydration sorted by a
+millisecond `timestamp` — so a fast turn (200 writes in one ms) both **collided ids** and had an
+**undefined order**, which a resumed session then replays to the model scrambled.
+
+| Part | What landed |
+|---|---|
+| Collision-free ids | `generateRecordId()` → `prefix_<uuid>` (still ≤64 chars for the column); message/tool-exec ids and the session-id suffix use it |
+| Total order (Postgres) | migration `0004_seq_and_text_columns` adds `seq BIGSERIAL` + an index; hydration is `ORDER BY seq ASC`, and `seq` is surfaced on `StoredMessage` — insertion order survives regardless of timestamp resolution |
+| Non-poisoning migrations (H7) | `ensureMigrated()` no longer latches a rejected promise: a transient failure (container warming up) clears the cache so the next call retries instead of deadlocking the store for the process's life |
+| Explicit columns (H9) | Hydration lists columns instead of `SELECT *`; provider/model/active_mode/effort_level widened VARCHAR→TEXT (a long BYOK model id was silently truncated) |
+| Lifecycle (H8/C9) | `updateSessionStatus`/`archiveSession`/`deleteSession` added to the `SessionStore` interface + both backends (JSON delete drops the child maps; Postgres relies on `ON DELETE CASCADE`); `listSessions` hides archived; the orchestrator persists `failed` on both `session.failed` paths |
+
+**Done when — verified:** `tests/unit/phase39-store.test.ts` (5 suites): 200 same-millisecond JSON
+writes → 200 unique ids and exact insertion order after hydration; status transitions persist;
+archive hides from the default list; delete removes and is idempotent; `generateRecordId` is
+shape-checked and 5000-unique. A **Postgres seq-ordering** test runs only when `DATABASE_URL`
+reaches a live DB (CI has one) and skips cleanly otherwise — it does not go red without Docker.
+build 0 · typecheck 0 · **47/47 suites**.
+
+**Not claimed:** retention TTL / store compaction (H8's other half) and emitting `completed`/
+`cancelled` (C9's other half) — both need a defined session-end and a sweeper, left open. `Resilient
+SessionStore`'s permanent-fallback latch (H4) and `close()` on shutdown (H11) are Phase 40/41, not here.
+
+### ✅ Phase 40 — LocalJson store: performance + honesty (2026-09-27)
+
+The offline store re-serialized its single 4.7 MB / 159-session file after *every* message and
+`console.error`-and-continued on write failure (H3), while `ResilientSessionStore` latched into
+fallback permanently on one dropped connection (H4). A crashed server also never released the store
+(H11).
+
+| Part | What landed |
+|---|---|
+| Append-only journal | `.inflynx/sessions/<id>.jsonl`, one record per line (`session`/`message`/`tool`/`telemetry`). A message write appends a line — ~130 KB for a 100-message turn instead of megabytes-per-message rewrites. Last `session` line wins for metadata; messages hydrate in file order (== insertion order) |
+| Honest writes (H3) | A failed append **throws**; the process exits non-zero rather than continuing with a view the disk never got |
+| Crash-tolerant read | A torn final line (killed mid-append) is skipped on reload; every earlier committed record survives, and a later append still works |
+| Legacy migration | The old `session_store.json` is converted once into the journal layout and left as `.migrated` (never deleted) |
+| Failover self-heal (H4) | Fallback is now a temporary state: the primary is retried after a 30 s window and a success leaves fallback; only connection errors fail over — a real query error surfaces. `close()` releases primary **and** fallback |
+| Shutdown close (H11) | `handleShutdown` calls `sessionStore.close()` (time-boxed to 1 s so a wedged close cannot hang exit) on both the graceful and forced paths |
+
+**Done when — verified:** `tests/unit/phase40-store-io.test.ts` (5 suites) measures total bytes written
+for 100 messages (`< 2 MB`, and `< 400 KB` so a full-rewrite regression cannot pass), asserts a
+mid-write crash costs only the last line, that a write failure throws, that the legacy file migrates
+and is preserved, and that status/messages survive a reopen. build 0 · typecheck 0 · **48/48** · no
+repo `.inflynx` pollution (every test runs in a temp workspace). H3/H4/H11 marked fixed.
+
+**Not claimed:** retention TTL / compaction (still open under H8); the 30 s self-heal window is not
+unit-tested against a live DB here (needs Postgres down-then-up); the append model assumes single-writer
+per session, which is the documented local-fallback contract (concurrent processes are the Postgres case).
+
+### ✅ Phase 41 — single source of truth per session (2026-09-27)
+
+Phase 40 made failover *temporary*, but the deeper H4 shape remained: a session created on
+Postgres whose later writes fell to the JSON fallback during an outage **forked its transcript** —
+early messages in one store, later in the other, and resume read a partial history. There was no
+owning-backend concept at all.
+
+`ResilientSessionStore` was rewritten around per-session backend pinning:
+
+| Part | What landed |
+|---|---|
+| Owner map | Each session id is created on exactly one backend and every later **write** routes there — never both |
+| Degraded, not forked | If a session's owning Postgres is unreachable, the write raises `SessionDegradedError` rather than silently writing to the fallback; the caller stops instead of corrupting history |
+| New sessions may degrade | A **brand-new** session (no transcript to fork yet) starts on the fallback while the primary is down, and pins there |
+| Circuit + read-probe | A cooldown stops hammering a down primary; reads (hydration, list) may probe both backends since a read cannot fork, so a restarted process still finds a session whose owner map is empty |
+| Injectable backends | The constructor accepts `{ primary, fallback }`, so the whole thing is unit-testable without a database |
+
+**Done when — verified:** `tests/unit/phase41-single-source.test.ts` uses a fake primary that can be
+switched off and asserts a pinned session surfaces degraded with **nothing** written to the fallback
+(no fork), a new-while-down session pins to the fallback with a coherent transcript, and `listSessions`
+unions both without duplicate ids. build 0 · typecheck 0 · **49 suites** · no repo `.inflynx` pollution.
+Also restored the missing `tsx` devDependency (the test runner had lost it from `node_modules`).
+
+**Not claimed:** the **kill-real-Postgres-mid-session → reconcile-on-reconnect** integration test
+needs a live DB (CI-only); on reconnect an in-flight degraded session currently requires the caller
+to retry rather than auto-replaying the buffered writes — the fork is prevented, the automatic
+reconciliation is the remaining slice.
+
+### ✅ Phase 38 — tool-contract coverage (2026-09-27)
+
+`tests/tool-contracts/` — the directory the maturity plan referenced for "every registered tool has
+a schema test AND an arguments-are-validated test" — **had never existed**. It is the missing
+drift guard for the whole 20-tool surface, and it lands now.
+
+| Check | What it proves |
+|---|---|
+| Schema validity | All 20 `CORE_TOOLS` have snake_case names, model-actionable descriptions, `{type:"object"}` parameters, `required ⊆ properties`, and a `type` on every property |
+| Non-empty where it takes args | `read_file`/`write_file`/`patch_file`/`search_files`/`execute_shell`/`list_diagnostics`/`update_plan` are not silently argless — while `shell_list` (genuinely argless) exercises the empty-properties allowance, so the check is not blanket |
+| Arguments validated | 18 required-arg tools all reject an empty call via the shared `validateToolArgs`, and the errors name the missing args |
+| Validator is type-aware | A hand-checked schema rejects missing **and** mistyped args and accepts a valid one — three-sided, not just "missing" |
+
+**Discovery while writing it:** the user had since **rewritten `validateToolArgs`** from my Phase 28
+name-switched checks into a proper JSON-Schema-subset validator (`{ok, errors}`, type/required/enum),
+renamed the registry to `CORE_TOOLS`, and dropped `toolsToOpenAiSchema`. The test was written against
+the *current* API, not my stale assumptions. **Done when — verified:** `tests/tool-contracts/tool-contract.test.ts`,
+4/4. build 0 · typecheck 0 · **51 suites**.
+
+**Not claimed:** the `max_tokens` output-budget half of Phase 38 was checked and found already sane
+(Gemini caps at 8192, chat at 4096 — no blanket 16k, no missing-ceiling bug), so no change was made
+there; per-tool L1 *behaviour* tests (beyond schema+args) are still thin and belong to Phase 45's
+contract harness.
+
+
 
 ### Follow-ups discovered by Phases 2, 4, 5, 6 and 7 (added to the inventory)
 

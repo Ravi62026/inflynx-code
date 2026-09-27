@@ -843,7 +843,7 @@ function handleShutdown(signal: string) {
 
   server.close(() => {
     console.log("[inflynx-server] HTTP server closed.");
-    process.exit(0);
+    void finishExit();
   });
   // `server.close()` only fires once every connection has ended, and an SSE stream
   // is open by design — so a graceful close is a hang here, not a shutdown. Force
@@ -853,8 +853,19 @@ function handleShutdown(signal: string) {
     console.log(
       `[inflynx-server] ${abandonedSessions} session(s) still attached (SSE streams do not close) — forcing exit.`
     );
-    process.exit(0);
+    void finishExit();
   }, 2_000).unref?.();
+
+  async function finishExit(): Promise<void> {
+    // H11: release the session store (Postgres pool / handles) before exiting. Best-effort
+    // and time-boxed — a wedged close must not hang shutdown past the force timer.
+    try {
+      await Promise.race([sessionStore.close(), new Promise((r) => setTimeout(r, 1_000))]);
+    } catch (err: any) {
+      console.warn(`[inflynx-server] sessionStore.close() failed: ${err?.message || err}`);
+    }
+    process.exit(0);
+  }
 }
 
 process.on("SIGINT", () => handleShutdown("SIGINT"));

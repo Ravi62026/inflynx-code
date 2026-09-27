@@ -53,6 +53,15 @@ const unitTestFiles = [
   "tests/unit/phase28-fence.test.ts",
   "tests/unit/phase33-fence.test.ts",
   "tests/unit/phase18-prompt-cache.test.ts",
+  "tests/unit/loop-matrix.test.ts",
+  "tests/unit/phase34-anthropic.test.ts",
+  "tests/unit/phase35-openai-adapters.test.ts",
+  "tests/unit/phase36-gemini.test.ts",
+  "tests/unit/phase39-store.test.ts",
+  "tests/unit/phase40-store-io.test.ts",
+  "tests/unit/phase41-single-source.test.ts",
+  "tests/unit/phase37-usage-cost.test.ts",
+  "tests/tool-contracts/tool-contract.test.ts",  // Phase 38: schema + argument-validation drift guard for every tool
   "tests/unit/session-store.test.ts",
   "tests/unit/session-recovery.test.ts",
   "tests/unit/gateway-bypass.test.ts",
@@ -60,6 +69,7 @@ const unitTestFiles = [
   "tests/unit/vector-store.test.ts",
   "tests/security/security-fixtures.test.ts",
   "tests/evals/bug-eval.test.ts",
+  "tests/evals/detector-eval.test.ts",
   "apps/vscode/tests/index.ts",
 ];
 

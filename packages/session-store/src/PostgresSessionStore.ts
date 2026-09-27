@@ -19,7 +19,7 @@ import type {
   SessionHydration,
   SessionModelConfig,
 } from "./types.js";
-import { generateSessionId } from "./types.js";
+import { generateSessionId, generateRecordId } from "./types.js";
 import { MIGRATIONS } from "./migrations.js";
 
 const { Pool } = pg;
@@ -39,15 +39,21 @@ export class PostgresSessionStore implements SessionStore {
   }
 
   /**
-   * Runs any not-yet-applied migrations, each in its own transaction, tracked
-   * in `schema_migrations`. Idempotent and safe to call from every public
-   * method — concurrent callers racing this on first use is harmless because
-   * each migration is wrapped in `BEGIN`/`COMMIT` and guarded by
-   * `INSERT ... ON CONFLICT DO NOTHING` on the tracking table.
+   * Runs any not-yet-applied migrations, each in its own transaction, tracked in
+   * `schema_migrations`.
+   *
+   * H7 (Phase 39): this used to cache the migration promise forever. A single transient
+   * failure — the container still warming up, a momentary connection drop — poisoned the
+   * cache, so every later call re-awaited the same rejected promise and the store was dead
+   * for the process's lifetime even after Postgres recovered. On failure the cached promise
+   * is cleared so the next call retries, with a capped backoff between attempts.
    */
   private async ensureMigrated(): Promise<void> {
     if (!this.migrationsPromise) {
-      this.migrationsPromise = this.runMigrations();
+      this.migrationsPromise = this.runMigrations().catch((err) => {
+        this.migrationsPromise = null; // do not latch the rejection (H7)
+        throw err;
+      });
     }
     return this.migrationsPromise;
   }
@@ -164,7 +170,7 @@ export class PostgresSessionStore implements SessionStore {
   ): Promise<StoredMessage> {
     await this.ensureMigrated();
 
-    const id = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const id = generateRecordId("msg");
     const timestamp = Date.now();
 
     try {
@@ -209,7 +215,7 @@ export class PostgresSessionStore implements SessionStore {
   ): Promise<StoredToolExecution> {
     await this.ensureMigrated();
 
-    const id = `tool_exec_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const id = generateRecordId("tool_exec");
     const timestamp = Date.now();
 
     try {
@@ -288,12 +294,22 @@ export class PostgresSessionStore implements SessionStore {
   async getSessionHydration(sessionId: string): Promise<SessionHydration | null> {
     await this.ensureMigrated();
 
-    const sRes = await this.pool.query(`SELECT * FROM agent_sessions WHERE session_id = $1`, [sessionId]);
+    const sRes = await this.pool.query(
+      `SELECT session_id, cwd, created_at, updated_at, provider, model,
+              credential_profile_id, base_url, reasoning_effort, actual_model,
+              active_mode, effort_level, title, status
+       FROM agent_sessions WHERE session_id = $1`, [sessionId]);
     if (sRes.rows.length === 0) return null;
 
     const session = this.mapSessionRow(sRes.rows[0]);
 
-    const mRes = await this.pool.query(`SELECT * FROM agent_messages WHERE session_id = $1 ORDER BY timestamp ASC`, [sessionId]);
+    // ORDER BY seq, not timestamp: a fast turn writes many rows in the same millisecond and
+    // timestamp order is then arbitrary (Phase 39). Explicit columns, not SELECT *, so a new
+    // column cannot silently change what hydration returns (H9).
+    const mRes = await this.pool.query(
+      `SELECT id, session_id, role, content, reasoning_content, tool_call_id,
+              tool_calls_json, provider_metadata_json, timestamp, seq
+       FROM agent_messages WHERE session_id = $1 ORDER BY seq ASC`, [sessionId]);
     const messages: StoredMessage[] = mRes.rows.map((r) => ({
       id: r.id,
       sessionId: r.session_id,
@@ -304,9 +320,12 @@ export class PostgresSessionStore implements SessionStore {
       toolCallsJson: r.tool_calls_json || undefined,
       providerMetadataJson: r.provider_metadata_json || undefined,
       timestamp: Number(r.timestamp),
+      seq: Number(r.seq),
     }));
 
-    const tRes = await this.pool.query(`SELECT * FROM agent_tool_executions WHERE session_id = $1 ORDER BY timestamp ASC`, [sessionId]);
+    const tRes = await this.pool.query(
+      `SELECT id, session_id, tool_call_id, tool_name, args_json, output, is_error, duration_ms, timestamp, seq
+       FROM agent_tool_executions WHERE session_id = $1 ORDER BY seq ASC`, [sessionId]);
     const toolExecutions: StoredToolExecution[] = tRes.rows.map((r) => ({
       id: r.id,
       sessionId: r.session_id,
@@ -319,7 +338,9 @@ export class PostgresSessionStore implements SessionStore {
       timestamp: Number(r.timestamp),
     }));
 
-    const telemRes = await this.pool.query(`SELECT * FROM agent_token_telemetry WHERE session_id = $1`, [sessionId]);
+    const telemRes = await this.pool.query(
+      `SELECT session_id, prompt_tokens, completion_tokens, reasoning_tokens, estimated_cost_usd, updated_at
+       FROM agent_token_telemetry WHERE session_id = $1`, [sessionId]);
     const telemRow = telemRes.rows[0];
     const telemetry: StoredTokenTelemetry = telemRow
       ? {
@@ -345,13 +366,35 @@ export class PostgresSessionStore implements SessionStore {
   async listSessions(cwd?: string): Promise<SessionRecord[]> {
     await this.ensureMigrated();
 
-    const query = cwd
-      ? `SELECT * FROM agent_sessions WHERE cwd = $1 ORDER BY updated_at DESC`
-      : `SELECT * FROM agent_sessions ORDER BY updated_at DESC`;
+    // Archived sessions are the lifecycle "kept but hidden" state — not listed by default.
+    const where = cwd ? `WHERE cwd = $1 AND status <> 'archived'` : `WHERE status <> 'archived'`;
     const params = cwd ? [cwd] : [];
-
-    const res = await this.pool.query(query, params);
+    const res = await this.pool.query(
+      `SELECT session_id, cwd, created_at, updated_at, provider, model,
+              credential_profile_id, base_url, reasoning_effort, actual_model,
+              active_mode, effort_level, title, status
+       FROM agent_sessions ${where} ORDER BY updated_at DESC`, params);
     return res.rows.map((row) => this.mapSessionRow(row));
+  }
+
+  async updateSessionStatus(sessionId: string, status: SessionRecord["status"]): Promise<void> {
+    await this.ensureMigrated();
+    const res = await this.pool.query(
+      `UPDATE agent_sessions SET status = $1, updated_at = $2 WHERE session_id = $3`,
+      [status, Date.now(), sessionId]
+    );
+    if (res.rowCount === 0) throw new Error(`Cannot set status on missing session "${sessionId}".`);
+  }
+
+  async archiveSession(sessionId: string): Promise<void> {
+    await this.updateSessionStatus(sessionId, "archived");
+  }
+
+  async deleteSession(sessionId: string): Promise<boolean> {
+    await this.ensureMigrated();
+    // ON DELETE CASCADE on the message/execution/telemetry FKs removes the child rows.
+    const res = await this.pool.query(`DELETE FROM agent_sessions WHERE session_id = $1`, [sessionId]);
+    return (res.rowCount ?? 0) > 0;
   }
 
   async close(): Promise<void> {

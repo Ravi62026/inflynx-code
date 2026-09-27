@@ -596,6 +596,9 @@ export class AgentOrchestrator {
       if (limitCheck.isExhausted) {
         this.eventBus.emit("session.failed", this.context.sessionId, { reason: limitCheck.reason });
         this.transitionTo("failed", limitCheck.reason ?? "Agent budget exhausted");
+        // C9/Phase 39: persist the terminal status so the sidebar can tell a crashed session
+        // from a live one. Best-effort — a store write must not mask the real failure.
+        void this.sessionStore.updateSessionStatus?.(this.context.sessionId, "failed").catch(() => {});
         break;
       }
 
@@ -606,6 +609,7 @@ export class AgentOrchestrator {
           `Retry in ${modelRateLimit.resetInSec}s.`;
         this.eventBus.emit("session.failed", this.context.sessionId, { reason });
         this.transitionTo("failed", reason);
+        void this.sessionStore.updateSessionStatus?.(this.context.sessionId, "failed").catch(() => {});
         break;
       }
 

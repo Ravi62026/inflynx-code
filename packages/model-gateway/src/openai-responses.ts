@@ -37,6 +37,12 @@ export function formatOpenAiResponsesInput(messages: Message[]): object[] {
         continue;
       }
       if (message.tool_calls?.length) {
+        // G6: an assistant turn can carry prose *and* tool calls. Emitting only the
+        // function_call items dropped the prose, so "I'll now read the file" — and the
+        // model's own reasoning about what it did — vanished from the replayed history.
+        if (message.content?.trim()) {
+          input.push({ role: "assistant", content: [{ type: "output_text", text: message.content }] });
+        }
         for (const toolCall of message.tool_calls) {
           const name = toolCall.function?.name || (toolCall as any).name || "unknown_tool";
           const args =
@@ -94,11 +100,16 @@ export async function* streamOpenAiResponses(
     input: formatOpenAiResponsesInput(request.messages),
     stream: true,
     max_output_tokens: request.maxTokens ?? 8_192,
+    // Phase 35: do not server-side-store the conversation (Inflynx owns the transcript in
+    // its session store); and ask for encrypted reasoning items so a tool loop can replay
+    // the model's own reasoning instead of losing it between calls.
+    store: false,
   };
   const tools = toResponseTools(request.tools);
   if (tools) body.tools = tools;
   if (request.reasoningEffort && request.reasoningEffort !== "none") {
     body.reasoning = { effort: request.reasoningEffort };
+    body.include = ["reasoning.encrypted_content"];
   }
 
   const baseURL = (request.baseURL || "https://api.openai.com/v1").replace(/\/+$/, "");
@@ -120,6 +131,7 @@ export async function* streamOpenAiResponses(
   let reasoningTokens = 0;
   let outputTextLength = 0;
   let finishReason = "stop";
+  let sawFunctionCall = false;
   let actualModel: string | undefined;
 
   for await (const event of parseSse(response)) {
@@ -163,6 +175,7 @@ export async function* streamOpenAiResponses(
       const key = String(item.id || item.call_id || outputItems.size);
       outputItems.set(key, { ...item });
       if (item.type === "function_call") {
+        sawFunctionCall = true;
         const callId = String(item.call_id || item.id || key);
         yield {
           type: "tool_call",
@@ -179,6 +192,11 @@ export async function* streamOpenAiResponses(
       finishReason = "error";
     }
   }
+
+  // The Responses API has no `finish_reason: tool_calls` — it signals a tool turn by
+  // emitting function_call items. Normalise here or the loop thinks the model stopped and
+  // never sends the tool results back.
+  if (sawFunctionCall && finishReason === "stop") finishReason = "tool_calls";
 
   const usage = promptTokens || completionTokens
     ? buildUsage(request.model, promptTokens, completionTokens, reasoningTokens)

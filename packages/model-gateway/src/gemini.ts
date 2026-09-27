@@ -122,24 +122,31 @@ export async function* streamGemini(
   if (!apiKey) throw new Error("Google Gemini API key missing");
 
   const { systemInstruction, contents } = formatGeminiContents(request.messages);
+  // B14/Phase 36: `none` must disable thinking via `thinkingBudget: 0`; `thinkingLevel:
+  // "none"` is not a valid enum and was rejected. Other efforts keep the level form.
+  const thinkingConfig = request.reasoningEffort
+    ? (request.reasoningEffort === "none"
+      ? { thinkingConfig: { thinkingBudget: 0, includeThoughts: false } }
+      : { thinkingConfig: { thinkingLevel: request.reasoningEffort, includeThoughts: true } })
+    : {};
   const body: Record<string, unknown> = {
     contents,
     systemInstruction,
     tools: formatGeminiTools(request.tools),
     generationConfig: {
       maxOutputTokens: request.maxTokens ?? 8_192,
-      ...(request.reasoningEffort
-        ? { thinkingConfig: { thinkingLevel: request.reasoningEffort } }
-        : {}),
+      ...thinkingConfig,
     },
   };
 
   const baseURL = (request.baseURL || "https://generativelanguage.googleapis.com/v1beta").replace(/\/+$/, "");
-  const url = `${baseURL}/models/${encodeURIComponent(request.model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
+  // The key goes in the `x-goog-api-key` header, never the query string — a URL with
+  // `?key=…` is written into proxy logs, error messages and history (finding B14).
+  const url = `${baseURL}/models/${encodeURIComponent(request.model)}:streamGenerateContent?alt=sse`;
   const response = await fetchWithRetry(
     "google",
     url,
-    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+    { method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey }, body: JSON.stringify(body) },
     signal
   );
   if (!response.ok) throw providerError("google", response.status, await response.text());
@@ -166,7 +173,16 @@ export async function* streamGemini(
     if (!candidate) continue;
     finishReason = candidate.finishReason || finishReason;
     for (const part of candidate.content?.parts || []) {
-      finalParts.push(part);
+      // Merge streamed text into one part. The API delivers a sentence across many deltas;
+      // storing them raw turned one answer into dozens of parts that were then replayed and
+      // re-counted. A part carrying a thought signature stays addressable on the merged text.
+      const last = finalParts[finalParts.length - 1];
+      if (typeof part.text === "string" && last && typeof last.text === "string" && !last.functionCall && !last.function_call) {
+        last.text = String(last.text) + part.text;
+        if (part.thoughtSignature) last.thoughtSignature = part.thoughtSignature;
+      } else {
+        finalParts.push({ ...part });
+      }
       if (part.text) {
         const text = String(part.text);
         outputTextLength += text.length;

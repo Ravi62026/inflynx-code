@@ -131,10 +131,14 @@ export async function* streamOpenAiCompatible(
     model: request.model,
     messages: formatOpenAiCompatibleMessages(request.messages),
     stream: true,
-    stream_options: { include_usage: true },
     temperature: request.temperature ?? 0,
     max_tokens: request.maxTokens ?? 4096,
   };
+  // G10: `stream_options` is an OpenAI extension strict compatible servers 400 on. Ask for
+  // usage only when the endpoint is known to accept it (a BYOK profile can opt out).
+  if (!request.strictStreamOptions) {
+    body.stream_options = { include_usage: true };
+  }
 
   if (request.tools?.length) {
     if (request.customCapabilities && !request.customCapabilities.supportsTools) {

@@ -25,7 +25,7 @@ export interface SessionRecord {
   activeMode: string;
   effortLevel: string;
   title?: string;
-  status: "active" | "completed" | "failed" | "archived";
+  status: "active" | "completed" | "failed" | "cancelled" | "archived";
 }
 
 export interface StoredMessage {
@@ -39,6 +39,13 @@ export interface StoredMessage {
   /** JSON-safe provider continuation state; never contains a credential. */
   providerMetadataJson?: string;
   timestamp: number;
+  /**
+   * Monotonic insertion order (Phase 39). `timestamp` is only millisecond-resolution, so
+   * 200 messages written in one millisecond hydrate in an arbitrary order without it.
+   * Postgres fills it from a `BIGSERIAL`; the JSON store leaves it undefined and relies on
+   * array order, which is already insertion order.
+   */
+  seq?: number;
 }
 
 export interface StoredToolExecution {
@@ -107,11 +114,35 @@ export interface SessionStore {
   updateSessionModelConfig(sessionId: string, config: SessionModelConfig): Promise<SessionRecord>;
   getSessionHydration(sessionId: string): Promise<SessionHydration | null>;
   listSessions(cwd?: string): Promise<SessionRecord[]>;
+  /**
+   * Session lifecycle (Phase 39 / finding C9). `status` was written once as "active" and
+   * never updated, so the sidebar could not tell a finished run from a crashed one from a
+   * live one. These move it; the orchestrator calls them on the Phase-7 terminal events.
+   */
+  updateSessionStatus(sessionId: string, status: SessionRecord["status"]): Promise<void>;
+  /** Soft lifecycle: status → "archived" (kept on disk, hidden from the default list). */
+  archiveSession(sessionId: string): Promise<void>;
+  /** Hard delete: removes the session and, via cascade, its messages/executions/telemetry. */
+  deleteSession(sessionId: string): Promise<boolean>;
   /** Releases underlying connections/handles, if any. Safe to call on stores that don't need it. */
   close(): Promise<void>;
 }
 
+import { randomUUID } from "node:crypto";
+
+/**
+ * Collision-free id for messages and tool executions (Phase 39).
+ *
+ * These used to be `prefix_${Date.now()}_${5 random base36 chars}`. Under a fast turn
+ * (200 writes inside one millisecond) the 5-char suffix collides often enough to either
+ * throw a PK violation (Postgres) or overwrite a stored row (JSON) — a lost message. A
+ * UUID is the cheap, correct fix and still fits the `VARCHAR(64)` columns.
+ */
+export function generateRecordId(prefix: string): string {
+  return `${prefix}_${randomUUID()}`;
+}
+
 /** Generates a session ID in the shared `session_<ts>_<rand>` format used across the codebase. */
 export function generateSessionId(): string {
-  return `session_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  return `session_${Date.now()}_${randomUUID().slice(0, 8)}`;
 }

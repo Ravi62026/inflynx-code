@@ -91,7 +91,11 @@ export function formatAnthropicMessages(messages: Message[]): AnthropicMessage[]
 
     flushToolResults();
     if (message.role === "assistant") {
-      formatted.push({ role: "assistant", content: assistantBlocks(message) });
+      const blocks = assistantBlocks(message);
+      // Anthropic rejects `content: []`. A history message can legitimately be empty
+      // (an interrupted turn, a persisted stub), and used to be sent as an empty array —
+      // which the API answers with a 400 that kills the session.
+      formatted.push({ role: "assistant", content: blocks.length ? blocks : [{ type: "text", text: " " }] });
     } else {
       // Text and images are separate blocks; an image is never a base64 string in the text.
       const blocks = [...textBlock(stripLegacyImageMarkdown(message.content)), ...imageBlocks(message)];
@@ -118,12 +122,44 @@ export function formatAnthropicTools(tools: object[] | undefined, cacheLast = fa
 }
 
 /**
+ * Maps a qualitative reasoning effort to Anthropic's real extended-thinking budget. The
+ * previous code sent `{ type: "adaptive" }` and an `output_config` field — neither of which
+ * exists in the Anthropic Messages API (finding G5), so any reasoning request was a 400. The
+ * real control is `{ type: "enabled", budget_tokens }` with `1024 <= budget < max_tokens`.
+ */
+const THINKING_BUDGET_BY_EFFORT: Record<string, number> = { low: 2_048, medium: 6_144, high: 16_384, max: 24_576 };
+
+function applyThinking(body: Record<string, unknown>, request: ModelRequest): void {
+  const effort = request.reasoningEffort;
+  if (effort === "none") {
+    body.thinking = { type: "disabled" };
+    return;
+  }
+  const raw = request.thinkingBudget ?? (effort ? THINKING_BUDGET_BY_EFFORT[String(effort)] : undefined);
+  if (effort && raw === undefined) {
+    // An effort we do not have a table entry for still means "think"; use a safe default.
+    body.thinking = { type: "enabled", budget_tokens: clampBudget(6_144, body) };
+    return;
+  }
+  if (!raw) return; // no effort, no explicit budget → no thinking block at all
+  if (request.thinkingBudget !== undefined && request.thinkingBudget < 1_024) {
+    throw new Error("Anthropic thinkingBudget must be at least 1024.");
+  }
+  body.thinking = { type: "enabled", budget_tokens: clampBudget(raw, body) };
+}
+
+/** Keep `1024 <= budget < max_tokens`, raising `max_tokens` if the caller's ceiling is too low. */
+function clampBudget(budget: number, body: Record<string, unknown>): number {
+  const capped = Math.max(1_024, budget);
+  const maxTokens = body.max_tokens as number;
+  if (capped >= maxTokens) body.max_tokens = capped + 1_024;
+  return capped;
+}
+
+/**
  * Builds the Anthropic request body. Extracted (and exported) because prompt caching depends
  * on the *stable prefix* — `system` + `tools` — being byte-identical turn after turn; keeping
  * it a pure function of the request is what lets that property be tested without a live call.
- *
- * Cache breakpoints sit on the system block and the last tool, so Anthropic caches the whole
- * system+tools head once per session and reuses it across every turn.
  */
 export function buildAnthropicBody(request: ModelRequest): Record<string, unknown> {
   const system = request.messages.find((message) => message.role === "system")?.content || "You are Inflynx Agent.";
@@ -136,25 +172,17 @@ export function buildAnthropicBody(request: ModelRequest): Record<string, unknow
   };
   const tools = formatAnthropicTools(request.tools, true);
   if (tools) body.tools = tools;
-
-  // Claude Sonnet 5 uses adaptive thinking, not the deprecated numeric budget. The legacy
-  // field remains only for callers explicitly targeting older Anthropic models.
-  if (request.reasoningEffort && request.reasoningEffort !== "none") {
-    body.thinking = { type: "adaptive" };
-    body.output_config = { effort: request.reasoningEffort };
-  } else if (request.reasoningEffort === "none") {
-    body.thinking = { type: "disabled" };
-  } else if (request.thinkingBudget) {
-    const maxTokens = body.max_tokens as number;
-    if (request.thinkingBudget < 1_024) {
-      throw new Error("Anthropic thinkingBudget must be at least 1024.");
-    }
-    if (request.thinkingBudget >= maxTokens) {
-      body.max_tokens = request.thinkingBudget + 1024;
-    }
-    body.thinking = { type: "enabled", budget_tokens: request.thinkingBudget };
-  }
+  applyThinking(body, request);
   return body;
+}
+
+/** Honour a proxy/BYOK `baseURL`; default to the Anthropic endpoint. */
+export function anthropicMessagesUrl(request: ModelRequest): string {
+  const base = request.baseURL?.trim();
+  if (!base) return "https://api.anthropic.com/v1/messages";
+  const clean = base.replace(/\/+$/, "");
+  if (/\/messages$/.test(clean)) return clean;
+  return clean.endsWith("/v1") ? `${clean}/messages` : `${clean}/v1/messages`;
 }
 
 export async function* streamAnthropic(
@@ -179,7 +207,7 @@ export async function* streamAnthropic(
 
     response = await fetchWithRetry(
       "anthropic",
-      "https://api.anthropic.com/v1/messages",
+      anthropicMessagesUrl(request),
       {
         method: "POST",
         headers,

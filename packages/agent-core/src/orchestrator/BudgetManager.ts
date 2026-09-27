@@ -89,6 +89,19 @@ export interface BudgetState {
   reasoningTokens: number;
   estimatedCostUsd: number;
   /**
+   * G12 (Phase 37): cached-input metrics are computed by every adapter (Phase 18) but were
+   * dropped on the floor here, so the cost panel could only ever show "0 cached" even when the
+   * turn saved thousands of tokens. Now accumulated so a surface can show the real saving.
+   */
+  cachedInputTokens: number;
+  cacheCreationInputTokens: number;
+  /**
+   * G8 (Phase 37): how many model calls returned NO usage block. Those used to be recorded as
+   * a silent 0 tokens / $0 success; the count lets the UI say "N turns unpriced" instead of
+   * implying the turn was free.
+   */
+  unpricedTurns: number;
+  /**
    * Occupancy of the *model's window* for the next request, which is not the same
    * thing as the cumulative `promptTokens` above (that sum grows every turn and can
    * never answer "how full is the context?"). 0 when the window is unknown.
@@ -123,6 +136,9 @@ export class BudgetManager {
       completionTokens: 0,
       reasoningTokens: 0,
       estimatedCostUsd: 0,
+      cachedInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      unpricedTurns: 0,
       contextUtilizationPercent: 0,
       contextWindow: 0,
       projectedContextTokens: 0,
@@ -262,9 +278,18 @@ export class BudgetManager {
     this.checkWarningThresholds();
   }
 
-  recordUsage(usage: { promptTokens: number; completionTokens: number; reasoningTokens?: number; estimatedCostUsd?: number }): void {
+  recordUsage(usage: { promptTokens: number; completionTokens: number; reasoningTokens?: number; estimatedCostUsd?: number; cachedInputTokens?: number; cacheCreationInputTokens?: number }): void {
+    // G8: a call that reported no usage at all is recorded as *unpriced*, not as a free turn.
+    if (!usage || (usage.promptTokens === 0 && usage.completionTokens === 0)) {
+      this.state.unpricedTurns++;
+      this.checkWarningThresholds();
+      return;
+    }
     this.state.promptTokens += usage.promptTokens;
     this.state.completionTokens += usage.completionTokens;
+    // G12: cache metrics now flow through to the budget (previously computed-then-discarded).
+    if (usage.cachedInputTokens) this.state.cachedInputTokens += usage.cachedInputTokens;
+    if (usage.cacheCreationInputTokens) this.state.cacheCreationInputTokens += usage.cacheCreationInputTokens;
     // Per-call values, kept separately from the cumulative sums above: these are
     // what context projection is anchored on.
     if (usage.promptTokens > 0) this.lastPromptTokens = usage.promptTokens;

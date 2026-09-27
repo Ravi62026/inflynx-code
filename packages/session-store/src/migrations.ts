@@ -95,4 +95,26 @@ export const MIGRATIONS: Migration[] = [
         WHERE credential_profile_id IS NOT NULL;
     `,
   },
+  {
+    // Phase 39. `timestamp` is only millisecond-resolution, so ORDER BY it does not give a
+    // total order — 200 messages written inside one millisecond hydrate in an arbitrary
+    // sequence, and a session restored in the wrong order silently re-sends the model a
+    // scrambled history. A monotonic BIGSERIAL is the real insertion order. Also widens
+    // provider/model from VARCHAR (a long BYOK model id silently truncated) to TEXT.
+    id: "0004_seq_and_text_columns",
+    sql: `
+      ALTER TABLE agent_messages ADD COLUMN IF NOT EXISTS seq BIGSERIAL;
+      CREATE INDEX IF NOT EXISTS idx_agent_messages_session_seq
+        ON agent_messages(session_id, seq);
+
+      ALTER TABLE agent_tool_executions ADD COLUMN IF NOT EXISTS seq BIGSERIAL;
+      CREATE INDEX IF NOT EXISTS idx_agent_tool_executions_session_seq
+        ON agent_tool_executions(session_id, seq);
+
+      ALTER TABLE agent_sessions ALTER COLUMN provider TYPE TEXT;
+      ALTER TABLE agent_sessions ALTER COLUMN model TYPE TEXT;
+      ALTER TABLE agent_sessions ALTER COLUMN active_mode TYPE TEXT;
+      ALTER TABLE agent_sessions ALTER COLUMN effort_level TYPE TEXT;
+    `,
+  },
 ];
