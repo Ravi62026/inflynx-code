@@ -56,7 +56,12 @@ FAIL tests/unit/policy-engine.test.ts
     '// @ts-ignore\nconst x: number = "hello";'
   );
 
-  if (!dangerousPatch1.isSafe && dangerousPatch1.violationReason?.includes("Anti-Pattern Rejected")) {
+  // Asserted on the rule id and the substance of the reason, not on the old literal
+  // wording: Phase 32 moved these rules into patch-engine and reworded the messages to
+  // tell the model what to do instead. Pinning prose would make every copy edit a test
+  // failure, which is how this suite read as a regression while behaving correctly.
+  if (!dangerousPatch1.isSafe && dangerousPatch1.violations?.includes("suppress-directive")
+      && /@ts-ignore|TypeScript error suppression/i.test(dangerousPatch1.violationReason || "")) {
     console.log("✓ Test 4 Passed: RepairLoop rejected @ts-ignore anti-pattern ->", dangerousPatch1.violationReason);
   } else {
     console.error("❌ Test 4 Failed: Anti-pattern @ts-ignore was not rejected!", dangerousPatch1);
@@ -69,7 +74,8 @@ FAIL tests/unit/policy-engine.test.ts
     'it("tests foo", () => { });'
   );
 
-  if (!dangerousPatch2.isSafe && dangerousPatch2.violationReason?.includes("deletes 2 test assertion(s)")) {
+  if (!dangerousPatch2.isSafe && dangerousPatch2.violations?.includes("assertion-removed")
+      && /removes 2 of 2 assertion/.test(dangerousPatch2.violationReason || "")) {
     console.log("✓ Test 5 Passed: RepairLoop rejected test assertion deletion anti-pattern ->", dangerousPatch2.violationReason);
   } else {
     console.error("❌ Test 5 Failed: Assertion deletion was not rejected!", dangerousPatch2);

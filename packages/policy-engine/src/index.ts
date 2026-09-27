@@ -6,6 +6,11 @@
 export { CanonicalPathGuard } from "./path-guard.js";
 export { CommandPolicy } from "./command-policy.js";
 export { validatePublicUrl } from "./ssrf-guard.js";
+export {
+  PREVIEW_MAX_FILE_BYTES,
+  resolvePreviewPath,
+  type PreviewResolution,
+} from "./preview-path.js";
 
 export {
   auditFieldsFromReview,

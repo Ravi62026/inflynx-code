@@ -149,6 +149,50 @@ export function redactSecrets(text: string): string {
     });
 }
 
+// ─── Terminal output safety ───────────────────────────────────────────────────
+
+/**
+ * Strip terminal control sequences from text that this tool did not author.
+ *
+ * Tool output, MCP server responses, fetched pages, cloned-repo file contents and
+ * restored transcripts are all written by someone else, and a terminal *executes* what
+ * it is handed: an embedded OSC 8 makes a clickable link out of anything, OSC 52 replaces
+ * the clipboard, and raw cursor/erase sequences can overwrite the line a security prompt
+ * is about to print. For a CLI whose entire safety story is "a human reads this and
+ * approves it", that is not a rendering bug (backlog N5).
+ *
+ * Applied at the same egress boundary as `redactSecrets`, and with the same restraint:
+ * only the externally-sourced value is passed through, never the surrounding string that
+ * contains this tool's own color codes — sanitizing those would silently break the UI.
+ *
+ * Also removes C0 control characters other than tab/newline, which terminals interpret in
+ * various ways, and the C1 range.
+ *
+ * Two things about the sequence patterns are deliberate:
+ * - They consume to the terminator (`BEL` or `ST` = `ESC \`) rather than stopping at an
+ *   inner `ESC`, because that is what terminals do — tmux passthrough (`DCS`) legitimately
+ *   contains nested `ESC` sequences, and a non-nesting match would strand them.
+ * - A final unconditional `ESC` strip guarantees the invariant the sanitizer exists for:
+ *   **no escape introducer survives**, whatever the input was. An unterminated OSC in the
+ *   wild would otherwise leave the whole payload printing as data with a live `ESC` in it.
+ */
+export function sanitizeForTerminal(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  return String(value)
+    // OSC: ESC ] ... terminated by BEL or ST
+    .replace(/\u001b\][\s\S]*?(?:\u0007|\u001b\\)/g, "")
+    // DCS / SOS / PMC / APC — may contain nested ESC sequences, same terminators
+    .replace(/\u001b[PX^_][\s\S]*?(?:\u0007|\u001b\\)/g, "")
+    // CSI: ESC [ parameters ... final byte @..~
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+    // Any remaining ESC + single interleaved byte ("other end-of-sequence" set)
+    .replace(/\u001b[@-Z\\-]/g, "")
+    // C0 controls except tab and newline; DEL; and C1 as bytes
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001a\u001c-\u001f\u007f-\u009f]/g, "")
+    // Last resort, and the actual guarantee: nothing here may still be an ESC.
+    .replace(/\u001b/g, "");
+}
+
 // ─── MCP configuration, trust & subprocess environment ───────────────────────
 // Lives in `mcp-config.ts` so that loading, trusting and spawning one server are
 // decided in one place — splitting them across files is how "where did this config

@@ -80,6 +80,14 @@ export function filterToolsForMode(
     // Shell tools blocked in ask and plan modes
     if (tool.permissionLevel === "shell" && !config.allowShell) return false;
 
+    // `git` is declared mutating so caches and fences treat it as able to write, but its
+    // risk is a property of the *invocation*. Hiding it in [plan] would make
+    // `git status`/`diff`/`log` — the read-only inspection a planning turn lives on —
+    // impossible, and would also mean ToolExecutionGateway's per-invocation git fence never
+    // sees a request to grade. It is offered; the fence remains the control, and a mutating
+    // git call comes back with a reason rather than silently not existing.
+    if (tool.name === "git" && !config.allowMutating && config.allowPlanWrite) return true;
+
     // External tools (MCP servers, plugins) are not offered in ask/plan at all.
     // `ask` promises "read-only, nothing happens" and `plan` promises "only
     // .inflynx/PLAN.md changes" — a third-party process breaks both however harmless
@@ -97,8 +105,13 @@ export function filterToolsForMode(
     // `.inflynx/**` is enforced by `ToolExecutionGateway` (backlog B8), NOT by an
     // instruction in the system prompt — model instructions are not security
     // boundaries, as this project's own maturity plan puts it.
+    //
+    // `update_plan` belongs on the same list and is the *better* option of the two: it can
+    // write exactly one path, under .inflynx/, by construction. `plan.txt` tells the model
+    // to publish the step list with it, so leaving it filtered out made that instruction
+    // unsatisfiable — the tool simply was not in the request.
     if (tool.isMutating && config.allowPlanWrite && !config.allowMutating) {
-      if (tool.name === "write_file") return true;
+      if (tool.name === "write_file" || tool.name === "update_plan") return true;
       return false; // Block patch_file, execute_shell, etc.
     }
 

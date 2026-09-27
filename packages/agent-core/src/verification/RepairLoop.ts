@@ -1,52 +1,42 @@
 import { AgentEventBus } from "@inflynx/protocol";
+import { reviewPatchSafety } from "@inflynx/patch-engine";
 import type { DiagnosticError } from "./FailureParser.js";
 
 export interface RepairSafetyCheckResult {
   isSafe: boolean;
   violationReason?: string;
+  /** Every rule that fired, not just the first — a human deciding an override sees all of them. */
+  violations?: string[];
 }
 
+/**
+ * The repair-loop telemetry and the (thin) safety façade.
+ *
+ * The fake-fix rules themselves deliberately do **not** live here. They used to, in a
+ * private table of five patterns that no product path ever called — which is how
+ * backlog C13 stayed half-open: the check existed, looked authoritative, and enforced
+ * nothing. They now live in `@inflynx/patch-engine`'s `patch-safety.ts`, next to the
+ * gateway step that enforces them, so the enforcement path and this compatibility
+ * wrapper cannot drift into disagreeing about what a fake fix is.
+ */
 export class RepairLoop {
-  private static FORBIDDEN_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
-    { pattern: /\/\/\s*@ts-ignore/, reason: "Addition of @ts-ignore directive to suppress compiler errors" },
-    { pattern: /\/\/\s*@ts-expect-error/, reason: "Addition of @ts-expect-error directive to bypass type checking" },
-    { pattern: /\/\*\s*eslint-disable/, reason: "Addition of eslint-disable comment block to bypass linter rules" },
-    { pattern: /catch\s*\([^)]*\)\s*\{\s*\}/, reason: "Empty catch block swallowing errors silently without handling" },
-    { pattern: /(?:it|test)\.skip\(/, reason: "Skipping failing test cases (.skip) instead of fixing underlying defect" },
-  ];
-
   constructor(
     private sessionId: string,
     private eventBus?: AgentEventBus
   ) {}
 
   /**
-   * Evaluates proposed repair replacement code for anti-patterns.
-   * Rejects fake fixes like disabling tests, suppressing type errors, or empty catch blocks.
+   * Evaluates proposed repair replacement code for anti-patterns: suppressed
+   * diagnostics, skipped or deleted tests, assertions that cannot fail.
    */
   validatePatchSafety(targetCode: string, replacementCode: string): RepairSafetyCheckResult {
-    // 1. Check for forbidden comment directives / empty catch blocks
-    for (const { pattern, reason } of RepairLoop.FORBIDDEN_PATTERNS) {
-      if (pattern.test(replacementCode) && !pattern.test(targetCode)) {
-        return {
-          isSafe: false,
-          violationReason: `Anti-Pattern Rejected: ${reason}. Fix the root cause instead of suppressing diagnostics.`,
-        };
-      }
-    }
-
-    // 2. Check for assertion deletion: count expect/assert statements in target vs replacement
-    const targetAsserts = (targetCode.match(/(?:expect|assert)\s*\(/g) || []).length;
-    const replacementAsserts = (replacementCode.match(/(?:expect|assert)\s*\(/g) || []).length;
-
-    if (targetAsserts > 0 && replacementAsserts < targetAsserts) {
-      return {
-        isSafe: false,
-        violationReason: `Anti-Pattern Rejected: Patch deletes ${targetAsserts - replacementAsserts} test assertion(s). Tests cannot be removed to pass verification.`,
-      };
-    }
-
-    return { isSafe: true };
+    const review = reviewPatchSafety({ before: targetCode, after: replacementCode });
+    if (review.safe) return { isSafe: true };
+    return {
+      isSafe: false,
+      violationReason: review.violations.map((v) => v.reason).join(" "),
+      violations: review.violations.map((v) => v.rule),
+    };
   }
 
   /**

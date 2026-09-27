@@ -1,12 +1,13 @@
 import * as vscode from "vscode";
 import fs from "node:fs";
 import path from "node:path";
+import { parsePlanMarkdown } from "@inflynx/protocol";
 import type { InflynxService } from "../InflynxService.js";
 
 export interface PlanStep {
   id: string;
   title: string;
-  status: "pending" | "in_progress" | "completed" | "failed";
+  status: "pending" | "in_progress" | "completed" | "failed" | "skipped";
   targetFile?: string;
   lineNumber?: number;
 }
@@ -29,6 +30,11 @@ export class PlanTreeItem extends vscode.TreeItem {
         break;
       case "failed":
         this.iconPath = new vscode.ThemeIcon("error", new vscode.ThemeColor("charts.red"));
+        break;
+      case "skipped":
+        // Skipped used to have no state here at all, because the tree's own parser read
+        // the `-` glyph as *in progress* — a step nobody will do looked like live work.
+        this.iconPath = new vscode.ThemeIcon("dash", new vscode.ThemeColor("disabledForeground"));
         break;
       default:
         this.iconPath = new vscode.ThemeIcon("circle-outline");
@@ -91,52 +97,21 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem> {
 
     try {
       const content = fs.readFileSync(planPath, "utf8");
-      this.steps = this.parsePlanContent(content, workspaceRoot);
+      // Through the shared parser. This file had its own regex, and it was the one place
+      // that mapped `[ ]`/`[x]` plus `-`→in progress; `/` (in progress) fell through to
+      // pending, so the sidebar showed the current step as not started.
+      const { plan } = parsePlanMarkdown(content);
+      this.steps = (plan?.steps ?? []).map((s) => ({
+        id: `step_${s.id}`,
+        title: `${s.title || s.description}`,
+        status: s.status,
+        targetFile: s.targetFiles.length
+          ? path.join(workspaceRoot, s.targetFiles[0])
+          : undefined,
+      }));
     } catch {
       this.steps = [];
     }
-  }
-
-  private parsePlanContent(content: string, workspaceRoot: string): PlanStep[] {
-    const lines = content.split("\n");
-    const steps: PlanStep[] = [];
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-      // Match markdown checkboxes: - [ ] Step description or 1. [x] Step description
-      const checkMatch = line.match(/^[-*0-9.]+\s*\[([ xX~-])\]\s*(.+)/);
-      if (checkMatch) {
-        const check = checkMatch[1].toLowerCase();
-        const text = checkMatch[2];
-
-        let status: PlanStep["status"] = "pending";
-        if (check === "x") {
-          status = "completed";
-        } else if (check === "~" || check === "-") {
-          status = "in_progress";
-        }
-
-        // Try extracting target file path from text: e.g. `path/to/file.ts` or [file.ts](...)
-        let targetFile: string | undefined;
-        const fileMatch = text.match(/`([^`]+\.[a-zA-Z0-9]+)`/) || text.match(/\[([^\]]+\.[a-zA-Z0-9]+)\]\(([^)]+)\)/);
-        if (fileMatch) {
-          const raw = fileMatch[2] || fileMatch[1];
-          const fullPath = path.isAbsolute(raw) ? raw : path.join(workspaceRoot, raw);
-          if (fs.existsSync(fullPath)) {
-            targetFile = fullPath;
-          }
-        }
-
-        steps.push({
-          id: `step_${i}`,
-          title: text.replace(/`([^`]+)`/g, "$1"),
-          status,
-          targetFile,
-        });
-      }
-    }
-
-    return steps;
   }
 
   getTreeItem(element: PlanTreeItem): vscode.TreeItem {

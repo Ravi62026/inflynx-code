@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "@inflynx/tool-runtime";
 import type { ShellCommandReview } from "@inflynx/policy-engine";
+import type { PatchSafetyReview } from "@inflynx/patch-engine";
 
 export interface ToolApprovalRequest {
   toolCallId?: string;
@@ -21,6 +22,12 @@ export interface ToolApprovalRequest {
    * without being read; this is what lets a UI show *which part* deletes something.
    */
   shellReview?: ShellCommandReview;
+  /**
+   * For file-mutating tools: the fake-fix review (Phase 32). Present and unsafe means the
+   * edit was refused by policy and this approval is an **override request** — the human is
+   * agreeing to a known-bad patch, not to an ordinary edit, so the UI has to say that.
+   */
+  patchSafety?: PatchSafetyReview;
 }
 
 export type ApprovalHandler = (request: ToolApprovalRequest) => Promise<boolean>;
@@ -32,10 +39,15 @@ export class ApprovalProvider {
    * Evaluates tool approval request.
    * Auto-approves read-only *core* tools; everything else asks, and defaults to deny
    * when no handler is wired up.
+   *
+   * A patch-safety violation is never auto-approved, whatever the permission level says
+   * about itself — a tool that is nominally read-only but has been found suppressing a
+   * diagnostic is precisely the case where an automatic yes is wrong.
    */
   async requestApproval(request: ToolApprovalRequest): Promise<boolean> {
     const origin = request.origin ?? "core";
-    if (request.permissionLevel === "readonly" && origin === "core") {
+    const overrideRequested = request.patchSafety && !request.patchSafety.safe;
+    if (request.permissionLevel === "readonly" && origin === "core" && !overrideRequested) {
       return true;
     }
 

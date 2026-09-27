@@ -9,9 +9,10 @@ import {
   resolveContextLimits,
   resolveCredentialSecret,
 } from "@inflynx/config";
-import { ToolRegistry, safeParseJsonArgs, type ToolCall, type ToolResult } from "@inflynx/tool-runtime";
+import { ToolRegistry, safeParseJsonArgs, reviewMutatingPatchForSafety, classifyGitInvocation, type ToolCall, type ToolResult } from "@inflynx/tool-runtime";
 import { ToolExecutionGateway } from "@inflynx/tool-runtime";
-import { reviewShellCommand } from "@inflynx/policy-engine";
+import type { PatchSafetyReview, PatchSafetyViolation } from "@inflynx/patch-engine";
+import { reviewShellCommand, type CanonicalPathGuard } from "@inflynx/policy-engine";
 import { createSessionStore, generateSessionId, type SessionStore } from "@inflynx/session-store";
 import { StateMachine, LEGAL_STATE_TRANSITIONS, type AgentState } from "./StateMachine.js";
 import { BudgetManager, type AgentBudgetLevel, type BudgetState } from "./BudgetManager.js";
@@ -772,7 +773,16 @@ export class AgentOrchestrator {
 
             tc.args = safeParseJsonArgs(tc.args);
             const toolDef = this.registry.get(tc.name);
-            const permissionLevel = toolDef?.permissionLevel || "readonly";
+            let permissionLevel = toolDef?.permissionLevel || "readonly";
+            // `git` is declared mutating as a container, but `git status` is not a write.
+            // Requiring approval for read-only repository inspection would make the tool
+            // unusable, while a *missing* check on `git commit` would be worse than both —
+            // so the grade comes from the argv, exactly as the shell path decides.
+            if (tc.name === "git") {
+              const rawArgs = (tc.args as Record<string, unknown>)?.args;
+              const grade = classifyGitInvocation(Array.isArray(rawArgs) ? rawArgs.map(String) : []).grade;
+              if (grade === "read-only") permissionLevel = "readonly";
+            }
             // Carried into the approval decision so a self-declared "readonly" from a
             // remote MCP server cannot buy itself an auto-approval (backlog B9).
             const origin = toolDef?.origin || "core";
@@ -787,7 +797,26 @@ export class AgentOrchestrator {
                 ? reviewShellCommand(String((tc.args as Record<string, unknown>)?.command || ""))
                 : null;
             const autoAllowedByRule = shellReview?.decision === "allow";
-            const needsHuman = shellReview ? shellReview.decision === "ask" : true;
+            let needsHuman = shellReview ? shellReview.decision === "ask" : true;
+
+            // Anti-fake-fix review (backlog Phase 32). Computed here so the human is shown
+            // *why* this edit is unusual before approving it, and so approving it means an
+            // explicit override that the gateway can then accept. Core tools only: an MCP
+            // server's own content is not something these patterns can sensibly judge.
+            let patchSafety: PatchSafetyReview | null = null;
+            if (toolDef?.isMutating && origin === "core") {
+              try {
+                patchSafety = reviewMutatingPatchForSafety(toolDef, tc.args as Record<string, unknown>, {
+                  readGuarded: (p: string) => this.gateway.readGuardedText(p),
+                });
+              } catch {
+                patchSafety = null; // a review failure must never block a legitimate edit
+              }
+            }
+            const patchNeedsOverride = Boolean(patchSafety && !patchSafety.safe);
+            // A violation always reaches a human, even for a tool the provider would
+            // otherwise have waved through.
+            needsHuman = needsHuman || patchNeedsOverride;
 
             this.eventBus.emit("tool.proposed", this.context.sessionId, {
               toolCallId: tc.id,
@@ -806,6 +835,12 @@ export class AgentOrchestrator {
                     })),
                   }
                 : {}),
+              ...(patchSafety && !patchSafety.safe
+                ? {
+                    patchSafetyRules: patchSafety.violations.map((v: PatchSafetyViolation) => v.rule),
+                    patchSafetySummary: patchSafety.violations.map((v: PatchSafetyViolation) => v.reason).join(" "),
+                  }
+                : {}),
             });
 
             // Approval check
@@ -818,6 +853,7 @@ export class AgentOrchestrator {
                 origin,
                 args: tc.args,
                 shellReview: shellReview || undefined,
+                patchSafety: patchSafety || undefined,
               }));
 
             if (approved) {
@@ -834,6 +870,11 @@ export class AgentOrchestrator {
                   // the audit log is for: the rules cleared it, or a person did. Reaching
                   // here any other way is refused by the gateway (see 3b there).
                   shellApprovalSource: autoAllowedByRule ? ("rule:allow" as const) : ("user:prompt" as const),
+                  // Only set when this patch tripped the fake-fix rules AND a human
+                  // approved after being shown them. Reaching the gateway with a violation
+                  // and without this is refused there — the same "required a human, prove
+                  // one agreed" rule the shell path enforces.
+                  patchApprovalSource: patchNeedsOverride ? ("user:override-patch-safety" as const) : undefined,
                 },
                 signal
               );
@@ -842,6 +883,19 @@ export class AgentOrchestrator {
               toolResultsAcc.push(result);
               if (result.touchedSourceFile && result.touchedPath) {
                 touchedSourceFiles.add(result.touchedPath);
+              }
+              // `plan.updated` existed in the protocol and had no emitter, so every plan UI
+              // was wired to a signal that never fired. The tool carries the structured plan
+              // rather than making each consumer re-parse markdown — see Phase 26.
+              if (result.plan && !result.isError) {
+                this.eventBus.emit("plan.updated", this.context.sessionId, {
+                  plan: result.plan,
+                  toolCallId: tc.id,
+                  goal: result.plan.goal,
+                  status: result.plan.status,
+                  completed: result.plan.steps.filter((s) => s.status === "completed").length,
+                  total: result.plan.steps.length,
+                });
               }
 
               // Persist tool execution output to SessionStore
@@ -888,7 +942,29 @@ export class AgentOrchestrator {
               // "Error: " prefix keeps the semantics correct for transcripts stored
               // before Message.is_error existed, and for providers without an
               // explicit error field on tool results.
-              const deniedMsg = "Error: Tool execution was denied by approval policy or user.";
+              //
+              // The reason is included, not just the fact of refusal: a denial that says
+              // only "denied" gives the model nothing to correct, so it re-attempts a
+              // variant of the same suppressed diagnostic.
+              const deniedReason = patchNeedsOverride
+                ? ` This edit was refused by anti-fake-fix policy:\n`
+                  + patchSafety!.violations.map((v: PatchSafetyViolation) => `- ${v.reason}`).join("\n")
+                  + `\nFix the underlying defect instead. If you believe the rule is wrong here, ` +
+                  `explain why in your reply and ask the user to override it.`
+                : "";
+              const deniedMsg = `Error: Tool execution was denied by approval policy or user.${deniedReason}`;
+              // The refusal is a result the turn owes its consumers: `TurnResult.toolResults`
+              // drives the CLI's tool summary and the extension's transcript, and a tool the
+              // human refused used to vanish from both — the model knew, the UI did not.
+              toolResultsAcc.push({
+                toolCallId: tc.id,
+                toolName: tc.name,
+                output: deniedMsg,
+                isError: true,
+                // Nothing ran, so nothing took time. The approval wait is deliberately not
+                // counted here — that would be reported as if it were execution time.
+                durationMs: 0,
+              });
               this.context.addMessage({
                 role: "tool",
                 content: deniedMsg,
@@ -1191,6 +1267,19 @@ export class AgentOrchestrator {
       prompt: this.formatGateFailureForModel(changed, summary, round + 1, profile.maxVerificationRuns),
       report: this.verificationReport("failed", changed, summary, round),
     };
+  }
+
+  /**
+   * The canonical path guard this session's tools will be checked against.
+   *
+   * Exposed so a UI can resolve a preview path with the **same** authority the gateway
+   * will use when it executes. Before this, the CLI's diff preview re-implemented path
+   * resolution with `path.isAbsolute` + `join` and read the file *before* approval, so a
+   * proposal naming an absolute path outside the workspace disclosed that file's contents
+   * even though the write itself was correctly refused (backlog N6).
+   */
+  getPathGuard(): CanonicalPathGuard {
+    return this.gateway.getPathGuard();
   }
 
   /**

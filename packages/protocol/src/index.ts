@@ -3,6 +3,8 @@
  * Public event protocol, typed event bus, and schema definitions.
  */
 
+export * from "./plan.js";
+
 export type AgentEventType =
   | "session.started"
   | "session.completed"

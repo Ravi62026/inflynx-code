@@ -24,6 +24,7 @@ import {
   type ProviderInfo,
   type ReasoningEffort,
   findWorkspaceRoot,
+  sanitizeForTerminal,
   getProjectMcpConfigPaths,
   listTrustedMcpServers,
   revokeMcpServer,
@@ -47,13 +48,14 @@ import {
   type ApprovalHandler,
   type ToolApprovalRequest,
 } from "@inflynx/agent-core";
-import { AgentEventBus } from "@inflynx/protocol";
+import { AgentEventBus, type PlanSpec } from "@inflynx/protocol";
 import {
   CanonicalPathGuard,
   CommandPolicy,
   getShellAuditPath,
   getUserShellRulesPath,
   readShellAudit,
+  resolvePreviewPath,
   reviewShellCommand,
   SHELL_AUDIT_RELATIVE_PATH,
 } from "@inflynx/policy-engine";
@@ -165,12 +167,17 @@ function truncateForPrompt(text: string, max: number): string {
 }
 
 function printToolApprovalHeader(toolName: string, args: Record<string, unknown>) {
+  // Everything here was chosen by the model or by a remote tool, and it is printed
+  // immediately before a human is asked to approve something. Terminal escapes in a tool
+  // name or argument can rewrite that screen and make an arbitrary line look like the
+  // prompt. Colors are still ours to add — only the foreign value is filtered. (N5)
+  const name = sanitizeForTerminal(toolName);
   console.log();
-  console.log(`${colors.bold}${colors.yellow}🔧 Tool Request: ${toolName}${colors.reset}`);
+  console.log(`${colors.bold}${colors.yellow}🔧 Tool Request: ${name}${colors.reset}`);
   console.log(`${colors.gray}${"─".repeat(52)}${colors.reset}`);
   for (const [k, v] of Object.entries(args)) {
-    const valStr = typeof v === "string" && v.length > 200 ? v.slice(0, 200) + "..." : String(v ?? "");
-    console.log(`  ${colors.cyan}${k}${colors.reset}: ${colors.bold}${valStr}${colors.reset}`);
+    const raw = typeof v === "string" && v.length > 200 ? v.slice(0, 200) + "..." : String(v ?? "");
+    console.log(`  ${colors.cyan}${sanitizeForTerminal(k)}${colors.reset}: ${colors.bold}${sanitizeForTerminal(raw)}${colors.reset}`);
   }
   console.log(`${colors.gray}${"─".repeat(52)}${colors.reset}`);
 }
@@ -297,11 +304,18 @@ async function main() {
     if (mode === "agent") {
       const activePlan = planEngine.loadActivePlan();
       if (activePlan && (activePlan.status === "IN_PROGRESS" || activePlan.status === "PENDING_APPROVAL")) {
-        const pending = activePlan.steps.filter((s) => s.status === "pending");
-        if (pending.length > 0) {
-          planBlock = `\n\nACTIVE PLAN (.inflynx/PLAN.md):\nGoal: ${activePlan.goal}\nStatus: ${activePlan.status}\nNext steps pending:\n` +
-            pending.map((s) => `  Step ${s.id}: ${s.description}${s.targetFile ? ` (${s.targetFile})` : ""}`).join("\n");
+        // `in_progress` belongs here too: the old filter was `pending` only, so the one
+        // step the model was actively working on vanished from the list it was shown.
+        const open = activePlan.steps.filter((s) => s.status === "pending" || s.status === "in_progress");
+        if (open.length > 0) {
+          const done = activePlan.steps.filter((s) => s.status === "completed").length;
+          planBlock = `\n\nACTIVE PLAN (.inflynx/PLAN.md):\nGoal: ${activePlan.goal}\nStatus: ${activePlan.status}\nProgress: ${done}/${activePlan.steps.length} steps completed\nOpen steps:\n` +
+            open.map((s) => `  Step ${s.id} [${s.status}]: ${s.description}${s.targetFiles.length ? ` (${s.targetFiles.join(", ")})` : ""}`).join("\n") +
+            `\nAdvance it with the update_plan tool — do NOT edit PLAN.md with write_file or edit_file.`;
         }
+      }
+      if (activePlan && activePlan.warnings.length > 0) {
+        console.log(`${colors.yellow}⚠ PLAN.md readability:${colors.reset} ${activePlan.warnings.join("; ")}`);
       }
     }
 
@@ -411,6 +425,18 @@ async function main() {
       printToolApprovalHeader(request.toolName, request.args as Record<string, unknown>);
     }
 
+    // A fake-fix violation is not an ordinary approval: the human is being asked to
+    // override a policy that already said no, so it has to look different on screen and
+    // say what each rule caught. (backlog Phase 32)
+    const overridePatch = Boolean(request.patchSafety && !request.patchSafety.safe);
+    if (overridePatch) {
+      console.log(`${colors.bold}${colors.red}⛔ The agent's edit was refused by policy. Approving this overrides an anti-fake-fix check.${colors.reset}`);
+      for (const v of request.patchSafety!.violations) {
+        console.log(`  ${colors.red}• ${sanitizeForTerminal(v.reason)}${colors.reset}`);
+        console.log(`    ${colors.gray}[${v.rule}] ${sanitizeForTerminal(v.evidence)}${colors.reset}`);
+      }
+    }
+
     try {
       const choices = isShell
         ? [
@@ -418,13 +444,20 @@ async function main() {
             { name: `Yes, and allow \`${truncateForPrompt(command, 46)}\` for the rest of this session`, value: "session" },
             { name: "No — deny", value: "deny" },
           ]
-        : [
-            { name: "Yes, run this", value: "once" },
-            { name: "No — deny", value: "deny" },
-          ];
+        : overridePatch
+          ? [
+              { name: "No — let the agent fix the real problem", value: "deny" },
+              { name: "Yes — I know it suppresses a check, apply it anyway", value: "once" },
+            ]
+          : [
+              { name: "Yes, run this", value: "once" },
+              { name: "No — deny", value: "deny" },
+            ];
 
       const answer = await select({
-        message: `Execute ${colors.bold}${request.toolName}${colors.reset}?`,
+        message: overridePatch
+          ? `Override the fake-fix refusal for ${colors.bold}${sanitizeForTerminal(request.toolName)}${colors.reset}?`
+          : `Execute ${colors.bold}${sanitizeForTerminal(request.toolName)}${colors.reset}?`,
         choices,
       });
       const approved = answer === "once" || answer === "session";
@@ -442,48 +475,61 @@ async function main() {
   // Everything the terminal prints during a turn is driven by AgentOrchestrator's
   // events — this is the single code path shared by every tool call, whether it
   // came from a plain user message, /debug, /plan, /execute-plan, or /mcp add.
-  eventBus.on<{ toolName: string; permissionLevel: string; args: Record<string, unknown>; shellDecision?: string; shellSegments?: Array<{ text: string; decision: string; reason: string }> }>("tool.proposed", (evt) => {
+  eventBus.on<{ toolName: string; permissionLevel: string; args: Record<string, unknown>; shellDecision?: string; shellSegments?: Array<{ text: string; decision: string; reason: string }>; patchSafetyRules?: string[]; patchSafetySummary?: string }>("tool.proposed", (evt) => {
+    if (evt.payload.patchSafetyRules?.length) {
+      console.log(`${colors.bold}${colors.red}⛔ refused by anti-fake-fix policy:${colors.reset} ${colors.gray}${evt.payload.patchSafetyRules.join(", ")}${colors.reset}`);
+    }
     if (evt.payload.shellSegments?.length) {
       // Every shell call shows its parsed structure, including the ones the rules
       // cleared without asking — otherwise "what just ran?" has no answer on screen.
       const line = truncateForPrompt(String(evt.payload.args?.command || ""), 120);
-      console.log(`${colors.bold}${colors.magenta}$${colors.reset} ${colors.bold}${line}${colors.reset}`);
+      console.log(`${colors.bold}${colors.magenta}$${colors.reset} ${colors.bold}${sanitizeForTerminal(line)}${colors.reset}`);
       for (const verdict of evt.payload.shellSegments) {
         if (verdict.decision === "allow" && evt.payload.shellSegments.length === 1) continue;
         const color = verdict.decision === "deny" ? colors.red : verdict.decision === "ask" ? colors.yellow : colors.brightGreen;
-        console.log(`  ${color}${verdict.decision}${colors.reset} ${colors.gray}${verdict.text} — ${verdict.reason}${colors.reset}`);
+        console.log(`  ${color}${verdict.decision}${colors.reset} ${colors.gray}${sanitizeForTerminal(verdict.text)} — ${sanitizeForTerminal(verdict.reason)}${colors.reset}`);
       }
     } else {
       printToolApprovalHeader(evt.payload.toolName, evt.payload.args);
     }
 
+    // A preview is a courtesy, not a reason to read a file the guard would refuse. The
+    // proposal text is untrusted until the tool actually runs. (backlog N6)
+    const previewGuard = orchestrator ? orchestrator.getPathGuard() : null;
+
     if (evt.payload.toolName === "patch_file") {
       const filePath = String(evt.payload.args.path || "");
       const targetCode = String(evt.payload.args.target_code || "");
       const replacementCode = String(evt.payload.args.replacement_code || "");
-      const absPath = path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
-      const oldContent = fs.existsSync(absPath) ? fs.readFileSync(absPath, "utf-8") : "";
-      try {
-        const patchRes = applySurgicalPatch(oldContent, targetCode, replacementCode);
-        const diff = computeUnifiedDiff(filePath, oldContent, patchRes.patchedContent);
-        renderColorDiff(filePath, diff);
-      } catch (diffErr: any) {
-        console.log(`${colors.yellow}⚠ Could not compute preview diff: ${diffErr.message}${colors.reset}`);
+      const resolved = resolvePreviewPath(previewGuard, filePath);
+      if (!resolved.ok) {
+        console.log(`${colors.yellow}⚠ No diff preview: ${resolved.reason}${colors.reset}`);
+      } else {
+        const oldContent = fs.existsSync(resolved.absPath) ? fs.readFileSync(resolved.absPath, "utf-8") : "";
+        try {
+          const patchRes = applySurgicalPatch(oldContent, targetCode, replacementCode);
+          const shown = sanitizeForTerminal(resolved.displayName);
+          const diff = computeUnifiedDiff(shown, oldContent, patchRes.patchedContent);
+          renderColorDiff(shown, sanitizeForTerminal(diff));
+        } catch (diffErr: any) {
+          console.log(`${colors.yellow}⚠ Could not compute preview diff: ${sanitizeForTerminal(diffErr.message)}${colors.reset}`);
+        }
       }
     } else if (evt.payload.toolName === "write_file") {
       const filePath = String(evt.payload.args.path || "");
       const newContent = String(evt.payload.args.content || "");
-      const absPath = path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
-      try {
-        if (fs.existsSync(absPath) && fs.statSync(absPath).isDirectory()) {
-          console.log(`${colors.yellow}⚠ Preview skipped: "${filePath}" is a directory${colors.reset}`);
-        } else {
-          const oldContent = fs.existsSync(absPath) ? fs.readFileSync(absPath, "utf-8") : "";
-          const diff = computeUnifiedDiff(filePath, oldContent, newContent);
-          renderColorDiff(filePath, diff);
+      const resolved = resolvePreviewPath(previewGuard, filePath);
+      if (!resolved.ok) {
+        console.log(`${colors.yellow}⚠ No diff preview: ${resolved.reason}${colors.reset}`);
+      } else {
+        try {
+          const oldContent = fs.existsSync(resolved.absPath) ? fs.readFileSync(resolved.absPath, "utf-8") : "";
+          const shown = sanitizeForTerminal(resolved.displayName);
+          const diff = computeUnifiedDiff(shown, oldContent, newContent);
+          renderColorDiff(shown, sanitizeForTerminal(diff));
+        } catch (diffErr: any) {
+          console.log(`${colors.yellow}⚠ Could not compute preview diff: ${sanitizeForTerminal(diffErr.message)}${colors.reset}`);
         }
-      } catch (diffErr: any) {
-        console.log(`${colors.yellow}⚠ Could not compute preview diff: ${diffErr.message}${colors.reset}`);
       }
     }
 
@@ -493,26 +539,32 @@ async function main() {
   });
 
   eventBus.on<{ toolName: string }>("tool.started", (evt) => {
-    process.stdout.write(`${colors.gray}⟳ Running ${evt.payload.toolName}...${colors.reset}`);
+    process.stdout.write(`${colors.gray}⟳ Running ${sanitizeForTerminal(evt.payload.toolName)}...${colors.reset}`);
   });
 
   eventBus.on<{ toolName: string; isError: boolean; durationMs: number; outputSnippet: string }>("tool.output", (evt) => {
     process.stdout.clearLine?.(0);
     process.stdout.cursorTo?.(0);
+    // The snippet is a foreign program's output — an MCP server, a shell command, the
+    // contents of a cloned file. It is printed seconds before a human reads a prompt, so
+    // it must not be able to move the cursor or rewrite the screen. (N5)
+    const snippet = sanitizeForTerminal(evt.payload.outputSnippet);
     if (evt.payload.isError) {
-      console.log(`${colors.red}✗ ${evt.payload.toolName} failed (${evt.payload.durationMs}ms):${colors.reset}\n${evt.payload.outputSnippet}\n`);
+      console.log(`${colors.red}✗ ${sanitizeForTerminal(evt.payload.toolName)} failed (${evt.payload.durationMs}ms):${colors.reset}\n${snippet}\n`);
     } else {
-      console.log(`${colors.brightGreen}✓ ${evt.payload.toolName} (${evt.payload.durationMs}ms)${colors.reset}`);
-      console.log(`${colors.gray}${evt.payload.outputSnippet}${colors.reset}\n`);
+      console.log(`${colors.brightGreen}✓ ${sanitizeForTerminal(evt.payload.toolName)} (${evt.payload.durationMs}ms)${colors.reset}`);
+      console.log(`${colors.gray}${snippet}${colors.reset}\n`);
     }
   });
 
   eventBus.on<{ text: string }>("model.text_delta", (evt) => {
-    process.stdout.write(evt.payload.text);
+    // The model's own text is untrusted too: it is a transcription of remote content and
+    // can echo a sequence back that it read out of a file.
+    process.stdout.write(sanitizeForTerminal(evt.payload.text));
   });
 
   eventBus.on<{ thought: string }>("model.thought_delta", (evt) => {
-    process.stdout.write(`${colors.gray}${evt.payload.thought}${colors.reset}`);
+    process.stdout.write(`${colors.gray}${sanitizeForTerminal(evt.payload.thought)}${colors.reset}`);
   });
 
   eventBus.on("turn.started", () => {
@@ -534,6 +586,30 @@ async function main() {
       console.log(
         `\n${colors.yellow}⚠ Budget warning (${evt.payload.thresholdPercent}%): ${evt.payload.currentTurns}/${evt.payload.maxTurns} turns, ${evt.payload.currentToolCalls}/${evt.payload.maxToolCalls} tool calls used.${colors.reset}`
       );
+    }
+  );
+
+  // The plan progress line. `plan.updated` had been in the protocol since the event list
+  // existed with nothing emitting it, which is a large part of why the plan feature read as
+  // prose: the human's only view of progress was opening PLAN.md by hand.
+  eventBus.on<{ plan?: PlanSpec; goal?: string; status?: string; completed?: number; total?: number }>(
+    "plan.updated",
+    (evt) => {
+      const plan = evt.payload.plan;
+      if (!plan) return;
+      const done = plan.steps.filter((s) => s.status === "completed").length;
+      const skipped = plan.steps.filter((s) => s.status === "skipped").length;
+      const settled = done + skipped;
+      const current = plan.steps.find((s) => s.status === "in_progress");
+      const width = 20;
+      const filled = plan.steps.length ? Math.round((settled / plan.steps.length) * width) : 0;
+      console.log(
+        `\n${colors.yellow}📋 plan${colors.reset} ${colors.gray}[${"█".repeat(filled)}${"░".repeat(width - filled)}]${colors.reset} ` +
+        `${colors.brightGreen}${settled}/${plan.steps.length}${colors.reset} · ${sanitizeForTerminal(plan.goal)} (${plan.status})`
+      );
+      if (current) {
+        console.log(`   ${colors.cyan}→ step ${current.id}: ${sanitizeForTerminal(current.title)}${colors.reset}`);
+      }
     }
   );
 
@@ -765,14 +841,14 @@ async function main() {
           console.log(`${colors.gray}─── Restored Chat Transcript ─────────────────────────────────${colors.reset}`);
           for (const msg of hydration.messages) {
             if (msg.role === "user") {
-              console.log(`\n${colors.bold}${colors.brightCyan}User:${colors.reset} ${msg.content}`);
+              console.log(`\n${colors.bold}${colors.brightCyan}User:${colors.reset} ${sanitizeForTerminal(msg.content)}`);
             } else if (msg.role === "assistant") {
               if (msg.content) {
-                console.log(`\n${colors.bold}${colors.brightMagenta}⚡ Inflynx (${hydration.session.model}):${colors.reset}\n${msg.content}`);
+                console.log(`\n${colors.bold}${colors.brightMagenta}⚡ Inflynx (${hydration.session.model}):${colors.reset}\n${sanitizeForTerminal(msg.content)}`);
               }
             } else if (msg.role === "tool") {
               const snippet = (msg.content || "").split("\n").slice(0, 3).join("\n");
-              console.log(`${colors.gray}🔧 Tool Output (${msg.toolCallId || "tool"}): ${snippet}${colors.reset}`);
+              console.log(`${colors.gray}🔧 Tool Output (${sanitizeForTerminal(msg.toolCallId || "tool")}): ${sanitizeForTerminal(snippet)}${colors.reset}`);
             }
           }
           console.log(`\n${colors.gray}─────────────────────────────────────────────────────────────${colors.reset}\n`);
@@ -1228,6 +1304,8 @@ async function main() {
               const icon = { completed: "✅", in_progress: "⏳", pending: "⬜", failed: "❌", skipped: "⏭" }[s.status];
               const riskColor = s.risk === "HIGH" ? colors.red : s.risk === "MEDIUM" ? colors.yellow : colors.gray;
               console.log(`  ${icon} Step ${s.id}: ${s.description} ${riskColor}[${s.risk}]${colors.reset}`);
+              if (s.targetFiles.length > 0) console.log(`      ${colors.gray}target: ${s.targetFiles.join(", ")}${colors.reset}`);
+              if (s.dependencies.length > 0) console.log(`      ${colors.gray}depends on: ${s.dependencies.join(", ")}${colors.reset}`);
             }
             console.log(`\n${colors.gray}Run /execute-plan to start execution, or /plan history to see past plans.${colors.reset}\n`);
           } else {
@@ -1280,8 +1358,9 @@ async function main() {
           `Execute the approved plan from .inflynx/PLAN.md step by step.`,
           `Goal: "${active.goal}"`,
           `The plan has ${pending.length} pending steps. Execute each step in order:`,
-          ...pending.map((s) => `- Step ${s.id}: ${s.description}${s.targetFile ? ` (target: ${s.targetFile})` : ""}`),
+          ...pending.map((s) => `- Step ${s.id}: ${s.description}${s.targetFiles.length ? ` (target: ${s.targetFiles.join(", ")})` : ""}`),
           `After each step succeeds, run its verification command and mark it complete.`,
+          `Publish progress with the update_plan tool at the start and end of every step — the human watches that, not PLAN.md.`,
           `Show progress as: ✅ Step N: [description] [DONE in Xs]`,
           `If a step fails after 2 retries, report it and ask the user for guidance.`,
         ].join("\n");

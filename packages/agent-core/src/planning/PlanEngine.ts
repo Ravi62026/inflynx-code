@@ -1,20 +1,16 @@
 import fs from "fs";
 import path from "path";
+import {
+  derivePlanStatus,
+  parsePlanMarkdown,
+  renderPlanMarkdown,
+  type PlanStep,
+  type PlanStatus,
+} from "@inflynx/protocol";
 
-export type PlanStatus =
-  | "PENDING_APPROVAL"
-  | "IN_PROGRESS"
-  | "COMPLETED"
-  | "ABORTED";
-
-export interface PlanStep {
-  id: number;
-  description: string;
-  targetFile?: string;
-  verifyCmd?: string;
-  risk: "LOW" | "MEDIUM" | "HIGH";
-  status: "pending" | "in_progress" | "completed" | "failed" | "skipped";
-}
+// Re-exported rather than re-declared. Two `PlanStatus` unions in two packages is how
+// `plan.updated`'s payload and this engine's output stopped agreeing without any error.
+export type { PlanStatus, PlanStep } from "@inflynx/protocol";
 
 export interface ActivePlan {
   goal: string;
@@ -24,6 +20,8 @@ export interface ActivePlan {
   steps: PlanStep[];
   rawMarkdown: string;
   planPath: string;
+  /** Why a readable file was reported as having no plan — never silently empty. */
+  warnings: string[];
 }
 
 export class PlanEngine {
@@ -42,7 +40,6 @@ export class PlanEngine {
     const raw = fs.readFileSync(this.planPath, "utf-8");
     return this.parsePlanMarkdown(raw);
   }
-
   /** Archive old plan and write a new one */
   writePlan(markdown: string): string {
     // Archive existing plan if any
@@ -58,37 +55,60 @@ export class PlanEngine {
     return this.planPath;
   }
 
-  /** Update a step's status in the active plan file */
-  markStep(stepId: number, status: PlanStep["status"]): void {
-    if (!fs.existsSync(this.planPath)) return;
-
-    let content = fs.readFileSync(this.planPath, "utf-8");
-    const statusEmoji = {
-      completed: "x",
-      in_progress: "/",
-      failed: "!",
-      skipped: "-",
-      pending: " ",
-    }[status];
-
-    // Replace the specific step checkbox
-    const stepRegex = new RegExp(
-      `(- \\[)[\\sx!/](\\].*?\\*\\*Step ${stepId}\\*\\*)`,
-      "g"
-    );
-    content = content.replace(stepRegex, `$1${statusEmoji}$2`);
-    fs.writeFileSync(this.planPath, content, "utf-8");
+  /**
+   * Update a step's status in the active plan file.
+   *
+   * Used to be a regex replace of one checkbox, which had two consequences worth
+   * naming: the `> Status:` line was left saying `COMPLETED` next to unticked boxes (and
+   * the CLI's prompt injection keys off that line, so it stopped reminding the model of
+   * remaining work), and `skipped` was written as `-` while the extension's reader
+   * treated `-` as *in progress*. This parses, changes one step, and re-renders through
+   * the single writer.
+   */
+  markStep(stepId: number, status: PlanStep["status"]): boolean {
+    const plan = this.loadActivePlan();
+    if (!plan) return false;
+    const step = plan.steps.find((s) => s.id === stepId);
+    if (!step) return false;
+    step.status = status;
+    return this.writeSpec({
+      goal: plan.goal,
+      complexity: plan.complexity,
+      generatedAt: plan.generatedAt,
+      status: plan.status,
+      steps: plan.steps,
+    });
   }
 
-  /** Mark the overall plan status */
-  updatePlanStatus(status: PlanStatus): void {
-    if (!fs.existsSync(this.planPath)) return;
-    let content = fs.readFileSync(this.planPath, "utf-8");
-    content = content.replace(
-      /> Status: \w+/,
-      `> Status: ${status}`
-    );
-    fs.writeFileSync(this.planPath, content, "utf-8");
+  /**
+   * Set the overall plan status. `ABORTED` is the only value honoured verbatim —
+   * otherwise the status is *derived* from the steps, because a model (or a stale file)
+   * declaring `COMPLETED` while boxes are unticked is the failure this engine had.
+   */
+  updatePlanStatus(status: PlanStatus): boolean {
+    const plan = this.loadActivePlan();
+    if (!plan) return false;
+    return this.writeSpec({
+      goal: plan.goal,
+      complexity: plan.complexity,
+      generatedAt: plan.generatedAt,
+      status,
+      steps: plan.steps,
+    });
+  }
+
+  /** Renders through the shared writer; the status is derived, never trusted. */
+  private writeSpec(spec: Parameters<typeof renderPlanMarkdown>[0]): boolean {
+    // `derivePlanStatus` returns ABORTED from a declared ABORTED but only reaches
+    // COMPLETED through the steps, so a declared COMPLETED with unticked boxes must be
+    // filtered here too — otherwise this method would upgrade it, which is the exact bug
+    // the `> Status:` line used to carry.
+    const derived = spec.status === "ABORTED" || spec.status === "COMPLETED"
+      ? spec.status
+      : derivePlanStatus(spec);
+    fs.mkdirSync(path.dirname(this.planPath), { recursive: true });
+    fs.writeFileSync(this.planPath, renderPlanMarkdown({ ...spec, status: derived }), "utf-8");
+    return true;
   }
 
   /** List all archived plans */
@@ -118,38 +138,23 @@ export class PlanEngine {
     return true;
   }
 
+  /**
+   * Reads through the shared parser. It used to have its own regex here, which is what
+   * made four readers disagree about the checkbox glyphs; the field names it exposes
+   * (`targetFiles`, `verificationCommand`) are the canonical ones now, so the CLI and the
+   * extension cannot quietly keep a private shape that only matches one of the writers.
+   */
   private parsePlanMarkdown(raw: string): ActivePlan {
-    const goalMatch = raw.match(/# 📋 Plan: (.+)/);
-    const statusMatch = raw.match(/> Status: (\w+)/);
-    const complexityMatch = raw.match(/> Complexity: (\w+)/);
-    const generatedMatch = raw.match(/> Generated: (.+)/);
-
-    const steps: PlanStep[] = [];
-    const stepRegex = /- \[([ x\/!-])\] \*\*Step (\d+)\*\*: (.+)\n(?:.*?Target: `(.+?)`\n)?(?:.*?Verify: `(.+?)`\n)?(?:.*?Risk: (LOW|MEDIUM|HIGH))?/gm;
-    let match;
-    while ((match = stepRegex.exec(raw)) !== null) {
-      const checkChar = match[1];
-      const statusMap: Record<string, PlanStep["status"]> = {
-        " ": "pending", "x": "completed", "/": "in_progress", "!": "failed", "-": "skipped",
-      };
-      steps.push({
-        id: parseInt(match[2]),
-        description: match[3].trim(),
-        targetFile: match[4],
-        verifyCmd: match[5],
-        risk: (match[6] as PlanStep["risk"]) || "LOW",
-        status: statusMap[checkChar] || "pending",
-      });
-    }
-
+    const { plan, warnings } = parsePlanMarkdown(raw);
     return {
-      goal: goalMatch?.[1] || "Unknown Goal",
-      generatedAt: generatedMatch?.[1] || new Date().toISOString(),
-      status: (statusMatch?.[1] as PlanStatus) || "PENDING_APPROVAL",
-      complexity: (complexityMatch?.[1] as ActivePlan["complexity"]) || "MEDIUM",
-      steps,
+      goal: plan?.goal ?? "Unknown Goal",
+      generatedAt: plan?.generatedAt ?? new Date(0).toISOString(),
+      status: plan?.status ?? "PENDING_APPROVAL",
+      complexity: plan?.complexity ?? "MEDIUM",
+      steps: plan?.steps ?? [],
       rawMarkdown: raw,
       planPath: this.planPath,
+      warnings,
     };
   }
 }

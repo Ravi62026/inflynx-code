@@ -34,6 +34,25 @@ function pidsMatching(marker: string): string[] {
 }
 
 /**
+ * Is a process with *exactly* this pid still alive? Used where the check is about one
+ * specific child rather than "anything carrying this command".
+ *
+ * `pidsMatching(String(pid))` is the wrong tool for that: it substring-matches the whole
+ * `pid command` line, so a bare pid like `36092` also matches any unrelated live process
+ * whose pid or arguments happen to contain those digits — and that line never disappears,
+ * so a correctly-reaped shell failed the assertion. Sending signal 0 reports existence
+ * without delivering anything: ESRCH means gone, anything else (incl. EPERM) means alive.
+ */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: any) {
+    return err?.code !== "ESRCH";
+  }
+}
+
+/**
  * Polls a shell's log until `needle` shows up, rather than sleeping a guessed amount.
  * Returns the read at the moment the output really arrived, or fails with the last
  * observed state so a timeout is diagnosable instead of mysterious.
@@ -284,7 +303,14 @@ async function runBackgroundShellTests(): Promise<void> {
       const record = registry.get(started.id)!;
       assert.equal(record.endedAt !== undefined, true, "the lifetime cap did not fire");
       assert.equal(record.terminatedReason, "timeout", `wrong termination reason: ${record.terminatedReason}`);
-      assert.ok(!pidsMatching(String(pid)).length, `pid ${pid} outlived its lifetime cap`);
+      // The registry recording `timeout` proves the cap fired; the OS actually reaping the
+      // process happens a moment later when SIGTERM lands. Asserting it gone synchronously
+      // raced under full-suite load — wait for the death. The check is by exact pid, not
+      // `pidsMatching(String(pid))`, which substring-matched unrelated live processes.
+      await waitUntil("the capped shell's pid to disappear", () => ({
+        ok: !pidAlive(pid),
+        seen: pidAlive(pid) ? `pid ${pid} still alive` : "gone",
+      }));
       console.log("✓ Test 5 Passed: a forgotten shell still dies at its lifetime cap.");
     }
 

@@ -12,6 +12,7 @@ import path from "node:path";
 import { TaskClassifier } from "../../packages/agent-core/src/planning/TaskClassifier.js";
 import { ExecutionContext } from "../../packages/agent-core/src/orchestrator/ExecutionContext.js";
 import { StructuredPlanEngine } from "../../packages/agent-core/src/planning/StructuredPlan.js";
+import { cleanupOnExit } from "../helpers/tmp.js";
 
 async function runPhase6Tests() {
   console.log("🧪 Running Phase 6 Task Classifier, Context Manager & Structured Planning Tests...\n");
@@ -134,7 +135,11 @@ async function runPhase6Tests() {
   // Tests 5 & 6: StructuredPlanEngine — DAG Step Dependency Resolution
   // Scoped to a temp dir: `process.cwd()` here used to overwrite the developer's real
   // `.inflynx/PLAN.md` with a fictional plan on every `pnpm test:unit` (backlog M10).
-  const planEngine = new StructuredPlanEngine(fs.mkdtempSync(path.join(os.tmpdir(), "inflynx-plan-")));
+  // Moving out of the repo is only half of M10 — the dir must also go away, or the fix
+  // just relocates the litter. `finally` cannot cover this file because the failure paths
+  // call `process.exit(1)`, which skips it; the `exit` hook does cover those.
+  const planRoot = cleanupOnExit(fs.mkdtempSync(path.join(os.tmpdir(), "inflynx-plan-")));
+  const planEngine = new StructuredPlanEngine(planRoot);
   planEngine.createPlan("Migrate to Shared Orchestrator", "HIGH", [
     { id: 1, title: "Create StateMachine", description: "Build state machine", targetFiles: ["src/StateMachine.ts"], risk: "LOW", dependencies: [] },
     { id: 2, title: "Build AgentOrchestrator", description: "Build orchestrator", targetFiles: ["src/AgentOrchestrator.ts"], risk: "MEDIUM", dependencies: [1] },

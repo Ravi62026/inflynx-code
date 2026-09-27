@@ -25,6 +25,7 @@ import { AgentEventBus } from "../../packages/protocol/src/index.js";
 import { ToolRegistry, CORE_TOOLS } from "../../packages/tool-runtime/src/index.js";
 import { AgentOrchestrator } from "../../packages/agent-core/src/orchestrator/AgentOrchestrator.js";
 import { LocalJsonSessionStore } from "../../packages/session-store/src/index.js";
+import { cleanupOnExit } from "../helpers/tmp.js";
 
 // ─── Fake streamModel() transport (OpenAI-compatible SSE over fetch) ────────────
 
@@ -77,14 +78,14 @@ async function runGatewayEnforcementTests() {
   // store; the root itself was still `process.cwd()`, so every run wrote
   // `.tmp_gateway_test/` and, since Phase 30, a checkpoint into the developer's
   // `.inflynx/`. Same class, same fix: work in a temp directory. (backlog M2, M10)
-  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "inflynx-gw-workspace-"));
+  const workspaceRoot = cleanupOnExit(fs.mkdtempSync(path.join(os.tmpdir(), "inflynx-gw-workspace-")));
   const scratchDir = path.join(workspaceRoot, ".tmp_gateway_test");
   const scratchFile = path.join(scratchDir, "scratch.txt");
   const relativeScratchFile = path.relative(workspaceRoot, scratchFile);
   // The session store must never point at the real workspace: doing so wrote a
   // fresh session row into the developer's .inflynx/session_store.json on every
   // test run (backlog M2).
-  const storeDir = fs.mkdtempSync(path.join(os.tmpdir(), "inflynx-gw-store-"));
+  const storeDir = cleanupOnExit(fs.mkdtempSync(path.join(os.tmpdir(), "inflynx-gw-store-")));
 
   fs.mkdirSync(scratchDir, { recursive: true });
   if (fs.existsSync(scratchFile)) fs.unlinkSync(scratchFile);
@@ -156,8 +157,18 @@ async function runGatewayEnforcementTests() {
       stubFetchSequence(toolCallResponse("write_file", { path: relativeScratchFile, content: "should never land" }));
       const result = await orchestrator.runTurn("please write a file");
 
-      if (approvalCalls === 1 && result.toolResults.length === 0 && !fs.existsSync(scratchFile)) {
-        console.log("✓ Test 2 Passed: Denied approval prevented tool execution — no ToolResult recorded, no file written.");
+      // Two separate properties, both necessary: nothing ran, **and** the refusal is
+      // visible to whoever consumes `toolResults` (CLI summary, extension transcript).
+      // Silently dropping denied calls was the old behaviour and it hid refusals from the UI.
+      const denied = result.toolResults[0];
+      if (
+        approvalCalls === 1 &&
+        result.toolResults.length === 1 &&
+        denied?.isError === true &&
+        /denied/i.test(denied.output) &&
+        !fs.existsSync(scratchFile)
+      ) {
+        console.log("✓ Test 2 Passed: Denied approval prevented tool execution — file not written, refusal recorded as an errored result.");
       } else {
         console.error("❌ Test 2 Failed:", { approvalCalls, toolResults: result.toolResults, exists: fs.existsSync(scratchFile) });
         process.exit(1);

@@ -164,13 +164,14 @@ export class CommandPolicy {
     args: string[],
     cwd: string,
     timeoutMs: number = 30_000,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    env?: NodeJS.ProcessEnv
   ): Promise<{ output: string; exitCode: number | null; spawnError?: string; aborted: boolean }> {
     return new Promise((resolve) => {
       const proc = execFile(
         executable,
         args,
-        { cwd, timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
+        { cwd, timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024, env: env ?? process.env },
         (err, stdout, stderr) => {
           signal?.removeEventListener("abort", onAbort);
           const spawnError =

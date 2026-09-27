@@ -33,12 +33,59 @@ export type ShellDecision = "allow" | "ask" | "deny";
 export type JoinOperator = "start" | "&&" | "||" | ";" | "|" | "|&" | "newline" | "&";
 
 export interface ShellSegment {
-  /** Raw text of this one command, as written. */
+  /** Raw text of this one command, as written. Shown to the human, never rule-matched. */
   text: string;
   /** Best-effort argv, quotes removed. Used for rule matching only. */
   tokens: string[];
   /** How this segment attaches to the previous one. */
   precededBy: JoinOperator;
+}
+
+/** Placeholder standing in for a quoted argument during rule matching. */
+const QUOTED_PLACEHOLDER = "\u0000quoted\u0000";
+
+/**
+ * Blank out quoted regions so rules match **structure, not data** (backlog N8).
+ *
+ * Quoted text is an argument, not a command — but the rules are regexes over a string,
+ * and `echo 'please do not rm -rf . in prod'` contains a pattern that reads, to a naive
+ * match, exactly like the thing it is talking about. Before this, that plain `echo` was
+ * HARD-DENIED, and `grep -nEi 'exec|spawn|rm\(|unlink' file` was reported to the user as
+ * "deletes or truncates files". A prompt that states a false reason is worse than no
+ * prompt, because it trains the human to approve without reading.
+ *
+ * This does NOT weaken real detection, and the reason matters: what executes a destructive
+ * payload is the *program*, so inline-code programs are escalated by identity below
+ * (`sh -c "..."`, `python -c "..."`), not by reading their argument. Redacting the argument
+ * of a program that treats its argument as data is precisely correct; redacting the
+ * argument of a shell would not be, and that case is covered separately.
+ */
+export function redactQuotedArguments(text: string): string {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === "\\") {
+      // An escaped character outside quotes is data too (\; is a literal semicolon).
+      out += "\u0000esc\u0000";
+      i += 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      const quote = ch;
+      i++;
+      while (i < text.length) {
+        if (quote === '"' && text[i] === "\\") { i += 2; continue; }
+        if (text[i] === quote) { i++; break; }
+        i++;
+      }
+      out += QUOTED_PLACEHOLDER;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
 }
 
 export interface ShellFeatures {
@@ -332,6 +379,18 @@ const DENY_RULES: Rule[] = [
 ];
 
 const ASK_RULES: Rule[] = [
+  {
+    // A shell's `-c` argument IS code. Escalated by program identity so the rule still
+    // fires once quoted arguments are redacted — otherwise this would be a bypass.
+    match: /(^|[\s;&|])(?:sudo\s+)?(?:ba|z|k|da)?sh\s+(?:[-+]\S*\s+)*-c\b/,
+    decision: "ask",
+    reason: "runs an inline program: the -c argument is code, not data",
+  },
+  {
+    match: /(^|[\s;&|])(?:python[0-9.]*|node|iojs|deno|tsx?|perl|ruby|php|osascript|lua|swift)\s+(?:\S+\s+)*-[ce]\b/,
+    decision: "ask",
+    reason: "runs an inline program: the -c/-e argument is code, not data",
+  },
   { match: /\b(rm|rmdir|unlink|shred|truncate)\b/, decision: "ask", reason: "deletes or truncates files" },
   { match: /\bmv\b/, decision: "ask", reason: "moves files (no diff preview, no checkpoint)" },
   { match: /\bgit\b[^|]*\b(commit|push|reset|checkout|restore|clean|rebase|merge|stash|branch\s+-D|tag)\b/, decision: "ask", reason: "changes git state" },
@@ -468,15 +527,18 @@ const CROSS_SEGMENT_DENY_RULES: Rule[] = [
 function classifySegment(segment: ShellSegment, userRules: ReturnType<typeof loadUserShellRules>): SegmentVerdict {
   const text = segment.text;
   const program = segment.tokens[0] || text.split(/\s+/)[0] || "";
+  // Rules see structure; the human sees the original text. Matching raw `text` is what
+  // made quoted words look like commands (backlog N8).
+  const matchText = redactQuotedArguments(text);
 
   // Order is: user's explicit intent → deny → ask → allow → unknown.
   const matched =
-    firstMatch(userRules.deny, text) ||
-    firstMatch(userRules.ask, text) ||
-    firstMatch(userRules.allow, text) ||
-    firstMatch(DENY_RULES, text) ||
-    firstMatch(ASK_RULES, text) ||
-    firstMatch(ALLOW_RULES, text);
+    firstMatch(userRules.deny, matchText) ||
+    firstMatch(userRules.ask, matchText) ||
+    firstMatch(userRules.allow, matchText) ||
+    firstMatch(DENY_RULES, matchText) ||
+    firstMatch(ASK_RULES, matchText) ||
+    firstMatch(ALLOW_RULES, matchText);
 
   if (matched) {
     return { text, program, decision: matched.decision, rule: String(matched.match || matched.program), reason: matched.reason };
@@ -539,10 +601,11 @@ export function reviewShellCommand(
   const { segments, features } = parseShellSegments(trimmed);
 
   // Hard refusals that describe a *relationship* between commands are checked against
-  // the whole line first, because no individual segment contains them.
+  // the whole line first, because no individual segment contains them. Redacted the same
+  // way as segments: the joiners are real syntax, quoted words are not (N8).
   const crossSegment = firstMatch(
     [...userRules.deny, ...CROSS_SEGMENT_DENY_RULES, ...DENY_RULES],
-    trimmed
+    redactQuotedArguments(trimmed)
   );
   if (crossSegment) {
     const verdict: SegmentVerdict = {

@@ -1,8 +1,20 @@
 import { checkRateLimit } from "@inflynx/cache";
+import fs from "node:fs";
 import path from "node:path";
+import {
+  formatPatchSafetyForUser,
+  reviewPatchSafety,
+  TurnCheckpointStore,
+  type PatchSafetyReview,
+} from "@inflynx/patch-engine";
 import { CanonicalPathGuard, reviewShellCommand, appendShellAudit, validatePublicUrl, hashShellOutput, type ShellApprovalSource, type ShellCommandReview } from "@inflynx/policy-engine";
-import { TurnCheckpointStore } from "@inflynx/patch-engine";
 import { ToolRegistry, executeTool, createToolExecutionContextFromGuard, ShellRegistry, type ToolCall, type ToolResult, type ToolDefinition, type ToolExecutionContext, type ToolExecutionMode } from "./index.js";
+import { classifyGitInvocation } from "./git-tools.js";
+
+/** Non-string-tolerant cast for an argv array the model handed in. */
+function toStringArray(raw: unknown): string[] {
+  return Array.isArray(raw) ? raw.map((a) => String(a)) : [];
+}
 
 export interface GatewayExecutionOptions {
   activeMode?: ToolExecutionMode;
@@ -24,6 +36,12 @@ export interface GatewayExecutionOptions {
    * records, and only the second one is worth re-reading after an incident.
    */
   shellApprovalSource?: ShellApprovalSource;
+  /**
+   * Says a human was shown a fake-fix violation and agreed to proceed anyway
+   * (backlog Phase 32). Absent means the gate enforces: a patch that suppresses a
+   * diagnostic or deletes tests is refused, not silently applied.
+   */
+  patchApprovalSource?: "user:prompt" | "user:override-patch-safety";
 }
 
 /**
@@ -52,6 +70,64 @@ const SHELL_HUMAN_SOURCES: ReadonlySet<string> = new Set([
   "user:session-rule",
   "flag:auto-approve",
 ]);
+
+/**
+ * Builds a fake-fix review for whichever file-mutating tool is running (Phase 32).
+ *
+ * Every tool states an edit differently and the enforcement must see the same thing
+ * whichever way it arrives: a before/after pair for one path. `delete_path` is the odd
+ * one — its "after" is emptiness, so it is reported as a deletion, which is what lets a
+ * deleted test file be caught by name rather than by diff.
+ *
+ * Returns null for anything that is not a content edit, so unrelated mutating tools are
+ * unaffected.
+ */
+export function reviewMutatingPatchForSafety(
+  tool: ToolDefinition,
+  args: Record<string, unknown>,
+  io: { readGuarded: (relPath: string) => string }
+): PatchSafetyReview | null {
+  const target = typeof args.path === "string" ? args.path : undefined;
+  if (!target) return null;
+
+  switch (tool.name) {
+    case "patch_file": {
+      const before = typeof args.target_code === "string" ? args.target_code : "";
+      const after = typeof args.replacement_code === "string" ? args.replacement_code : "";
+      if (!before && !after) return null;
+      return reviewPatchSafety({ filePath: target, before, after });
+    }
+    case "write_file": {
+      const after = typeof args.content === "string" ? args.content : "";
+      // The whole previous file is the baseline, so an edit that quietly drops a hundred
+      // assertions is caught even though this tool has no "target snippet" concept.
+      return reviewPatchSafety({ filePath: target, before: io.readGuarded(target), after });
+    }
+    case "edit_file": {
+      const edits = Array.isArray(args.edits) ? (args.edits as Array<{ oldText?: string; newText?: string }>) : [];
+      if (edits.length === 0) return null;
+      // Reviewed as the single resulting pair, not per edit: a fake fix spread across four
+      // hunks must not look like four safe edits.
+      const before = io.readGuarded(target);
+      let after = before;
+      for (const e of edits) {
+        if (typeof e?.oldText === "string" && typeof e?.newText === "string" && after.includes(e.oldText)) {
+          after = after.replace(e.oldText, e.newText);
+        }
+      }
+      return reviewPatchSafety({ filePath: target, before, after });
+    }
+    case "delete_path":
+      return reviewPatchSafety({
+        filePath: target,
+        before: io.readGuarded(target),
+        after: "",
+        deletesFile: true,
+      });
+    default:
+      return null;
+  }
+}
 
 /**
  * Below this size a repeat read is *not* deduplicated.
@@ -146,6 +222,21 @@ export class ToolExecutionGateway {
    */
   shutdownShells(): number {
     return this.shells.reapAll("reaped");
+  }
+
+  /**
+   * Reads a workspace file *through this session's guard*, returning "" for anything it
+   * would not let a tool touch. Used to build the before-side of a fake-fix review, and
+   * exported rather than reimplemented by callers so there is only ever one path
+   * authority — the mistake that made backlog N6 possible.
+   */
+  readGuardedText(relPath: string): string {
+    try {
+      const abs = this.pathGuard.validateAndResolve(relPath);
+      return fs.existsSync(abs) && fs.statSync(abs).isFile() ? fs.readFileSync(abs, "utf-8") : "";
+    } catch {
+      return "";
+    }
   }
 
   /** Start of a new agentic turn: nothing from the previous turn is assumed visible. */
@@ -331,6 +422,23 @@ export class ToolExecutionGateway {
     //     plan mode on purpose, because writing .inflynx/PLAN.md is the whole point
     //     of the mode; this fence is what makes exposing it safe.
     if (mode === "plan" && tool.isMutating) {
+      // `git` is declared mutating so caches and fences treat it as able to write, but it
+      // has no path argument to inspect: a path-only scan would wave `git commit` through
+      // in [plan] mode and block a harmless `git status`. Grade the invocation instead.
+      if (tool.name === "git") {
+        const gitGrade = classifyGitInvocation(toStringArray(args.args)).grade;
+        if (gitGrade !== "read-only") {
+          return {
+            toolCallId: call.id,
+            toolName: call.name,
+            output:
+              `Error: [plan] mode can only inspect the repository, but \`git ${toStringArray(args.args)[0] || "?"}\` ` +
+              `would change it. Ask the user to switch to [agent] mode to commit, checkout, reset or branch.`,
+            isError: true,
+            durationMs: Date.now() - startMs,
+          };
+        }
+      } else {
       const planRoot = path.join(this.pathGuard.getWorkspaceRoot(), ".inflynx");
       for (const key of pathKeys) {
         const resolved = args[key];
@@ -345,6 +453,7 @@ export class ToolExecutionGateway {
           isError: true,
           durationMs: Date.now() - startMs,
         };
+      }
       }
     }
 
@@ -413,6 +522,41 @@ export class ToolExecutionGateway {
         isError: true,
         durationMs: Date.now() - startMs,
       };
+    }
+
+    // 3c. Anti-fake-fix enforcement (backlog Phase 32).
+    //
+    // Phase 31 made "done" mean the workspace's own gates passed, which created a new
+    // incentive: silence the compiler, skip the test, assert `true`. That would make the
+    // gate's green worth nothing, so a patch that only *hides* the problem is refused
+    // here, at the same choke point as path and shell policy — not merely advised against
+    // in a prompt. A human may still override, and that path is explicit and recorded.
+    const safety = reviewMutatingPatchForSafety(tool, args, {
+      readGuarded: (relPath: string) => this.readGuardedText(relPath),
+    });
+    if (safety && !safety.safe) {
+      if (options.patchApprovalSource !== "user:override-patch-safety") {
+        console.warn(
+          `[gateway] refused a fake fix by ${call.name} on ${String(args.path || "?")}: ` +
+          safety.violations.map((v) => v.rule).join(", ")
+        );
+        return {
+          toolCallId: call.id,
+          toolName: call.name,
+          output:
+            `Error: this edit was refused because it suppresses the problem instead of fixing it.\n\n`
+            + formatPatchSafetyForUser(safety)
+            + `\n\nFix the underlying defect. If you are confident the suppressed diagnostic is ` +
+            `wrong (a genuine false positive), say so explicitly in your reply and ask the user to ` +
+            `override — do not quietly re-attempt a variant.`,
+          isError: true,
+          durationMs: Date.now() - startMs,
+        };
+      }
+      console.warn(
+        `[gateway] ⚠ human overrode anti-fake-fix for ${call.name} on ${String(args.path || "?")}: ` +
+        safety.violations.map((v) => v.rule).join(", ") + " — proceeding as approved"
+      );
     }
 
     // 4. Repeat-read dedupe, on the *resolved* arguments so "src/app.ts" and

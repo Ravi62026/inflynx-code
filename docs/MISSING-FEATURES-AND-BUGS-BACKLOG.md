@@ -30,6 +30,76 @@ postponed behind "auth is out of scope".
 
 ---
 
+## 0.5 Current status — read this first when resuming
+
+> **As of:** 2026-09-26/27 · **HEAD:** `7237a7c` (1 commit ahead of `origin/main`, **not pushed**)
+> Everything below was measured from the working tree, not estimated. Re-run the commands at the
+> end of this section before trusting it — this file is a log, not a live system.
+
+| | | |
+|---|---|---|
+| **Phases landed** | **29 / 47** | 62% |
+| **Effort-weighted** | **78 / 137** eng-days | 57% |
+| **P0 (critical)** | **17 / 17** | **100% — nothing critical left** |
+| P1 | 11 / 19 | 58% — open: 27, 34, 35, 36, 39, 40, 45, 46 |
+| P2 | 1 / 11 | open: 18, 19, 28, 33, 37, 38, 41, 42, 44, 47 |
+| Findings actually fixed | **≈ 93 / 188** | ~49% — §3 rows are still under-marked (see the bookkeeping note below); verify against §11 before re-implementing anything |
+| Tests | **37 / 37 suites** | baseline at audit time was 17. `grep -rhoE 'assert\.[a-zA-Z]+' tests/unit \| wc -l` → 1,145 *assertion statements* (counting a loop body once per call site, so it overstates runs and understates the hand-rolled `if (…) throw` suites — treat it as a size proxy, not a pass criterion) |
+| Build / typecheck | 0 / 0 | `pnpm build`, `pnpm typecheck` |
+
+**Landed:** Phases 1–17, 20–24, 26, 29–32, 43, plus MCP hygiene B5/B6/B9. Full per-phase detail —
+including the bug each phase's tests caught and the verification transcripts — is **§11**.
+**✅ N5–N16 are fixed** (2026-09-27, see §11 for the same date). N5–N9 are the five findings the agent
+raised against itself; N10–N11 surfaced while writing Phase 24's tests and N12–N16 while writing Phase
+26's. Each is closed with a test that pins both directions — the false positive gone *and* the real
+control still biting.
+
+**Next, in order:** **27 → 33 → 28** (media/attachment transport, then the sensitive-content fence,
+then parallel read-only execution + arg validation). After those, the P2 tail: 18 prompt caching,
+45 eval harness, 46 release engineering.
+
+**Known bookkeeping gap:** when a phase closed findings, the §3 rows were usually not updated. Two
+consequences: (a) §3's marked-closed count understates real progress badly (10 vs ~79); (b) do **not**
+re-implement something because its row still says open — check §11 and the code first.
+
+Re-measure with:
+```bash
+git log --oneline -1 && git status -sb | head -1
+pnpm build && pnpm typecheck && pnpm test:unit      # expect 37/37
+grep -cE '^\| P[0-9] \| ✅' docs/MISSING-FEATURES-AND-BUGS-BACKLOG.md   # landed phase rows (29)
+grep -E '^\| P[0-9] \| ✅' docs/MISSING-FEATURES-AND-BUGS-BACKLOG.md \
+  | awk -F'|' '{gsub(/ /,"",$4); s+=$4} END {print s "/137 eng-days"}'   # effort, summed from the rows
+```
+
+### 0.5.1 Orientation map — so a new session does not read 25,708 lines
+
+The repo is 102 source files / ~25.7k lines (re-measured 2026-09-27; the LOC column below is
+`find … -name "*.ts" -o -name "*.tsx" | grep -v .test. | xargs wc -l`). **Do not "read the codebase
+first"** — this table plus the `file:line` pointers above are the orientation. Targeted reads are
+~1.4k lines for N5–N9; an undirected sweep just burns the window.
+
+| Package / app | LOC | What lives there — and the file to open first |
+|---|---|---|
+| `apps/cli` | 2,097 | REPL, slash commands, all event-bus rendering, approval prompts, diff preview. **The user-visible surface.** (`src/index.ts`) |
+| `agent-core` | 3,769 | `AgentOrchestrator.runTurn` (loop, approvals, gate, checkpoint boundary, `plan.updated`), `ExecutionContext`, `BudgetManager` + effort profiles, `ApprovalProvider`, `StateMachine`, `verification/`, `planning/` (now a wrapper over `protocol`'s plan format) |
+| `tool-runtime` | 3,804 | The 20 core tools: read/search/glob/list + edit_file/patch_file/write_file + delete/move + web/fetch + 3 background-shell + `git` (`git-tools.ts`) + `update_plan` (`plan-tool.ts`) + `list_diagnostics`/`list_symbols`/`find_definition` (`diagnostics-tools.ts`, the in-process TS language service). `ToolExecutionGateway` is the single choke point (path guard, mode fence, policy, anti-fake-fix, audit, cache, touched-path) |
+| `policy-engine` | 1,617 | `shell-rules.ts` (parser + allow/ask/deny), `command-policy.ts` (process execution), `path-guard.ts` (`CanonicalPathGuard`), `preview-path.ts`, `shell-audit.ts` |
+| `patch-engine` | 1,569 | `diff.ts` (Myers + parse/apply), `checkpoints.ts` (undo journal), `patch-safety.ts` (anti-fake-fix rules), `index.ts` (`applySurgicalPatch`, `EditTransactionManager`) |
+| `mcp-runtime` | 1,153 | `json-rpc.ts` (session/timeouts/exit), `stdio-transport.ts`, `http-transport.ts`, `index.ts` (manager, trust gating, result rendering) |
+| `config` | 1,502 | `mcp-config.ts` (load + env allowlist + trust store), `workspace-root.ts` (the file behind N7), `model-catalog.ts`, `credential-store.ts`, terminal sanitizer (N5) |
+| `model-gateway` | 1,540 | provider adapters + `errors.ts` (`InflynxProviderError` taxonomy) |
+| `session-store` | 961 | `LocalJsonSessionStore` (default) + Postgres store |
+| `vector-store` / `workspace-runtime` / `skill-runtime` / `cache` / `protocol` | 106 / 485 / 243 / 130 / 441 | HNSW index, indexer+file-watch, skills, rate limit, event types — **`protocol` also holds the canonical plan format (`src/plan.ts`) and has no dependencies, which is why it is the shared layer** |
+| `apps/server` | 883 | loopback HTTP + SSE fan-out (`bus.on("*")` forwards every event) |
+| `apps/vscode` | 5,237 | extension host + webview — **the largest area in the repo, and the least covered**: where M11/M13/M17/M18 UI gaps live |
+| `plugin-sdk` (20) · `telemetry` (9) | — | effectively empty; Phase 44 decides delete-or-implement. **Don't build on these** |
+
+Where to look for a behavior: model loop → `agent-core`; a tool's effect on disk → `tool-runtime` +
+`policy-engine/path-guard.ts`; "why did the approval say that" → `policy-engine/shell-rules.ts` +
+`apps/cli/src/index.ts`; anything about MCP → `mcp-runtime` + `config/mcp-config.ts`.
+
+---
+
 ## 1. The honest grade
 
 | Score | Dimension | Why |
@@ -82,7 +152,7 @@ Two earlier claims were wrong and are corrected here:
 | Test suite for a real multi-turn agent loop | 4 scenarios, 1 shape | ≥ 14 scenarios (§Phase 39 matrix) |
 | Max turns sustainable in one session | unbounded context → provider 400 | ≥ 200 turns with eviction + compaction |
 | Per-tool output cap | only `fetch_url` (12k chars) | central cap on all tools |
-| Tool count | 8 | ≥ 18 |
+| Tool count | 8 | ≥ 18 (at **15** after Phase 23) |
 | `contextWindow` known for catalog models | 3 of 8 | 8 of 8 + mandatory for BYOK |
 | Slash commands / UI surfaces that do what they say | ~55% | 100% (fix or delete) |
 | `.vsix` shippable from CI | no CI packaging | signed artifact per release |
@@ -151,7 +221,7 @@ Severity: **P0** = blocker, unsafe or broken today. **P1** = significant, blocks
 | C10 | P1 | Tool calls execute strictly sequentially (`for (const tc of pendingToolCalls)`) — no parallel read-only execution, so N file reads cost N loop iterations | 28 |
 | C11 | P1 | `switchModel()` refuses to carry history across providers (correct, deliberate) but there is no in-provider context migration, so `/model` silently loses the conversation for the user | 34 |
 | C12 | P1 | `abort()` immediately re-creates the `AbortController` (`ExecutionContext.ts:86-89`), so in-flight work is not really cancelled; a test currently asserts this behaviour as correct (`session-recovery.test.ts:94-98`) | 6 |
-| C13 | P1 | **Half closed by Phase 31.** ~~No verification gate~~ — `VerificationEngine.runAllChecks()` now runs at the end of every source-changing turn. **Still open:** `RepairLoop.validatePatchSafety()` is never called from any product path, so nothing yet rejects the fake-fix escapes (`@ts-ignore`, commented-out assertions). | 32 |
+| C13 | P1 | ✅ **Closed** (gate by Phase 31, fake-fix enforcement by Phase 32). The verification loop runs at the end of a source-changing turn *and* a patch that only silences a diagnostic is now refused at the gateway, so "green" cannot be bought with `@ts-ignore`. | — |
 | C14 | P2 | `TaskClassifier` is pure keyword matching (`"fix"` → `debug` mode, which grants shell + write). Currently unwired — good. Never wire it to a permission decision | 32 |
 | C15 | P2 | `plan.txt` Phase 1 requires "Ask 2–4 clarifying questions and **WAIT** for answers", but the loop has no mid-turn user-input mechanism (only per-tool approval). The interview flow is unimplementable today | 24 |
 | C16 | **P0** | *(found by Phase 7)* A read-only turn ends in `exploring`, which had **no edge to `completed`** — so every plain question returned `isCompleted: false`. The silent `if (canTransitionTo)` guards hid it; the loud refusal diagnostic exposed it on the first run. `tests/unit/orchestrator.test.ts` had even **codified the bug as an assertion** ("Illegal direct transition from exploring -> completed") | done |
@@ -335,6 +405,18 @@ Severity: **P0** = blocker, unsafe or broken today. **P1** = significant, blocks
 | N2 | P2 | No privacy statement of what leaves the machine: prompts+`.env` to provider, repo graph to `mermaid.ink`, DuckDuckGo scraping, OpenRouter `HTTP-Referer` header. `SecurityPage`/`PrivacyPage` exist in `fe/` only | 46 |
 | N3 | P3 | No versioning/release automation, changelog, SBOM, `pnpm audit` gate, or dep freshness policy; `typescript ^6.0.2` / `@types/node ^25` pinned ahead of ecosystem | 47 |
 | N4 | P3 | `docker-compose.yml` publishes Postgres/Redis to the host with a default password and no Redis auth — acceptable for dev, needs a prod profile | 47 |
+| N5 | P1 | ✅ **FIXED** — **Terminal escape-sequence injection.** Untrusted text reaches `stdout` raw: `outputSnippet` (`apps/cli/src/index.ts:503,506`), model text/thought deltas (`:511,515`), restored session transcripts. Content from MCP servers, cloned repos or command output can carry OSC 52 (clipboard), OSC 8 (clickable hyperlinks) or ANSI that visually rewrites the **approval prompt** — the one control every other safety measure in this file assumes. `redactSecrets` strips keys, not escapes; no sanitizer exists anywhere (0 hits for `OSC`). Fix at the same egress boundary redaction uses, and sanitize only the variable payload — our own colors are ANSI, so blanket-stripping breaks the UI | — |
+| N6 | P1 | ✅ **FIXED** — **CLI diff preview bypasses the path guard.** `apps/cli/src/index.ts:464-465` and `:476-481` build `absPath = path.isAbsolute(filePath) ? filePath : join(workspaceRoot, filePath)` from the *proposed* args and call `fs.readFileSync` before the gateway ever sees the call. A tool proposal naming `/Users/me/.ssh/id_rsa` gets read and printed at approval time even though the write is refused — the read happens on a second, unguarded path-resolution authority. Aggravator the reporter missed: **no size cap either**, so a huge path hangs the CLI. Phase 22 covered gateway args; this is outside the gateway | — |
+| N7 | P1 | ✅ **FIXED** — **Workspace root is captured by a nested `.inflynx`.** `packages/config/src/workspace-root.ts:16-21` accepts `.inflynx` as a root marker while walking up, *before* checking for `pnpm-workspace.yaml` higher up. `apps/cli/.inflynx` exists, so `pnpm dev` resolves the root to `apps/cli` — verified live — and the agent physically cannot read `packages/*`. Self-reinforcing: one run creates the marker, later runs are confined by it. Measured cost in the self-audit: the agent noticed the denial, worked around it instead of reporting it, and audited 1 of ~19 packages. Fix ordering: monorepo/VCS markers first, `.inflynx` only as a last resort | — |
+| N8 | P1 | ✅ **FIXED** — **Shell rules match inside quoted arguments.** `classifySegment` (`shell-rules.ts:469`) tests rules against `segment.text`, which still contains quoted data, even though `:38` defines a quotes-stripped `argv` "for rule matching only". Reproduced live: `grep -nEi 'exec|spawn|rm\(|unlink|…' file` → `ask / "deletes or truncates files"`, and `echo 'please do not rm -rf . in prod'` → **`deny`**. A destructive-pattern denial fired by a string literal both blocks legitimate work and teaches the user to click through prompts whose reasons are wrong — the exact failure Phase 20 was built to avoid | — |
+| N9 | P2 | ✅ **FIXED** — **`search_files` on a file path returns `spawn ENOTDIR`** (`path: "src/index.ts"` + `file_glob`) — seen live in the self-audit, where the agent then burned 5 overlapping `read_file` calls on one 2053-line file. No file-vs-directory check before spawning the searcher. Credit where due: Phase 20's exit-code honesty is working — it reported the real error instead of the old "No matches found" lie | — |
+| N10 | P1 | ✅ **FIXED** — **a denied tool call vanished from `TurnResult.toolResults`.** The model was told (`AgentOrchestrator` puts the refusal in the tool message) but the array the CLI summary and the extension transcript read got nothing, so a refusal the *human* made was invisible in the UI. Found because Phase 24's test asserted the refusal through that array — and the assertion passed against a field that was always empty | — |
+| N11 | P2 | ✅ **FIXED** — **registry-contract test pinned a bare tool count**, so it could report drift without naming it, and an addition plus a rename keeps the number steady. When it did fire, my first repair recited 15 tool names of which 3 do not exist (`update_memory`, `mcp_resource_read`, `view_image`) — the probe caught what the memory did not | — |
+| N12 | P1 | ✅ **FIXED** — **four readers parsed `.inflynx/PLAN.md` with four regexes and they disagreed about the checkbox glyphs.** `PlanEngine.markStep` writes `x / ! -`; `StructuredPlanEngine` wrote `x /` and never `-`; `apps/vscode/src/trees/PlanTreeProvider.ts` matched `[ xX~- ]` with **`-` → in progress** and no `/` at all, so a skipped step rendered as live work and an in-progress one as pending; the CLI's prompt injection (`apps/cli/src/index.ts:305-312`) filtered `pending` only, so the step being worked on vanished from the list the model was told to execute | 26 |
+| N13 | P1 | ✅ **FIXED** — **`plan.updated` was declared in the event protocol and emitted by nothing.** Every plan UI was wired to a signal that never fired, which is a large part of why "the agent is following its plan" was unverifiable. Also: `PlanEngine.markStep` replaced one checkbox by regex and never touched `> Status:`, so `COMPLETED` sat beside unticked boxes — and the CLI's injection keys off that line | 26 |
+| N14 | P1 | ✅ **FIXED** — **`filterToolsForMode` had a name allowlist of one** (`if (tool.name === "write_file") return true;` in plan mode), so `update_plan` and `git` were invisible to the model in `[plan]`: `plan.txt` instructed it to use a tool that was not in the request, and Phase 24's per-invocation git fence had no traffic to inspect. A UX filter silently became the reason a control could not be reached | 26, 24 |
+| N15 | P2 | ✅ **FIXED** — omitting a **completed** step from a plan update silently deleted its `target_files` and `verification_command`, i.e. the fields Phase 31's gate reads. Found while writing the phase's own test, which had assumed the opposite | 26 |
+| N16 | P2 | ✅ **FIXED** — `executeTool` rebuilt the result from `output`/`isError`/`exitCode`, so a tool's structured payload could not reach the caller at all; the only channel for "what plan is this" was to re-parse a string written for the model and capped by the gateway | 26 |
 
 ---
 
@@ -579,10 +661,10 @@ Legend — **Pri**: P0 blocker / P1 significant / P2 quality / P3 polish. **Est*
 | P0 | ✅ **20. Real shell execution + rule-based approval** | 5 | 11 | `execute_shell` became usable |
 | P1 | ✅ **21. Background & persistent shells** | 3 | 20 | Dev servers, installs, long builds |
 | P1 | ✅ **22. File lifecycle tools + registry hygiene** | 3 | 5 | glob, delete, move, session registry |
-| P1 | **23. Multi-hunk `edit_file`** | 3 | 29, 30 | Refactors in one call |
-| P1 | **24. Git tool family** | 3 | 20 | Diffs, log, blame, commit |
-| P1 | **25. LSP/diagnostics + symbol tools** | 4 | 22 | Structure-aware navigation |
-| P1 | **26. `update_plan` / todo tool** | 2 | 4, 11 | Model publishes progress |
+| P1 | ✅ **23. Multi-hunk `edit_file`** | 3 | 29, 30 | Refactors in one call |
+| P1 | ✅ **24. Git tool family** | 3 | 20 | Diffs, log, blame, commit |
+| P1 | ✅ **25. LSP/diagnostics + symbol tools** | 4 | 22 | Structure-aware navigation |
+| P1 | ✅ **26. `update_plan` / todo tool** | 2 | 4, 11 | Model publishes progress |
 | P1 | **27. Media & attachment content transport** | 3 | 22 | Images to all providers, real files |
 | P2 | **28. Parallel read-only execution + arg validation** | 3 | 22 | Latency + safety |
 
@@ -661,7 +743,7 @@ Legend — **Pri**: P0 blocker / P1 significant / P2 quality / P3 polish. **Est*
 | P1 | ✅ **29. Real diff engine** | 2 | 4 | Correct, `git apply`-compatible diffs |
 | P0 | ✅ **30. Turn checkpoint + `/undo`** | 4 | 22 | Reversible edits |
 | P1 | ✅ **31. Verification gate wired into the loop** | 5 | 7, 9 | "Done" means the repo's own gates pass |
-| P2 | **32. Anti-fake-fix enforcement** | 2 | 31 | No `@ts-ignore` escapes |
+| P2 | ✅ **32. Anti-fake-fix enforcement** | 2 | 31 | No `@ts-ignore` escapes |
 | P2 | **33. Sensitive-content & injection fence** | 3 | 4, 28 | No `.env` into prompts |
 
 **Phase 29 — ✅ Real diff engine**
@@ -1539,7 +1621,9 @@ test anything it wrote. Four tools and one registry later it can.
 
 **New test:** `tests/unit/background-shells.test.ts` (9 suites, real processes) — immediate start, incremental polling that never resends, exit-code capture, idempotent stop, **0 surviving processes after stop** (verified by `ps`, waiting for the group to exist first), bounded retention with honest disclosure, lifetime cap, reap accounting, background-through-gateway policy + approval + audit, cross-session invisibility, and the no-dedupe guarantee.
 
-**Verified:** `pnpm typecheck` 0 · `pnpm build` 0 · `pnpm test:unit` **27/27** (14 core tools, from 8 at audit time) · `ps` after a full run shows **0 stray background processes**.
+**Verified:** `pnpm typecheck` 0 · `pnpm build` 0 · `pnpm test:unit` **27/27** (14 core tools at the
+time of that phase, from 8 at audit time; **the count is 17 now** — read §0.5, not this line) · `ps`
+after a full run shows **0 stray background processes**.
 
 **Deferred:** `shell_send` / stdin writes, and port-ownership detection (telling the model which localhost port a shell bound). Both are workflow polish; the leak and policy surface is closed.
 
@@ -1784,6 +1868,202 @@ env leak: no leak (B5 holds through dist)
 **Verified:** `pnpm build` 0 · `pnpm typecheck` 0 · `pnpm test:unit` **31/31** · dist smoke transcript above · `/mcp` through the built CLI against this repo's own config: both repo-defined servers show `needs-trust`, the full command line, and **zero requests reached them** · `PLAN.md` md5 unchanged, session store back to 171 after pruning smoke sessions, no orphan MCP children.
 
 **Not done here:** the server side (M20); `notifications/cancelled`, sampling and elicitation roots (the `roots/list` handler stays a stub); and MCP *resources/prompts* are not surfaced at all — only `tools/*` is spoken, so a server offering resources contributes nothing.
+
+### ✅ N5–N9 — the agent's own audit findings (2026-09-27)
+
+The agent was asked, through `pnpm dev`, to find a bug in its own codebase. It reported two.
+Both were real, **neither was in this 47-phase plan**, and a further three defects turned up
+while verifying them. Fixing them in order of how much they blinded everything else:
+
+| # | What was actually happening | Fix | Proof |
+|---|---|---|---|
+| **N7** root capture | `findWorkspaceRoot` accepted a nested `.inflynx/` as a root marker *before* looking for `pnpm-workspace.yaml` above it. `apps/cli/.inflynx` exists, so `pnpm dev` resolved the workspace to one package of nineteen — the agent could not read `packages/*` at all, and the marker is self-reinforcing (one run creates it, the next is confined by it) | Precedence by declared intent: `pnpm-workspace.yaml` → `package.json#workspaces` → `.git` → `.inflynx` → outermost `package.json`; plus `describeWorkspaceRootSource()` so *which* marker decided it is reportable | `findWorkspaceRoot(apps/cli)` now returns the repo root; precedence asserted over four synthetic trees |
+| **N6** preview path bypass | The CLI's diff preview resolved the proposed path itself (`path.isAbsolute ? p : join(root, p)`) and `readFileSync`-ed it **before approval** — an arbitrary-file read outside the sandbox, and no size cap either | `resolvePreviewPath()` in policy-engine, using the same `CanonicalPathGuard` execution uses, plus a 2 MB cap; moved out of the CLI so the extension can use the same answer | `/etc/passwd`, `~/.ssh/id_rsa`, home and traversal all refused; in-workspace absolute still allowed |
+| **N8** quoted data read as commands | Rules matched `segment.text` including quoted arguments. Reproduced: `echo 'please do not rm -rf . in prod'` → **hard deny**; `grep -nEi 'exec\|spawn\|rm\(|unlink' f` → "deletes or truncates files" | Match on quote-redacted text; inline-code interpreters (`sh -c`, `python -c`, …) escalate by **program identity** instead, so redaction is not a bypass | False positives gone; `rm -rf /`, `curl \| sh`, `\| xargs sh`, `rm -rf .` all still deny |
+| **N5** terminal escape injection | Tool output snippets, model text/thought deltas and restored transcripts were written to stdout raw — OSC 52/OSC 8/CSI from an MCP server or a cloned file can rewrite the approval screen | `sanitizeForTerminal()` applied to the *payload* only (the UI's own colors are ANSI; blanket-stripping would break the interface) | 8 attack shapes stripped; code, tabs, newlines and the color wrapper survive byte-intact |
+| **N9** `search_files` on a file | The resolved path was passed as the child's **working directory** → `spawn ENOTDIR`, though the tool's own description advertises "Directory or file" | Search from the containing directory; a missing path now says "does not exist", not "no matches" | File, directory, workspace-wide, missing-path and bad-regex cases each get their own honest answer |
+| **N10** denied calls vanished from `toolResults` | Approval denial only wrote into the model's context, never into the turn's result array — so the CLI/extension showed no trace of a refusal the human made, and a test that asserted the refusal through that array passed while reading a permanently empty field | `AgentOrchestrator` pushes an errored `ToolResult` for denials, `durationMs: 0` (nothing ran; the approval wait is not execution time) and carrying the same reason text the model sees | `orchestrator-gateway` Test 2 and `anti-fake-fix` Test 8 re-pinned on substance: not-written **and** refusal visible with reason — the old `length === 0` assertions would have failed loudly |
+| **N11** count-pinned registry test | `assert.equal(tools.length, 15)` — right instinct, wrong granularity | Assert the sorted **name set** against the real 16 (`git` added) | A missing, extra or renamed tool is now named in the failure |
+| **N12** four PLAN.md readers | `markStep` wrote `x / ! -`, `StructuredPlanEngine` wrote `x /` and never `-`, the extension read `-` as **in progress** and dropped `/`, the CLI's injection listed `pending` only — the same file, four meanings, and *which step is live* was the one thing they could not agree on | One format in `protocol/src/plan.ts`: `renderPlanMarkdown` is the only writer, `parsePlanMarkdown` the only reader; `PlanStepState` has a distinct glyph each | Test 1 round-trips all five states and asserts the glyphs are distinct; Test 2 parses a real legacy file and requires a **warning** where a step would previously have vanished |
+| **N13** `plan.updated` had no emitter | Declared in `AgentEventType` since the list existed; every plan UI subscribed to a signal that never fired. `markStep` also left `> Status:` stale, so `COMPLETED` sat beside unticked boxes | `ToolResult.plan` → orchestrator emits with the full spec; `markStep` re-renders and `derivePlanStatus` decides | Test 7 asserts exactly one `plan.updated` through a real turn, with `steps[1].status === "in_progress"` and the verification command intact; Test 8 asserts `markStep` keeps the header honest |
+| **N14** the mode filter hid the tools the prompts mandated | `if (tool.name === "write_file") return true;` — `update_plan` (Phase 26) and `git` (Phase 24) were not in the model's tool list in `[plan]`, so the instruction to use them was unsatisfiable and the gateway's per-invocation git fence never saw a call | `update_plan` + `git` offered in `[plan]` (single-path tool; gateway still the control), `update_plan` withheld in `[ask]` | Test 8 asserts membership per mode in both directions — including that `patch_file`/`execute_shell` are still absent |
+| **N15** completed steps could be silently deleted | The drop check skipped `status === "completed"`, so a later call that omitted a finished step erased its `target_files` and `verification_command` — the fields Phase 31's gate reads. My own test assumed the opposite and had to be re-derived | Any existing id missing from the call is refused, with the message naming why a finished step still matters | Test 4 + Test 10 assert the refusal and that the file on disk is unchanged after it |
+| **N16** no channel for structured tool output | `executeTool` rebuilt the result from `output`/`isError`/`exitCode`, so a tool that *knows* a plan could only hand back a string written for the model — and capped by the gateway | `ToolExecuteResult.plan` / `ToolResult.plan`, passed through in `executeTool` and preserved by the gateway | Test 6 asserts `planned.plan` survives the gateway; Test 7 asserts it survives a whole turn |
+
+**One meta-lesson worth keeping:** the audit transcript also showed the agent *noticing* the
+`..` denial, working around it, and continuing — without reporting that its own workspace
+looked wrong. A confused agent that silently routes around a broken control is worse than one
+that fails loudly, which is the same argument as every "announce the truncation" fix in this
+file.
+
+**Bug found in my own test while doing this:** the fixture steered itself with host
+environment variables, and the child never saw them — because `buildMcpEnvironment` correctly
+allows only a minimal set. The control worked; the test was wrong. Fixed by passing config
+`env`, and the `/tmp/none` fallback removed so it cannot pass silently again.
+
+### ✅ Phase 32 — anti-fake-fix enforcement (2026-09-27)
+
+Phase 31 gave the agent a gate; this phase stops it from passing the gate by hiding the
+problem. `RepairLoop.validatePatchSafety()` had existed for the whole audit with five patterns
+and **no caller** — which is worth naming as the actual failure mode of this codebase: a
+check that reads like a control, is described in a class, and enforces nothing.
+
+| Part | What landed |
+|---|---|
+| Single ruleset | `patch-engine/src/patch-safety.ts` — 13 named rules (`suppress-directive`, `linter-disable`, `empty-handler`, `test-skipped`, `test-isolated`, `trivial-assertion`, `assertion-removed`, `assertion-commented-out`, `test-block-removed`, `test-file-deleted`, `forced-exit-in-test`, `secret-introduced`). `RepairLoop` now delegates to it rather than keeping its own list, so the façade and the enforcement cannot drift |
+| Additions only | A directive already present in the file stays present. Without this, the first edit to any file containing `eslint-disable` would be blocked forever and the fix would be to turn the feature off — which is exactly how the old shell ban died |
+| Docs are not code | `*.md`/yaml/json/toml describe code rather than being code: `Use @ts-ignore sparingly` in a README is not a suppression. A credential pasted into a doc **is** still caught |
+| Enforced at the choke point | Gateway step **3c**, beside the path and shell policy: violation → refusal with every rule and its quoted evidence, nothing written. `patch_file`, `write_file`, `edit_file` (as the **combined** before/after, not per hunk) and `delete_path` of a test file |
+| Override is explicit | `patchApprovalSource: "user:override-patch-safety"`, set only after a human saw the violations. The approval prompt changes appearance and wording ("⛔ refused by policy… you are overriding"), the choices are reordered so *deny* is first, and the override is logged |
+| The model gets a reason | A denial now carries the rules that fired and what to do instead. A bare "denied" sends the model to retry a variant of the same suppressed diagnostic — found while writing the tests, not before |
+
+**Also fixed, in code I wrote this week:** `needsHuman` for shell approvals, the
+`?? 1` hunk fallback, the quoted-argument matching above — and one honest correction to
+`verification.test.ts`, which asserted the *literal string* `"Anti-Pattern Rejected"`. My
+reworded message broke it while it behaved correctly; the assertions are now on the rule id
+plus the substance of the reason, because pinning prose turns every copy edit into a
+regression.
+
+**New test:** `tests/unit/anti-fake-fix.test.ts` (9 suites) — 11 fake-fix shapes caught with
+evidence; the additions-only rule (edit a file that already suppresses → allowed; add one more
+→ refused); six honest refactors that must **not** be flagged, including a regex containing
+the word `skip` and docs explaining `@ts-ignore`; gateway refusal with the file byte-identical
+afterwards; a named override that genuinely applies; multi-hunk assembly; `RepairLoop` and the
+gateway agreeing on the same three inputs; and a real orchestrated turn where the human is
+shown the violation *before* the write and a "no" means nothing reaches disk.
+
+### ✅ Phase 23 — multi-hunk `edit_file` (2026-09-27)
+
+`patch_file` takes one snippet, so a refactor touching four places was four calls, four
+approvals, four writes and four windows for the file to change underneath.
+
+| Part | What landed |
+|---|---|
+| The tool | `edit_file({ path, edits: [{ oldText, newText, replaceAll? }] })`, applied **in order against a working copy**, written once through `EditTransactionManager` — so Phase 30's hash re-verification and rollback cover it |
+| Real atomicity | Every edit is located before any byte is written. An assertion in the tests: edit #3 missing leaves the file byte-identical, and the error names which edit and how many preceded it |
+| Uniqueness, not guessing | `oldText` matching twice without `replaceAll` is refused with the occurrence count and the remedy (more context, or mean it) |
+| Errors the model can act on | No-match quotes the text it looked for and says to re-read; empty `oldText` refused (it matches everywhere); missing file points at `write_file` |
+| Nested schemas | `ToolDefinition.parameters` could only express `{type, description}` per property, so **no tool could declare an array of objects** — the reason `patch_file` takes string blobs. Widened to a real JSON Schema node, which is what makes this phase and the git family possible without per-tool mini-languages |
+| Cross-phase checks | Phase 30: two hunks are **one** checkpoint entry, and `/undo` restores the pre-call bytes exactly. Phase 32: a fake fix split across two hunks is caught on the combined result. `agent.txt` now prefers `edit_file` and lists the real 15 tools (its list was stale — it named none of the shell tools) |
+
+**Verified:** `pnpm build` 0 · `pnpm typecheck` 0 · `pnpm test:unit` **34/34**, 196
+assertions · `edit_file` refused in `[plan]` mode with no write · escapes to `/etc/hosts`,
+`~/.ssh/authorized_keys` and `../../outside.ts` all refused through the gateway · CRLF file
+keeps `\r\n` on both lines.
+
+**Not claimed:** no fuzzy matching and no whitespace-insensitive retry. A miss is a miss, and
+the model re-reads — an approximation that edits the wrong region is worse than a refusal.
+
+### ✅ Phase 24 — git tool family (2026-09-27)
+
+The agent had no git. Reviewing its own turn meant `execute_shell("git diff")` — a *string* through
+the shell classifier, so a legitimate `git log --format="%H %s"` was argued about by shell rules, and
+nothing about the invocation was graded. `packages/tool-runtime/src/git-tools.ts` is one tool taking
+an argument array: no shell is ever involved, and the read-only / mutating / refused decision is made
+per **invocation** — the same shape Phase 20 chose for the shell tool.
+
+| Part | What landed |
+|---|---|
+| Grading, not permission levels | `classifyGitInvocation()` is pure and runs before anything executes. Read-only (`status`/`diff`/`log`/`show`/`blame`/`ls-files`/`grep`/`rev-parse`…) never asks; `branch --list`, `tag --list`, `stash list`, `config --get`, `remote -v` are graded read-only **by flag**, while `stash pop` / `config --unset` / `remote set-url` ask. Unknown subcommand → mutating → asks. Absence from the list is the default-deny, so an unlisted subcommand can never be silently auto-approved |
+| The allowlist is not the sandbox | Git's **global** options rewrite what the invocation touches, and are refused for every subcommand: `-C`, `--git-dir`, `--work-tree`, `--namespace`, `--exec-path`, `--super-prefix`, `-c`/`--config-env` (config is code — `core.fsmonitor`, `core.pager`, aliases launch processes), `--output=` (a file write past the diff preview, the guard and the undo journal), `--no-verify`, `--no-gpg-sign`, and force-push to `main`/`master`/`trunk`/`HEAD` |
+| Two bugs found while writing the tests | (1) **`--work-tree=/tmp commit` escaped an exact-match denylist** and was graded merely "mutating" — a real sandbox escape; fixed with `isForbiddenGlobal()` covering the `=`-form, which is the classic hole in flag denylists. (2) Global vs subcommand position: `git switch -c new-branch` and `git log -p` were refused because `-c`/`-p` were matched anywhere. `subcommandIndex()` now scopes the global check to the leading option block and the interactive check to the subcommands where those letters actually mean interactive |
+| Child env, not argv hygiene | `GIT_TERMINAL_PROMPT=0` (a private remote asking for a password hangs until timeout, which reads as slow rather than unavailable), `GIT_CONFIG_NOSYSTEM=1` (`/etc/gitconfig` is whoever-installed-git's code-execution surface; `~/.gitconfig` still honoured), `GIT_PAGER`/`PAGER=cat`, `NO_COLOR=1`. `--no-pager` is prefixed because it is a genuine global option — `--color=never` is not, and git answered usage error 129 |
+| Honest failure | A non-repo and an unknown revision return git's own words **and** `# exit code 128`, with `isError: true`, and **no summary**. That last part was a bug I shipped in this phase and caught in its own test: `# 0 modified, 0 added, 0 deleted…` printed over `fatal: not a git repository` is indistinguishable from a clean tree — the confident-wrong answer an agent acts on |
+| Summaries the model can act on | `status` → counts per state; `log`/`reflog` → commit lines shown; `diff`/`show` → **git's own** stat line when present, `N file(s) listed` for name-mode (which has no `diff --git` header at all — an invented "0 files changed" was the alternative), `N file(s) changed, +a / -b` for patch form. `R100\told\tnew` counts as two paths, and the score token is filtered out by requiring the field to look like a path |
+| Wiring | Gateway `[plan]` fence grades git per invocation instead of blocking the tool by name — `[plan]` can `status`/`diff`/`log` and cannot `commit` (asserted: the blocked commit does not appear in the log). Orchestrator narrows `permissionLevel` to `readonly` for read-only git so no prompt fires. `CommandPolicy.execProcessDirectDetailed()` gained an `env` parameter rather than the tool reaching for `spawn` itself |
+
+**Verified:** `pnpm build` 0 · `pnpm typecheck` 0 · `pnpm test:unit` **35/35**. 7 suites in
+`tests/unit/git-tools.test.ts`, all against a **real `git init` repo in a temp dir** — the properties
+worth testing are git's actual behaviour (exit codes, `not a git repository`, whether `--short`
+parsing matches the real format). 10 escape attempts refused; 19 legitimate invocations not
+over-blocked. The phase's "Done when": the agent writes a change, `git diff` shows `-value = 1` /
+`+value = 99`, and both `git checkout -- app.ts` and `git restore app.ts` return the tree to
+byte-identical.
+
+**Also fixed on the way, because the git tests surfaced them:**
+
+| # | Finding | Fix |
+|---|---|---|
+| **N10** | **A denied tool call vanished from `TurnResult.toolResults`.** The model was told (tool message in context) but the CLI summary and the extension transcript showed nothing — a refusal the human made is invisible to every consumer of the turn. Test 5 asserted the refusal by reading a field that was always empty, and it *passed* | `AgentOrchestrator` records the denial as an errored `ToolResult` (`durationMs: 0` — nothing ran, and the approval wait is deliberately not counted as execution time). Two existing suites had pinned the old behaviour (`toolResults.length === 0`) and were re-pinned on substance: file not written **and** refusal present, `isError`, and carrying the reason |
+| **N11** | The registry-contract test asserted a **bare tool count**. It caught Phase 24's addition (good) but could not say which tool drifted, and a rename plus an addition would have kept the number steady. My first repair guessed 15 names and 3 of them did not exist (`update_memory`, `mcp_resource_read`, `view_image`) — caught only by running the probe | Pinned on the sorted **name set** |
+| — | `agent.txt` claimed 15 tools and named none of the shell tools' usage; now lists 16 and carries a git rule: argument array, never through `execute_shell`, and never propose a commit/push/history rewrite unless asked |
+
+**Not claimed:** no `git push` allow-list refinement beyond the default-branch force guard (a plain push is
+`mutating` → asks), no worktree/submodule awareness, and no interactive `-p` staging path — that is a UI
+feature, not a policy one. `git commit` still goes through the model's own message; there is no trailer
+or sign-off policy.
+
+### ✅ Phase 26 — `update_plan` / the todo tool (2026-09-27)
+
+The plan was the clearest place where this agent promised more than it did. `plan.txt` told the model to
+write `.inflynx/PLAN.md` and `agent.txt` told it to "change `- [ ]` to `- [x]`" afterwards — so every
+progress tick was a file edit with an approval prompt and a diff of markdown, `plan.updated` was declared
+in the event protocol and **emitted by nothing**, and the one helper that understood the dependency DAG
+(`getExecutableNextSteps`) had **no callers at all**.
+
+| Part | What landed |
+|---|---|
+| One format | `packages/protocol/src/plan.ts` (340 lines) is now the single definition: `PlanSpec`/`PlanStep`, `renderPlanMarkdown`, `parsePlanMarkdown`, `planProgress`, `getActionableSteps`, `derivePlanStatus`. It lives in `protocol` because that package has **no dependencies**, which is the only way `tool-runtime` (which publishes plans) and `agent-core` (which advances them) can share it without importing each other |
+| Why that matters | **Four readers parsed PLAN.md with four regexes and disagreed about the glyphs.** `markStep` wrote `x / ! -`; `StructuredPlanEngine` wrote `x /` and never `-`; the extension read `[ xX~- ]` with `-`→**in progress** and dropped `/` entirely, so an in-progress step showed as pending and a skipped step showed as live work; the CLI's prompt injection filtered `pending` only, so the step the model was actively working on vanished from the list it was told to execute. The one thing a plan exists to communicate is *which step now* |
+| Lossless + legible | The markdown keeps the human shape (header, checkboxes, `- Target:` / `- Verify:` / `- Risk:`) and gains a `<!-- inflynx:plan:{…} -->` block that survives any rewording. `PlanEngine.parsePlanMarkdown`'s single regex used to satisfy itself for exactly one of the four layouts the writers emitted — a differently-shaped step **silently disappeared** and the caller was told "no active plan" |
+| The tool | `update_plan({ goal, complexity, steps: [{ id, title, description, target_files, verification_command, risk, dependencies, state }] })` — writes exactly one path (`.inflynx/PLAN.md`), computed from the workspace root, so a `path` argument is not a knob. 15 nonsense shapes refused with nothing written (see the tests). Fields the call omits are **carried over** from the plan on disk, because the model is not going to re-emit a verification command on every tick |
+| Progress cannot be claimed | `derivePlanStatus` decides from the steps: a declared `COMPLETED` with unticked boxes is written as `IN_PROGRESS`, and one `failed` step makes the plan `ABORTED` rather than "still in progress". Omitting **any** existing step — even a completed one — is refused, because dropping it would lose its `target_files` and `verification_command` (N15) |
+| The DAG is a rule | `getActionableSteps`: a step is blocked while a dependency is pending or failed; `completed`/`skipped` clear it and an `in_progress` prerequisite does not deadlock what only waits on its *completion*. Cycles terminate as blocked. `update_plan` refuses unresolvable ids, self-dependencies, dangling dependencies and cycles at validation time |
+| Event, not prose | The tool returns the structured `PlanSpec` on the `ToolResult` (N16 — `executeTool` had to stop dropping it), the orchestrator turns it into `plan.updated`, and the CLI renders a progress bar with the current step. The extension's sidebar already watched the file and needed no new plumbing — only the shared parser |
+| Read side | `PlanEngine` and `StructuredPlanEngine` no longer define formats: 229 lines of private regexes and renderers replaced by delegation, their duplicate `PlanStatus`/`PlanStep` unions are aliases of protocol's, and `markStep` re-renders through the writer so the header cannot go stale. `apps/vscode`'s `PlanTreeProvider` lost its 42-line parser and gained the `skipped` state it never had |
+| Modes | `filterToolsForMode` had `if (tool.name === "write_file") return true;` in plan mode, so `update_plan` — and `git`, which Phase 24's fence expects to inspect (N14) — were **invisible to the model** there. `plan.txt`'s own instruction was unsatisfiable. Now both are offered in `[plan]`, `update_plan` stays out of `[ask]`, and the gateway remains the control |
+| Prompts | `plan.txt`'s "PLAN.md Schema (follow EXACTLY)" asked for `## ✅ Task Checklist` while every reader matched `## 🎯 Target Steps & Dependency DAG` — the prose and the code had drifted apart with no test able to notice. The schema is now *illustration* plus "you do not write this"; narrative sections stay free-form because nothing parses them |
+
+**Verified:** `pnpm build` 0 · `pnpm typecheck` 0 · `pnpm test:unit` **36/36** (1,105 assertion
+statements across 34 unit files). `tests/unit/plan-tool.test.ts` is 10 suites:
+round-trip of all five states distinctly · a legacy file parsed with warnings instead of zeros ·
+15 refusals with nothing written · derived status · DAG gating (skipped/cyclic/dangling/failed) ·
+gateway policy (`[plan]` yes, `[ask]` no, path arg refused, never cached) · **a real turn**
+publishing a plan and emitting `plan.updated` with one tool call and no file write · the two
+engines reading each other's output · the registry contract · a pure validator.
+
+**Two things this changed that are worth their own rows:** the tool count is now **17**
+(`agent.txt` updated), and `tests/run-all-tests.ts` grew a suite. The e2e and
+`planning-context` suites still pass against the shared format, which is the actual proof the
+legacy reader is not dead weight.
+
+**Not claimed:** no plan *editing* UI (`/plan history` and `/execute-plan` still work off the file),
+no multi-plan sessions, no automatic step advancement from tool results — the model still has to
+say it finished a step, and that is now a validated, evented call rather than a hand-ticked box.
+The narrative sections are still free-form prose by design.
+
+### ✅ Phase 25 — LSP/diagnostics + symbol tools (2026-09-27)
+
+`SymbolGraph`/`CodeSymbol` in `workspace-runtime` had been *declared and never used* — an
+aspiration with no engine. `packages/tool-runtime/src/diagnostics-tools.ts` (524 lines) replaces
+it with three real tools backed by the **in-process TypeScript language service**, the same engine
+tsserver drives, so `list_diagnostics` after an edit returns `bad.ts:2:7 error TS2322 …` without a
+`tsc` subprocess or an LSP handshake.
+
+| Part | What landed |
+|---|---|
+| `list_diagnostics({ paths, include_warnings? })` | Real syntactic + semantic diagnostics with exact line/column and TS code, per file. `paths` is **required** — a whole-workspace scan is what made `tsc` feel heavy, and a tool silently doing 25 files of type-checking on every call is not cheap. Non-`.ts/.js` files are **reported as not covered**, never as clean |
+| `list_symbols({ path, include_methods?, exported_only? })` | AST walk of one file → top-level (and optionally class-member) declarations with kind, line and export status — the API surface without reading the body |
+| `find_definition({ path, line, column })` | Compiler go-to-definition via `getDefinitionAndBoundSpan`, across files; out-of-range lines and keyword positions answered honestly rather than crashing |
+| Incremental, not per-call rebuild | One `LanguageService` cached per `(workspace, tsconfig)`; the host versions each snapshot by `mtime + size`, so a file the agent *just* rewrote is re-read (Test 3 proves a fresh edit is diagnosed with no rebuild) while unchanged files keep their parsed AST. `resetLanguageServices()` is exposed for tests and tsconfig changes |
+| Guard + policy | Every path resolves through `ctx.pathGuard`, so a `../../elsewhere.ts` is refused before it is ever opened; all three tools are `readonly`, offered in all four modes through the gateway, and **non-cacheable** (a stale diagnosis is worse than none) |
+| Why the language service, not a spawned LSP server | The backlog asked for "a real LSP client (tsserver + others)". What that is *for* — post-edit type errors without `tsc`, structure-aware navigation — is delivered exactly by `ts.createLanguageService`. A separate server would add a JSON-RPC handshake, a global-binary dependency, and a non-deterministic test to reach the same answers, and still cover no extra language |
+| Gate pre-check API | `getDiagnosticsForFile()` returns errors-only for one file — the cheap pre-check the verification gate (Phase 31) can adopt. **API landed and tested; the gate is not rewired this phase** (it already runs `tsc`/build via scripted checks, so wiring it in would change verified outcomes without a correctness need) |
+
+**Verified:** `pnpm build` 0 · `pnpm typecheck` 0 · `pnpm test:unit` **37/37**. 9 suites in
+`tests/unit/diagnostics-tools.test.ts` against a **real generated TS project in a temp dir** (a
+`tsconfig.json` + a `good.ts` + a `bad.ts` with two deliberate `TS2322`s): exact line:col assertions
+(not message wording, which drifts by TS version) · clean-file clean-with-caveat · a post-edit error
+seen with no rebuild · `.md`/missing/directory/empty all refused · symbols + methods + exported_only
+· cross-file definition jump and bad-position honesty · readonly/offered-in-all-modes/non-cacheable
+through the gateway · the gate pre-check helper · the registry contract at **20 tools**. `typescript`
+is now a declared dependency of `@inflynx/tool-runtime`.
+
+**Not claimed:** TypeScript/JavaScript only — no Python/Go/other language servers (a `.py`/`.go` file
+is "not covered", never "no problems"); the `SymbolGraph`/`CodeSymbol` types in `workspace-runtime`
+are left in place (dead) rather than deleted, pending a sweep of that package; the gate pre-check is
+an available API, not yet a wired behaviour; and this is not a replacement for running the project's
+build and tests, which the tool's own success message says.
 
 ### Follow-ups discovered by Phases 2, 4, 5, 6 and 7 (added to the inventory)
 

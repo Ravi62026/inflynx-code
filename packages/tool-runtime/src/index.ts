@@ -12,6 +12,34 @@ import {
   BACKGROUND_SHELL_MAX_LIFETIME_MS,
   BACKGROUND_SHELL_RETENTION_BYTES,
 } from "./background-shells.js";
+import { GIT_TOOL } from "./git-tools.js";
+import { UPDATE_PLAN_TOOL } from "./plan-tool.js";
+import { LIST_DIAGNOSTICS_TOOL, LIST_SYMBOLS_TOOL, FIND_DEFINITION_TOOL } from "./diagnostics-tools.js";
+
+export {
+  LIST_DIAGNOSTICS_TOOL,
+  LIST_SYMBOLS_TOOL,
+  FIND_DEFINITION_TOOL,
+  getDiagnosticsForFile,
+  resetLanguageServices,
+  type FileDiagnostic,
+  type CodeSymbol,
+} from "./diagnostics-tools.js";
+
+export {
+  UPDATE_PLAN_TOOL,
+  PLAN_RELATIVE_PATH,
+  buildPlanFromInput,
+  type UpdatePlanInput,
+} from "./plan-tool.js";
+
+export {
+  GIT_TOOL,
+  classifyGitInvocation,
+  validateGitArgs,
+  type GitGrade,
+  type GitInvocationInfo,
+} from "./git-tools.js";
 
 export {
   ShellRegistry,
@@ -25,6 +53,7 @@ export {
 export {
   ToolExecutionGateway,
   capToolOutput,
+  reviewMutatingPatchForSafety,
   DEFAULT_MAX_TOOL_OUTPUT_CHARS,
   type GatewayExecutionOptions,
 } from "./ToolExecutionGateway.js";
@@ -123,6 +152,17 @@ function fileSnapshot(absPath: string): { content: string; exists: boolean } {
   }
 }
 
+/** Non-overlapping occurrences of `needle`. `split` counts correctly and skips regex traps. */
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  return haystack.split(needle).length - 1;
+}
+
+/** Keeps an error message about a long snippet readable. */
+function truncateForMessage(text: string, max: number): string {
+  return text.length > max ? text.slice(0, max) + `… (${text.length - max} more chars)` : text;
+}
+
 /**
  * Record a completed file mutation so `/undo` can reverse it. The post-image is read back
  * from disk rather than taken from what the tool thinks it wrote — the reverse patch has
@@ -196,12 +236,31 @@ export function createToolExecutionContext(
   return createToolExecutionContextFromGuard(new CanonicalPathGuard(workspaceRoot), options);
 }
 
+/**
+ * A JSON Schema node, typed permissively.
+ *
+ * This used to be `{ type, description, default }`, which made it impossible to declare a
+ * tool that takes an array of objects — so `edit_file` (multi-hunk edits), a git tool
+ * taking a file list, or anything structured could not be described to the model at all,
+ * and tools resorted to string-encoded blobs. Widening it here is what lets Phase 23 and
+ * 24 exist without inventing a mini-language per tool.
+ */
+export type ToolParameterSchema = {
+  type: string;
+  description?: string;
+  default?: unknown;
+  items?: ToolParameterSchema;
+  properties?: Record<string, ToolParameterSchema>;
+  required?: string[];
+  enum?: readonly unknown[];
+};
+
 export interface ToolDefinition<TArgs = Record<string, unknown>> {
   name: string;
   description: string;
   parameters: {
     type: "object";
-    properties: Record<string, { type: string; description: string; default?: unknown }>;
+    properties: Record<string, ToolParameterSchema>;
     required: string[];
   };
   isMutating?: boolean;
@@ -231,6 +290,14 @@ export interface ToolExecuteResult {
   isError?: boolean;
   /** Reported where a process exit code is meaningful, for the shell audit log. */
   exitCode?: number | null;
+  /**
+   * Set by `update_plan` only. A tool that changes the plan cannot express that through
+   * `output` — the CLI progress line and the extension sidebar need the *structure*, and
+   * every reader re-parsing the markdown is exactly the arrangement Phase 26 removed.
+   * Typed loosely on purpose: the canonical shape is `PlanSpec` in `@inflynx/protocol`,
+   * and this package's `plan-tool.ts` imports it from there.
+   */
+  plan?: import("@inflynx/protocol").PlanSpec;
 }
 
 export interface ToolResult {
@@ -262,6 +329,12 @@ export interface ToolResult {
   touchedPath?: string;
   /** True when `touchedPath` lies outside `.inflynx/`, i.e. it is a real source edit. */
   touchedSourceFile?: boolean;
+  /**
+   * The structured plan, when this call published or advanced one (`update_plan`).
+   * The orchestrator turns it into the `plan.updated` event, which had been declared in
+   * the protocol and emitted by nothing since the event list existed.
+   */
+  plan?: import("@inflynx/protocol").PlanSpec;
 }
 
 // ─── Core Tool Implementations ────────────────────────────────────────────────
@@ -535,6 +608,120 @@ export const CORE_TOOLS: ToolDefinition[] = [
 
       const lines = content.split("\n").length;
       return `✓ Written: ${filePath} (${lines} lines)`;
+    },
+  },
+
+  {
+    name: "edit_file",
+    /**
+     * Multi-hunk editing (backlog Phase 23). `patch_file` takes one snippet, so a
+     * five-line refactor across four places costs four calls, four approvals and four
+     * chances for the file to change underneath. This applies a list of edits in order
+     * and writes **once** — either every edit located cleanly, or nothing is written.
+     */
+    description:
+      "Apply several exact-string replacements to one file in a single atomic edit. " +
+      "Edits apply in order, each old_text must match exactly one place unless replace_all is set, " +
+      "and if any edit cannot be applied the file is left untouched. Prefer this over repeated " +
+      "patch_file calls for a refactor that touches several places.",
+    permissionLevel: "readwrite",
+    isMutating: true,
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "File to edit" },
+        edits: {
+          type: "array",
+          description: "Replacements applied in order",
+          items: {
+            type: "object",
+            properties: {
+              oldText: { type: "string", description: "Exact existing text to replace" },
+              newText: { type: "string", description: "Text to put in its place" },
+              replaceAll: { type: "boolean", description: "Replace every occurrence instead of requiring a unique match" },
+            },
+            required: ["oldText", "newText"],
+          },
+        },
+      },
+      required: ["path", "edits"],
+    },
+    execute: async (args, ctx) => {
+      const { path: filePath, edits } = args as {
+        path: string;
+        edits: Array<{ oldText?: string; newText?: string; replaceAll?: boolean }>;
+      };
+      if (!Array.isArray(edits) || edits.length === 0) {
+        return { output: "Error: edit_file needs a non-empty 'edits' array.", isError: true };
+      }
+
+      const absPath = ctx.pathGuard.validateAndResolve(filePath);
+      const before = fileSnapshot(absPath);
+      if (!before.exists) {
+        return {
+          output:
+            `Error: "${filePath}" does not exist, so there is nothing to edit. ` +
+            `Use write_file to create it.`,
+          isError: true,
+        };
+      }
+
+      // Every edit is resolved against the working copy before a single byte is written,
+      // which is what makes "all-or-nothing" true rather than a claim.
+      let working = before.content;
+      const applied: number[] = [];
+      for (let i = 0; i < edits.length; i++) {
+        const edit = edits[i] || {};
+        const oldText = typeof edit.oldText === "string" ? edit.oldText : "";
+        const newText = typeof edit.newText === "string" ? edit.newText : "";
+        if (!oldText) {
+          return { output: `Error: edit #${i + 1} has an empty oldText, which would match everywhere.`, isError: true };
+        }
+
+        const occurrences = countOccurrences(working, oldText);
+        if (occurrences === 0) {
+          // Only true when something actually preceded this edit — claiming earlier
+          // edits were applied when #1 is the one that failed would send the model
+          // looking for a partial write that never happened.
+          const partialNote = i === 0
+            ? "Nothing was written."
+            : `The ${i} earlier edit(s) in this call *were* applied to the in-memory copy, but nothing was written.`;
+          return {
+            output:
+              `Error: edit #${i + 1} of ${edits.length} found no match for its oldText in "${filePath}".\n` +
+              `${partialNote}\n` +
+              `Re-read the file and match the text that is actually there, including indentation.\n` +
+              `Looking for: ${JSON.stringify(truncateForMessage(oldText, 220))}`,
+            isError: true,
+          };
+        }
+        if (occurrences > 1 && !edit.replaceAll) {
+          return {
+            output:
+              `Error: edit #${i + 1} is ambiguous — oldText appears ${occurrences} times in "${filePath}" ` +
+              `and replace_all was not set. Nothing was written.\n` +
+              `Either include more surrounding lines to make it unique, or pass replaceAll: true ` +
+              `if you really mean every occurrence.`,
+            isError: true,
+          };
+        }
+
+        working = edit.replaceAll
+          ? working.split(oldText).join(newText)
+          : working.replace(oldText, newText);
+        applied.push(occurrences);
+      }
+
+      const txManager = new EditTransactionManager(ctx.pathGuard);
+      const staged = txManager.stageFileWrite(filePath, working);
+      txManager.commit();
+      recordCheckpoint(ctx, absPath, before);
+
+      const changed = computeUnifiedDiff(filePath, before.content, staged.newContent);
+      return (
+        `✓ Applied ${applied.length} edit(s) to ${filePath} in one atomic write.\n` +
+        `Diff:\n${changed}`
+      );
     },
   },
 
@@ -839,6 +1026,22 @@ export const CORE_TOOLS: ToolDefinition[] = [
 
       const absPath = ctx.resolvePath(searchPath);
 
+      // The description has always said "Directory or file to search in". Searching a
+      // file did not work: `absPath` was passed as the child's *working directory*, so a
+      // file target made the spawn fail with ENOTDIR — an advertised surface that does the
+      // opposite of what it claims (backlog N9, §7 item 8).
+      if (!fs.existsSync(absPath)) {
+        return {
+          output:
+            `Error: nothing to search at "${searchPath}" — that path does not exist. ` +
+            `This is not "no matches"; the search never ran.`,
+          isError: true,
+        };
+      }
+      const searchIsDirectory = fs.statSync(absPath).isDirectory();
+      const runCwd = searchIsDirectory ? absPath : path.dirname(absPath);
+      const shownName = path.relative(ctx.workspaceRoot, absPath) || ".";
+
       // Safe argument-array execution for rg (ripgrep)
       const rgArgs: string[] = [
         "--line-number",
@@ -873,7 +1076,7 @@ export const CORE_TOOLS: ToolDefinition[] = [
         const lines = raw.split("\n").filter((line) => line.trim().length > 0);
         if (lines.length === 0) return "";
         const shown = lines.slice(0, MAX_SEARCH_RESULT_LINES);
-        const rel = (line: string) => line.replaceAll(`${absPath}/`, "").replaceAll(`${absPath}`, ".");
+        const rel = (line: string) => line.replaceAll(`${absPath}/`, "").replaceAll(absPath, shownName);
         return (
           shown.map(rel).join("\n") +
           (lines.length > shown.length
@@ -883,7 +1086,7 @@ export const CORE_TOOLS: ToolDefinition[] = [
         );
       };
 
-      const rg = await CommandPolicy.execProcessDirectDetailed("rg", rgArgs, absPath, 15_000, ctx.signal);
+      const rg = await CommandPolicy.execProcessDirectDetailed("rg", rgArgs, runCwd, 15_000, ctx.signal);
       if (rg.spawnError === "ABORTED") return { output: "Error: Search was cancelled.", isError: true };
 
       if (rg.spawnError !== "ENOENT") {
@@ -892,7 +1095,7 @@ export const CORE_TOOLS: ToolDefinition[] = [
           return body || `No matches found for: ${pattern}`;
         }
         if (rg.exitCode === 1) {
-          return `No matches found for: ${pattern} (searched ${path.relative(ctx.workspaceRoot, absPath) || "."}${
+          return `No matches found for: ${pattern} (searched ${shownName}${
             file_glob ? `, ${file_glob}` : ""
           } — rg ran successfully and matched nothing)`;
         }
@@ -905,7 +1108,7 @@ export const CORE_TOOLS: ToolDefinition[] = [
       }
 
       // ripgrep is not installed: fall back to grep, with the same exit-code honesty.
-      const grep = await CommandPolicy.execProcessDirectDetailed("grep", grepArgs, absPath, 15_000, ctx.signal);
+      const grep = await CommandPolicy.execProcessDirectDetailed("grep", grepArgs, runCwd, 15_000, ctx.signal);
       if (grep.spawnError === "ABORTED") return { output: "Error: Search was cancelled.", isError: true };
       if (grep.spawnError === "ENOENT") {
         return {
@@ -914,7 +1117,7 @@ export const CORE_TOOLS: ToolDefinition[] = [
         };
       }
       if (grep.exitCode === 0) return format(grep.output) || `No matches found for: ${pattern}`;
-      if (grep.exitCode === 1) return `No matches found for: ${pattern} (grep ran and matched nothing)`;
+      if (grep.exitCode === 1) return `No matches found for: ${pattern} (searched ${shownName} — grep ran and matched nothing)`;
       return {
         output:
           `Error: search failed rather than finding nothing — the pattern may not be a valid ` +
@@ -1269,6 +1472,12 @@ export const CORE_TOOLS: ToolDefinition[] = [
       );
     },
   },
+
+  GIT_TOOL,
+  UPDATE_PLAN_TOOL,
+  LIST_DIAGNOSTICS_TOOL,
+  LIST_SYMBOLS_TOOL,
+  FIND_DEFINITION_TOOL,
 ];
 
 // ─── Registry Class ────────────────────────────────────────────────────────────
@@ -1360,6 +1569,9 @@ export async function executeTool(
       ...(typeof executed === "object" && executed.exitCode !== undefined
         ? { exitCode: executed.exitCode }
         : {}),
+      // Structured payloads survive to the caller deliberately. The alternative is every
+      // consumer parsing `output`, which is written for the model and gets truncated.
+      ...(typeof executed === "object" && executed.plan ? { plan: executed.plan } : {}),
     };
   } catch (err: any) {
     return {

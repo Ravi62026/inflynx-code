@@ -11,6 +11,7 @@ import { formatUnifiedPatch } from "./diff.js";
 
 export * from "./diff.js";
 export * from "./checkpoints.js";
+export * from "./patch-safety.js";
 
 // ─── Existing Types ───────────────────────────────────────────────────────────
 
