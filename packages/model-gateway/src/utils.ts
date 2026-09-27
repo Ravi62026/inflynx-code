@@ -11,13 +11,16 @@ export function buildUsage(
   model: string,
   promptTokens: number,
   completionTokens: number,
-  reasoningTokens?: number
+  reasoningTokens?: number,
+  cache?: { cachedInputTokens?: number; cacheCreationInputTokens?: number }
 ): TokenUsage {
   const usage: TokenUsage = {
     promptTokens,
     completionTokens,
     totalTokens: promptTokens + completionTokens,
     reasoningTokens: reasoningTokens && reasoningTokens > 0 ? reasoningTokens : undefined,
+    cachedInputTokens: cache?.cachedInputTokens || undefined,
+    cacheCreationInputTokens: cache?.cacheCreationInputTokens || undefined,
   };
   usage.estimatedCostUsd = estimateTokenUsageCost(model, usage);
   return usage;

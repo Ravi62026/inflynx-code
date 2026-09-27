@@ -13,6 +13,12 @@ export {
 } from "./preview-path.js";
 
 export {
+  isSensitiveToWrite,
+  isSensitiveToRead,
+  type SensitiveVerdict,
+} from "./sensitive-paths.js";
+
+export {
   auditFieldsFromReview,
   appendShellAudit,
   getShellAuditPath,

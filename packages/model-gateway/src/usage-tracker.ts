@@ -62,5 +62,13 @@ export function estimateTokenUsageCost(model: string, usage: TokenUsage): number
   const reasoningCost =
     ((usage.reasoningTokens || 0) / 1_000_000) * (pricing.reasoningUsdPer1M || pricing.completionUsdPer1M);
 
-  return parseFloat((promptCost + completionCost + reasoningCost).toFixed(6));
+  // Cache metrics are normalised by every adapter to the Anthropic convention —
+  // `promptTokens` is the *uncached* input, and cached reads / cache writes are separate
+  // counts — so they are added here, at the 0.1x read / 1.25x write multipliers Anthropic
+  // and OpenAI both publish. Without this a cached turn is costed as if every prefix token
+  // were paid full rate, which is the opposite of the point of Phase 18.
+  const cacheReadCost = ((usage.cachedInputTokens || 0) / 1_000_000) * pricing.promptUsdPer1M * 0.1;
+  const cacheWriteCost = ((usage.cacheCreationInputTokens || 0) / 1_000_000) * pricing.promptUsdPer1M * 1.25;
+
+  return parseFloat((promptCost + completionCost + reasoningCost + cacheReadCost + cacheWriteCost).toFixed(6));
 }

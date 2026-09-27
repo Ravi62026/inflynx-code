@@ -199,6 +199,9 @@ importers:
       '@inflynx/policy-engine':
         specifier: workspace:*
         version: link:../policy-engine
+      '@inflynx/protocol':
+        specifier: workspace:*
+        version: link:../protocol
       '@inflynx/tool-runtime':
         specifier: workspace:*
         version: link:../tool-runtime
@@ -313,7 +316,11 @@ importers:
         specifier: ^6.0.2
         version: 6.0.3
 
-  packages/workspace-runtime: {}
+  packages/workspace-runtime:
+    dependencies:
+      '@inflynx/policy-engine':
+        specifier: workspace:*
+        version: link:../policy-engine
 
 packages:
 

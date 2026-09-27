@@ -77,7 +77,19 @@ export function formatGeminiContents(messages: Message[]): {
       continue;
     }
 
-    contents.push({ role: "user", parts: [{ text: message.content }] });
+    // Phase 27: user text plus any images as native inlineData parts, never a data-URL in
+    // the text (Gemini has no regex to recover one — this was the adapter that silently
+    // received an unreadable base64 blob).
+    const userParts: GeminiPart[] = [];
+    const userText = message.content
+      .replace(/!\[[^\]]*\]\(data:image\/[^)]+\)/g, "[Attached Screenshot]")
+      .replace(/data:image\/(?:png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+/g, "[Attached Screenshot]")
+      .trim();
+    if (userText) userParts.push({ text: userText });
+    for (const img of message.images ?? []) {
+      userParts.push({ inlineData: { mimeType: img.mediaType, data: img.dataBase64 } });
+    }
+    contents.push({ role: "user", parts: userParts.length ? userParts : [{ text: message.content }] });
   }
 
   return {

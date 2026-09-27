@@ -12,6 +12,7 @@ export {
   type CustomModelCapabilities,
   type FinishReason,
   type Message,
+  type MessageImage,
   type ModelAdapter,
   type ModelEvent,
   type ModelRequest,

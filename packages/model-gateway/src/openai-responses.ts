@@ -67,9 +67,16 @@ export function formatOpenAiResponsesInput(messages: Message[]): object[] {
       });
       continue;
     }
+    const contentParts: Array<Record<string, unknown>> = [{ type: "input_text", text: message.content }];
+    // Phase 27: images go as native input_image parts, not a data-URL buried in the text.
+    if (message.role === "user") {
+      for (const img of message.images ?? []) {
+        contentParts.push({ type: "input_image", image_url: `data:${img.mediaType};base64,${img.dataBase64}` });
+      }
+    }
     input.push({
       role: message.role === "system" ? "developer" : "user",
-      content: [{ type: "input_text", text: message.content }],
+      content: contentParts,
     });
   }
   return input;

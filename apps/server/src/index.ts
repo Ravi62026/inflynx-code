@@ -10,6 +10,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { URL } from "node:url";
+import { prepareAttachments } from "./attachments.js";
 import {
   loadEnv,
   MODEL_CATALOG,
@@ -677,39 +678,16 @@ const server = http.createServer(async (req, res) => {
         sseWrite(event.type, event.payload);
       });
 
-      // Process any attached images / screenshots / files
+      // Process any attached images / screenshots / files (Phase 27).
       let attachedContext = body.attachedContext || "";
+      let messageImages: Array<{ mediaType: string; dataBase64: string; name?: string }> = [];
       const attachments = Array.isArray(body.attachments) ? body.attachments : [];
       if (attachments.length > 0) {
         const attachmentsDir = path.join(WORKSPACE_ROOT, ".inflynx", "attachments");
-        try {
-          await fs.promises.mkdir(attachmentsDir, { recursive: true });
-        } catch {}
-
-        const notes: string[] = [];
-        for (let i = 0; i < attachments.length; i++) {
-          const att = attachments[i];
-          if (att && att.dataUrl) {
-            if (att.mimeType?.startsWith("image/")) {
-              try {
-                const ext = att.mimeType.split("/")[1]?.replace("jpeg", "jpg") || "png";
-                const cleanName = (att.name || `screenshot_${i + 1}`).replace(/[^a-zA-Z0-9_.-]/g, "_");
-                const filename = `${Date.now()}_${cleanName.endsWith(`.${ext}`) ? cleanName : `${cleanName}.${ext}`}`;
-                const filePath = path.join(attachmentsDir, filename);
-                const base64Data = att.dataUrl.replace(/^data:image\/\w+;base64,/, "");
-                await fs.promises.writeFile(filePath, Buffer.from(base64Data, "base64"));
-                const relPath = path.relative(WORKSPACE_ROOT, filePath);
-                notes.push(`[Attached Screenshot saved at: ${relPath}]\n![${att.name || "Screenshot"}](${att.dataUrl})`);
-              } catch {
-                notes.push(`![${att.name || "Screenshot"}](${att.dataUrl})`);
-              }
-            } else {
-              notes.push(`[Attached File: ${att.name}]`);
-            }
-          }
-        }
-        if (notes.length > 0) {
-          attachedContext = (attachedContext ? `${attachedContext}\n\n` : "") + notes.join("\n\n");
+        const prepared = prepareAttachments(attachments, { root: WORKSPACE_ROOT, saveDir: attachmentsDir });
+        messageImages = prepared.images;
+        if (prepared.contextText) {
+          attachedContext = (attachedContext ? `${attachedContext}\n\n` : "") + prepared.contextText;
         }
       }
 
@@ -721,7 +699,7 @@ const server = http.createServer(async (req, res) => {
       req.on("close", onClientClose);
 
       try {
-        const turnResult = await active.orchestrator.runTurn(prompt, attachedContext);
+        const turnResult = await active.orchestrator.runTurn(prompt, attachedContext || undefined, messageImages.length ? messageImages : undefined);
         sseWrite("turn.completed", {
           finalText: turnResult.finalText,
           toolResults: turnResult.toolResults,

@@ -534,7 +534,13 @@ export class AgentOrchestrator {
   /**
    * Executes a complete agentic turn with model streaming and tool invocation.
    */
-  async runTurn(userPrompt: string, attachedContext?: string): Promise<TurnResult> {
+  async runTurn(
+    userPrompt: string,
+    attachedContext?: string,
+    /** Multimodal images for this turn's user message (Phase 27). Carried structurally so
+     *  every adapter can render a native image block instead of a data-URL in the text. */
+    images?: Array<{ mediaType: string; dataBase64: string; name?: string }>,
+  ): Promise<TurnResult> {
     // One cancellation generation per turn. Hold this exact signal for the whole
     // turn — `context.signal` can belong to a later generation after an abort.
     const signal = this.context.beginGeneration();
@@ -555,7 +561,7 @@ export class AgentOrchestrator {
     await this.repairHistoryIntegrity();
 
     const fullPrompt = attachedContext ? `${userPrompt}\n\n=== Attached Context ===\n${attachedContext}` : userPrompt;
-    this.context.addMessage({ role: "user", content: fullPrompt });
+    this.context.addMessage({ role: "user", content: fullPrompt, ...(images && images.length ? { images } : {}) });
 
     // Persist user prompt to SessionStore
     await this.sessionStore.saveMessage(this.context.sessionId, {

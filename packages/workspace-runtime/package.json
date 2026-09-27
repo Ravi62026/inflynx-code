@@ -9,5 +9,8 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "clean": "rimraf dist"
+  },
+  "dependencies": {
+    "@inflynx/policy-engine": "workspace:*"
   }
 }

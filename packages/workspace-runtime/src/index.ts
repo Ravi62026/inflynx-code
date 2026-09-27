@@ -5,6 +5,7 @@
 
 import fs from "fs";
 import path from "path";
+import { isSensitiveToRead } from "@inflynx/policy-engine";
 
 // ─── Existing Types ───────────────────────────────────────────────────────────
 
@@ -75,24 +76,54 @@ const IGNORED_EXTENSIONS = new Set([
   ".zip", ".tar", ".gz", ".exe", ".bin",
 ]);
 
-function loadGitignorePatterns(dir: string): Set<string> {
+/**
+ * Ignore files we honour, in order. `.gitignore` is the baseline; `.agentignore` and
+ * `.inflynxignore` let a repo say "keep this out of the agent's automatic retrieval" without
+ * changing what ships in git (backlog Phase 33). A human typing an explicit `read_file` path
+ * still gets the file — this list governs what the agent may *discover and auto-include*.
+ */
+const IGNORE_FILE_NAMES = [".gitignore", ".agentignore", ".inflynxignore"];
+
+/**
+ * Files that must never enter the index, a `@mention`, auto-context or a vector chunk by
+ * default, whether or not they are gitignored: secrets, keys and credential stores. This is
+ * the *retrieval* fence — the reason B7 ("`.env` is the one dotfile kept in the index") was
+ * dangerous is that retrieval feeds the model, and feeding it a secret is a leak whether or
+ * not anyone meant to read it.
+ */
+const SECRET_BASENAMES = new Set([
+  ".env", ".npmrc", ".netrc", ".git-credentials", "id_rsa", "id_ed25519", "id_ecdsa",
+  "authorized_keys", "credentials.json", "credentials.yml", "secrets.json", ".htpasswd",
+]);
+const SECRET_SUFFIXES = [".pem", ".key", ".p12", ".pfx", ".kdbx", ".jks"];
+
+/** Committed templates are meant to be seen; a real `.env.local` is not. */
+function isSecretRetrieval(name: string): boolean {
+  if (SECRET_BASENAMES.has(name)) return true;
+  if (name.startsWith(".env.") && !/\.(example|sample|template|dist|txt)$/.test(name)) return true;
+  const lower = name.toLowerCase();
+  return SECRET_SUFFIXES.some((s) => lower.endsWith(s));
+}
+
+function loadIgnorePatterns(dir: string): Set<string> {
   const patterns = new Set<string>();
-  const gitignorePath = path.join(dir, ".gitignore");
-  if (!fs.existsSync(gitignorePath)) return patterns;
-  try {
-    const lines = fs.readFileSync(gitignorePath, "utf-8").split("\n");
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed && !trimmed.startsWith("#")) {
-        patterns.add(trimmed.replace(/\/$/, "").replace(/^\//, ""));
+  for (const file of IGNORE_FILE_NAMES) {
+    const ignorePath = path.join(dir, file);
+    if (!fs.existsSync(ignorePath)) continue;
+    try {
+      for (const line of fs.readFileSync(ignorePath, "utf-8").split("\n")) {
+        const trimmed = line.trim();
+        if (trimmed && !trimmed.startsWith("#")) {
+          patterns.add(trimmed.replace(/\/$/, "").replace(/^\//, ""));
+        }
       }
-    }
-  } catch { /* ignore */ }
+    } catch { /* a malformed ignore file simply contributes nothing */ }
+  }
   return patterns;
 }
 
-function isIgnoredByGitignore(name: string, gitignorePatterns: Set<string>): boolean {
-  for (const pattern of gitignorePatterns) {
+function isIgnoredByPatterns(name: string, ignorePatterns: Set<string>): boolean {
+  for (const pattern of ignorePatterns) {
     if (name === pattern) return true;
     if (pattern.includes("*") && name.endsWith(pattern.replace("*", ""))) return true;
   }
@@ -101,7 +132,7 @@ function isIgnoredByGitignore(name: string, gitignorePatterns: Set<string>): boo
 
 export function buildWorkspaceIndex(rootDir: string, maxDepth = 8): WorkspaceIndex {
   const files: WorkspaceFile[] = [];
-  const gitignorePatterns = loadGitignorePatterns(rootDir);
+  const ignorePatterns = loadIgnorePatterns(rootDir);
 
   function walk(dir: string, depth: number) {
     if (depth > maxDepth) return;
@@ -109,9 +140,12 @@ export function buildWorkspaceIndex(rootDir: string, maxDepth = 8): WorkspaceInd
     try { entries = fs.readdirSync(dir); } catch { return; }
 
     for (const entry of entries) {
-      if (entry.startsWith(".") && !entry.endsWith(".env")) continue;
+      // B7: dotfiles are skipped outright. The old exception that re-included `.env` is gone
+      // — a secret dotfile must never appear in the index a model is prompted with.
+      if (entry.startsWith(".")) continue;
       if (IGNORED_DIRS.has(entry)) continue;
-      if (isIgnoredByGitignore(entry, gitignorePatterns)) continue;
+      if (isIgnoredByPatterns(entry, ignorePatterns)) continue;
+      if (isSecretRetrieval(entry)) continue;
 
       const absPath = path.join(dir, entry);
       let stat: fs.Stats;
@@ -275,6 +309,14 @@ export function resolveAtMentionContext(mentions: AtMention[]): string {
   for (const mention of mentions) {
     if (!fs.existsSync(mention.absolutePath)) {
       blocks.push(`<file path="${mention.filePath}">\n(File not found)\n</file>`);
+      continue;
+    }
+
+    // B7: `@.env` / `@.git/config` / an ssh key must not be dumped into the prompt just
+    // because it is on disk. The same fence the gateway and attachment transport use.
+    const fence = isSensitiveToRead(mention.filePath, "");
+    if (fence.sensitive) {
+      blocks.push(`<file path="${mention.filePath}">\n(Not included: this is a sensitive path — ${fence.reason})\n</file>`);
       continue;
     }
 

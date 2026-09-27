@@ -7,9 +7,10 @@ import {
   TurnCheckpointStore,
   type PatchSafetyReview,
 } from "@inflynx/patch-engine";
-import { CanonicalPathGuard, reviewShellCommand, appendShellAudit, validatePublicUrl, hashShellOutput, type ShellApprovalSource, type ShellCommandReview } from "@inflynx/policy-engine";
+import { CanonicalPathGuard, reviewShellCommand, appendShellAudit, validatePublicUrl, hashShellOutput, isSensitiveToWrite, type ShellApprovalSource, type ShellCommandReview } from "@inflynx/policy-engine";
 import { ToolRegistry, executeTool, createToolExecutionContextFromGuard, ShellRegistry, type ToolCall, type ToolResult, type ToolDefinition, type ToolExecutionContext, type ToolExecutionMode } from "./index.js";
 import { classifyGitInvocation } from "./git-tools.js";
+import { validateToolArgs } from "./arg-validation.js";
 
 /** Non-string-tolerant cast for an argv array the model handed in. */
 function toStringArray(raw: unknown): string[] {
@@ -387,6 +388,25 @@ export class ToolExecutionGateway {
       }
     }
 
+    // 1c. Argument validation against the tool's declared schema, before anything runs.
+    //     Cheap, and it turns "the tool threw somewhere deep" into a correction the model
+    //     can act on. Only rejects clear violations (missing required, wrong container type,
+    //     bad enum) — extra properties and numeric-as-string pass, because those are not the
+    //     kind of thing that should fail a legitimate call.
+    const argCheck = validateToolArgs(tool.parameters as never, (call.args ?? {}) as Record<string, unknown>);
+    if (!argCheck.ok) {
+      return {
+        toolCallId: call.id,
+        toolName: call.name,
+        output:
+          `Error: invalid arguments for ${call.name} — the call was not run.\n` +
+          argCheck.errors.map((e) => `• ${e}`).join("\n") +
+          `\n\nExpected shape: ${JSON.stringify({ required: tool.parameters.required ?? [], properties: Object.keys(tool.parameters.properties) })}`,
+        isError: true,
+        durationMs: Date.now() - startMs,
+      };
+    }
+
     // 2. Validate Path Arguments via CanonicalPathGuard
     const args = { ...call.args };
     // Every argument that *names a place* must appear here. A path-shaped arg that is
@@ -410,6 +430,32 @@ export class ToolExecutionGateway {
             toolCallId: call.id,
             toolName: call.name,
             output: `Error: Security Policy Violation (${key}): ${err.message}`,
+            isError: true,
+            durationMs: Date.now() - startMs,
+          };
+        }
+      }
+    }
+
+    // 2a. Sensitive-write fence (backlog B10). A path that survived the canonical guard is
+    //     inside the workspace — but `.git/config`, `~/.ssh`, the credential store and
+    //     `node_modules` are inside too, and no agent edit belongs there. Enforced here, on
+    //     the resolved values, so a write can only be refused once and correctly, whatever
+    //     tool it came from. Read-only tools are exempt: reading a dependency is normal.
+    if (tool.isMutating) {
+      const root = this.pathGuard.getWorkspaceRoot();
+      for (const key of pathKeys) {
+        const resolved = args[key];
+        if (typeof resolved !== "string" || !resolved) continue;
+        const verdict = isSensitiveToWrite(resolved, root);
+        if (verdict.sensitive) {
+          return {
+            toolCallId: call.id,
+            toolName: call.name,
+            output:
+              `Error: ${call.name} refused to ${path.relative(root, resolved) ? `write "${path.relative(root, resolved)}"` : "write a path"} — ${verdict.reason}\n\n` +
+              `This is a policy refusal, not a filesystem error. The path is protected from agent edits. ` +
+              `If the user genuinely wants this changed, they should do it in their own terminal.`,
             isError: true,
             durationMs: Date.now() - startMs,
           };

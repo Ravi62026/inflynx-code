@@ -4,6 +4,7 @@
  */
 
 export * from "./plan.js";
+export * from "./untrusted.js";
 
 export type AgentEventType =
   | "session.started"

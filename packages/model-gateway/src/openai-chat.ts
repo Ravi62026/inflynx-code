@@ -74,26 +74,36 @@ export function formatOpenAiCompatibleMessages(messages: Message[]): Array<Recor
       return formatted;
     }
 
-    if (message.role === "user" && typeof message.content === "string") {
-      const dataUrlRegex = /data:image\/(?:png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+/g;
-      const matches = message.content.match(dataUrlRegex);
-      if (matches && matches.length > 0) {
-        const cleanText = message.content.replace(/!\[.*?\]\(data:image\/[^\)]+\)/g, "[Attached Screenshot]").trim();
-        const parts: Array<Record<string, unknown>> = [
-          { type: "text", text: cleanText || "Analyze this image." },
-        ];
-        for (const dataUrl of matches) {
-          parts.push({
-            type: "image_url",
-            image_url: { url: dataUrl },
-          });
-        }
-        return { role: "user", content: parts };
+    if (message.role === "user") {
+      // Phase 27: images arrive structurally on `message.images`, not scraped out of the
+      // text. Any leftover markdown data-URL (an older persisted session) is stripped from
+      // the text so a base64 blob is never sent as if it were prose.
+      const text = stripLegacyImageMarkdown(message.content ?? "");
+      if (message.images && message.images.length > 0) {
+        return {
+          role: "user",
+          content: [
+            { type: "text", text: text || "Analyze the attached image(s)." },
+            ...message.images.map((img) => ({
+              type: "image_url",
+              image_url: { url: `data:${img.mediaType};base64,${img.dataBase64}` },
+            })),
+          ],
+        };
       }
+      return { role: "user", content: text };
     }
 
     return { role: message.role, content: message.content };
   });
+}
+
+/** Removes `![alt](data:...)` markdown images and bare data-URLs from text. */
+function stripLegacyImageMarkdown(text: string): string {
+  return text
+    .replace(/!\[[^\]]*\]\(data:image\/[^)]+\)/g, "[Attached Screenshot]")
+    .replace(/data:image\/(?:png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+/g, "[Attached Screenshot]")
+    .trim();
 }
 
 export async function* streamOpenAiCompatible(
@@ -192,6 +202,7 @@ export async function* streamOpenAiCompatible(
   let promptTokens = 0;
   let completionTokens = 0;
   let reasoningTokens = 0;
+  let cachedInputTokens = 0;
   let outputTextLength = 0;
   let finishReason = "stop";
   let actualModel: string | undefined;
@@ -224,6 +235,8 @@ export async function* streamOpenAiCompatible(
         parsed.usage.completion_tokens_details?.reasoning_tokens ??
         parsed.usage.reasoning_tokens ??
         reasoningTokens;
+      // OpenAI reports cached_tokens as a SUBSET of prompt_tokens, billed at a discount.
+      cachedInputTokens = parsed.usage.prompt_tokens_details?.cached_tokens ?? cachedInputTokens;
     }
 
     const delta = parsed.choices?.[0]?.delta;
@@ -280,8 +293,10 @@ export async function* streamOpenAiCompatible(
   }
 
   yield* flushTools();
+  // Normalise to the shared convention: `promptTokens` becomes the uncached portion, and the
+  // cached subset moves to cachedInputTokens (which the cost model bills at 0.1x).
   const usage = promptTokens || completionTokens
-    ? buildUsage(request.model, promptTokens, completionTokens, reasoningTokens)
+    ? buildUsage(request.model, Math.max(0, promptTokens - cachedInputTokens), completionTokens, reasoningTokens, { cachedInputTokens })
     : fallbackUsage(request.model, body, outputTextLength, reasoningTokens);
   yield {
     type: "done",

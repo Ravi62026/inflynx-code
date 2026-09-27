@@ -21,6 +21,20 @@ function textBlock(text: string): AnthropicContentBlock[] {
   return text ? [{ type: "text", text }] : [];
 }
 
+/** Anthropic image block from the provider-neutral `MessageImage` (Phase 27). */
+function imageBlocks(message: Message): AnthropicContentBlock[] {
+  return (message.images ?? []).map((img) => ({
+    type: "image",
+    source: { type: "base64", media_type: img.mediaType, data: img.dataBase64 },
+  }));
+}
+
+function stripLegacyImageMarkdown(text: string): string {
+  return text
+    .replace(/!\[[^\]]*\]\(data:image\/[^)]+\)/g, "[Attached Screenshot]")
+    .replace(/data:image\/(?:png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+/g, "[Attached Screenshot]");
+}
+
 function assistantBlocks(message: Message): AnthropicContentBlock[] {
   const savedBlocks = message.provider_metadata?.anthropicContentBlocks;
   if (Array.isArray(savedBlocks)) return savedBlocks as AnthropicContentBlock[];
@@ -79,46 +93,52 @@ export function formatAnthropicMessages(messages: Message[]): AnthropicMessage[]
     if (message.role === "assistant") {
       formatted.push({ role: "assistant", content: assistantBlocks(message) });
     } else {
-      formatted.push({ role: "user", content: textBlock(message.content) });
+      // Text and images are separate blocks; an image is never a base64 string in the text.
+      const blocks = [...textBlock(stripLegacyImageMarkdown(message.content)), ...imageBlocks(message)];
+      formatted.push({ role: "user", content: blocks.length ? blocks : textBlock(message.content) });
     }
   }
   flushToolResults();
   return formatted;
 }
 
-export function formatAnthropicTools(tools: object[] | undefined): object[] | undefined {
+export function formatAnthropicTools(tools: object[] | undefined, cacheLast = false): object[] | undefined {
   if (!tools?.length) return undefined;
-  return tools.map((tool: any) => {
+  return tools.map((tool: any, i: number) => {
     const definition = tool.function || tool;
     return {
       name: definition.name,
       description: definition.description || "",
       input_schema: definition.parameters || { type: "object", properties: {} },
+      // The cache breakpoint goes on the LAST cached block of the stable prefix, which is
+      // the tool list here: everything before it (system + all tools) becomes one cached unit.
+      ...(cacheLast && i === tools.length - 1 ? { cache_control: { type: "ephemeral" } } : {}),
     };
   });
 }
 
-export async function* streamAnthropic(
-  request: ModelRequest,
-  signal?: AbortSignal
-): AsyncIterable<ModelEvent> {
-  const apiKey = request.apiKey || process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) throw new Error("Anthropic API key missing");
-
+/**
+ * Builds the Anthropic request body. Extracted (and exported) because prompt caching depends
+ * on the *stable prefix* — `system` + `tools` — being byte-identical turn after turn; keeping
+ * it a pure function of the request is what lets that property be tested without a live call.
+ *
+ * Cache breakpoints sit on the system block and the last tool, so Anthropic caches the whole
+ * system+tools head once per session and reuses it across every turn.
+ */
+export function buildAnthropicBody(request: ModelRequest): Record<string, unknown> {
   const system = request.messages.find((message) => message.role === "system")?.content || "You are Inflynx Agent.";
   const body: Record<string, unknown> = {
     model: request.model,
-    system,
+    system: [{ type: "text", text: system, cache_control: { type: "ephemeral" } }],
     messages: formatAnthropicMessages(request.messages),
     max_tokens: request.maxTokens ?? 8_192,
     stream: true,
   };
-  const tools = formatAnthropicTools(request.tools);
+  const tools = formatAnthropicTools(request.tools, true);
   if (tools) body.tools = tools;
 
-  // Claude Sonnet 5 uses adaptive thinking, not the deprecated numeric
-  // budget. The legacy field remains only for callers explicitly targeting
-  // older Anthropic models.
+  // Claude Sonnet 5 uses adaptive thinking, not the deprecated numeric budget. The legacy
+  // field remains only for callers explicitly targeting older Anthropic models.
   if (request.reasoningEffort && request.reasoningEffort !== "none") {
     body.thinking = { type: "adaptive" };
     body.output_config = { effort: request.reasoningEffort };
@@ -129,14 +149,22 @@ export async function* streamAnthropic(
     if (request.thinkingBudget < 1_024) {
       throw new Error("Anthropic thinkingBudget must be at least 1024.");
     }
-    // Auto-adjust max_tokens when thinking budget is set, since Anthropic
-    // requires budget_tokens < max_tokens (thinking tokens count toward the
-    // turn limit). If the caller didn't set maxTokens, bump it to fit.
     if (request.thinkingBudget >= maxTokens) {
       body.max_tokens = request.thinkingBudget + 1024;
     }
     body.thinking = { type: "enabled", budget_tokens: request.thinkingBudget };
   }
+  return body;
+}
+
+export async function* streamAnthropic(
+  request: ModelRequest,
+  signal?: AbortSignal
+): AsyncIterable<ModelEvent> {
+  const apiKey = request.apiKey || process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error("Anthropic API key missing");
+
+  const body = buildAnthropicBody(request);
 
   let response: Response;
   try {
@@ -168,6 +196,8 @@ export async function* streamAnthropic(
   let promptTokens = 0;
   let completionTokens = 0;
   let reasoningTokens = 0;
+  let cachedInputTokens = 0;
+  let cacheCreationInputTokens = 0;
   let outputTextLength = 0;
   let finishReason = "stop";
   let actualModel: string | undefined;
@@ -178,8 +208,13 @@ export async function* streamAnthropic(
 
     if (parsed.type === "message_start") {
       actualModel = parsed.message?.model || actualModel;
-      promptTokens = parsed.message?.usage?.input_tokens ?? promptTokens;
-      completionTokens = parsed.message?.usage?.output_tokens ?? completionTokens;
+      const u = parsed.message?.usage || {};
+      // Anthropic reports cache read / cache creation as tokens SEPARATE from input_tokens,
+      // which is exactly the convention estimateTokenUsageCost expects.
+      promptTokens = u.input_tokens ?? promptTokens;
+      completionTokens = u.output_tokens ?? completionTokens;
+      cachedInputTokens = u.cache_read_input_tokens ?? cachedInputTokens;
+      cacheCreationInputTokens = u.cache_creation_input_tokens ?? cacheCreationInputTokens;
     }
 
     if (parsed.type === "content_block_start") {
@@ -238,7 +273,7 @@ export async function* streamAnthropic(
   }
 
   const usage = promptTokens || completionTokens
-    ? buildUsage(request.model, promptTokens, completionTokens, reasoningTokens)
+    ? buildUsage(request.model, promptTokens, completionTokens, reasoningTokens, { cachedInputTokens, cacheCreationInputTokens })
     : fallbackUsage(request.model, body, outputTextLength, reasoningTokens);
   yield {
     type: "done",

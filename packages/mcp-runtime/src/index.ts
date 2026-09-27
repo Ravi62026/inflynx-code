@@ -14,6 +14,7 @@ import {
   type McpServerConfig,
   type ResolvedMcpServer,
 } from "@inflynx/config";
+import { wrapUntrusted } from "@inflynx/protocol";
 import { DEFAULT_MAX_TOOL_OUTPUT_CHARS, type ToolDefinition, type ToolRegistry } from "@inflynx/tool-runtime";
 import { HttpMcpSession } from "./http-transport.js";
 import { StdioMcpSession } from "./stdio-transport.js";
@@ -295,7 +296,7 @@ export class McpClientManager {
           timeoutMs: callTimeoutMs,
         });
 
-        return { output: renderMcpCallResult(serverId, name, result), isError: Boolean(result?.isError) };
+        return { output: wrapUntrusted(`MCP server "${serverId}" tool ${name}`, renderMcpCallResult(serverId, name, result)), isError: Boolean(result?.isError) };
       },
     };
   }

@@ -13,6 +13,7 @@ import {
   BACKGROUND_SHELL_RETENTION_BYTES,
 } from "./background-shells.js";
 import { GIT_TOOL } from "./git-tools.js";
+import { wrapUntrusted } from "@inflynx/protocol";
 import { UPDATE_PLAN_TOOL } from "./plan-tool.js";
 import { LIST_DIAGNOSTICS_TOOL, LIST_SYMBOLS_TOOL, FIND_DEFINITION_TOOL } from "./diagnostics-tools.js";
 
@@ -1238,10 +1239,10 @@ export const CORE_TOOLS: ToolDefinition[] = [
         return `No live web search results found for query: "${query}". Try refining search terms.`;
       }
 
-      return results
+      return wrapUntrusted("web_search", results
         .slice(0, max_results)
         .map((r, i) => `${i + 1}. ${r.title}\n   URL: ${r.link}\n   Snippet: ${r.snippet}`)
-        .join("\n\n");
+        .join("\n\n"));
     },
   },
 
@@ -1279,7 +1280,7 @@ export const CORE_TOOLS: ToolDefinition[] = [
         const text = stripHtmlTags(html);
         const truncated = text.length > 12_000 ? text.slice(0, 12_000) + "\n\n... (truncated for context length)" : text;
 
-        return `Content from ${publicUrl.toString()}:\n\n${truncated}`;
+        return wrapUntrusted(`web page ${publicUrl.toString()}`, `Content from ${publicUrl.toString()}:\n\n${truncated}`);
       } catch (err: any) {
         return `Failed to fetch URL ${url}: ${err?.message || String(err)}`;
       }
