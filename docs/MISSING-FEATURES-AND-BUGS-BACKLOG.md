@@ -32,32 +32,35 @@ postponed behind "auth is out of scope".
 
 ## 0.5 Current status — read this first when resuming
 
-> **As of:** 2026-09-26/27 · **HEAD:** `7237a7c` (1 commit ahead of `origin/main`, **not pushed**)
+> **As of:** 2026-09-27 · **HEAD:** `dd67aa8` (launch-sprint batch — see the §11 entry of the same name)
 > Everything below was measured from the working tree, not estimated. Re-run the commands at the
 > end of this section before trusting it — this file is a log, not a live system.
 
 | | | |
 |---|---|---|
-| **Phases landed** | **37 / 47** | 79% |
-| **Effort-weighted** | **100 / 137** eng-days | 73% |
+| **Phases landed** | **46 / 47** | 98% — only 47 (UI-runtime half) remains |
+| **Effort-weighted** | **≈ 120 / 137** eng-days | 88% |
 | **P0 (critical)** | **17 / 17** | **100% — nothing critical left** |
-| P1 | 17 / 19 | 89% — open: 45*, 46 (*45 partial: harness+eval+loop-matrix landed) |
-| P2 | 3 / 11 | open: 19, 28*, 37, 38, 41, 42, 44, 47 (*Phase 28 fence + arg-validation landed; parallel read-only remains) |
-| Findings actually fixed | **≈ 103 / 188** | ~55% — §3 rows are still under-marked (see the bookkeeping note below); verify against §11 before re-implementing anything |
-| Tests | **48 / 48 suites** | baseline at audit time was 17. Eval scoring lives in `tests/evals/` and reports recall/precision numbers. |
+| P1 | 19 / 19 | 100% — closed (45 by the CI eval job + weekly trigger, 46 by docs/CI/release) |
+| P2 | 10 / 11 | open: 47 (partial — K12 batching, keybinding collision, lazy activation, webview input parity) |
+| Findings actually fixed | **≈ 103+ / 188** | ~55%+ — §3 rows are still under-marked (see the bookkeeping note below); verify against §11 before re-implementing anything |
+| Tests | **58 unit + 5 service suites = 63** | 58/58 unit green locally; the 5 service suites proven green against correctly-credentialed Postgres/Redis (earlier local failures were a foreign container squatting port 5432 — environmental, not code) |
 | Build / typecheck | 0 / 0 | `pnpm build`, `pnpm typecheck` |
 
-**Landed:** Phases 1–18, 20–24, 26, 27, 29–36, 39, 40, 43 (plus the fence + arg-validation of
-Phase 28 and the harness/eval/loop-matrix of Phase 45), MCP hygiene B5/B6/B9. Full per-phase
-detail — including the bug each phase's tests caught — is **§11**.
+**Landed:** Phases 1–46 complete — including 19 (engine **and** the `delegate` tool + capability
+seam), 28 (fence + arg-validation **and** parallel read-only batches), 45 (harness + eval corpus
+**and** the CI eval job + weekly trigger) — plus MCP hygiene B5/B6/B9, self-audit N5–N16, and the
+launch-sprint batch (image self-read; CLI AGENTS.md / markdown streaming / headless `-p` / `/attach`).
+Full per-phase detail — including the bug each phase's tests caught — is **§11**.
 **✅ N5–N16 are fixed** (2026-09-27, see §11 for the same date). N5–N9 are the five findings the agent
 raised against itself; N10–N11 surfaced while writing Phase 24's tests and N12–N16 while writing Phase
 26's. Each is closed with a test that pins both directions — the false positive gone *and* the real
 control still biting.
 
-**Next, in order:** **41 → 37 → 38 → 46 → 42 → 44 → 19 → 28** — failover split-brain (41),
-usage-cost truth + output-token policy (37/38), rate-limit fail-open/backoff (42), skills/plugins
-(44), release/CI (46), then sub-agent isolation (19) and Phase 28 parallel reads.
+**Next, in order:** **47's UI-runtime tail** (K12 batched `postMessage`, the `cmd+shift+m`
+keybinding collision, lazy activation, webview input parity) — each needs a running extension host
+to validate honestly. Beyond the numbered backlog: server-side mode/system prompts (J2), MCP server
+surface (M20), and the launch checklist.
 
 **Known bookkeeping gap:** when a phase closed findings, the §3 rows were usually not updated. Two
 consequences: (a) §3's marked-closed count understates real progress badly (10 vs ~79); (b) do **not**
@@ -66,7 +69,7 @@ re-implement something because its row still says open — check §11 and the co
 Re-measure with:
 ```bash
 git log --oneline -1 && git status -sb | head -1
-pnpm build && pnpm typecheck && pnpm test:unit      # expect 48/48
+pnpm build && pnpm typecheck && pnpm test:unit      # expect 58/58
 grep -cE '^\| P[0-9] \| ✅' docs/MISSING-FEATURES-AND-BUGS-BACKLOG.md   # landed phase rows (37)
 grep -E '^\| P[0-9] \| ✅' docs/MISSING-FEATURES-AND-BUGS-BACKLOG.md \
   | awk -F'|' '{gsub(/ /,"",$4); s+=$4} END {print s "/137 eng-days"}'   # effort, summed from the rows
@@ -2370,7 +2373,7 @@ regenerating the `.mmd`/`.svg` architecture figures to match the graph, and arch
 plan docs (L20). Phase 45 remainder (node:test migration, per-provider request snapshots, weekly
 multi-provider eval) needs live providers/a scheduler and stays a CI-only follow-on.
 
-### 🟡 Phase 19 — sub-agent context isolation (2026-09-27) — engine landed, tool wiring deferred
+### ✅ Phase 19 — sub-agent context isolation (2026-09-27) — engine + `delegate` tool both landed
 
 The isolation engine is real and tested: `AgentOrchestrator.runSubAgent(task)` builds a nested,
 `"low"`-budget `AgentOrchestrator` via `.start` (so its session row exists before any turn), gives
@@ -2385,13 +2388,14 @@ appear in the child's messages (proven by first giving the parent a real history
 a ≤ 2 KB distilled summary reached in one extra provider call — i.e. the parent pays one result, not
 40 reads. build 0 · typecheck 0 · **54 suites** · no leaked temp dirs.
 
-**Deferred honestly:** surfacing it as a model-callable `delegate` **tool**. A registry tool's
-`execute(args, ctx)` gets a `ToolExecutionContext` (fs/shells/root), not the orchestrator, so making
-`delegate` a normal tool needs a capability-injection seam into the context *or* registering a
-closure-bound tool — but the registry is shared across sessions in the server, so a closure would
-capture the wrong orchestrator. That seam touches the concurrently-refactored guard/dispatch path and
-deserves deliberate design, so the engine + its isolation test land first and the tool surface is the
-explicit remaining step (a UI/`ToolRegistry` capability follow-on, not half-wired into the hot loop).
+**Completed (was deferred in the first pass):** surfacing it as a model-callable `delegate`
+**tool**. The predicted seam is exactly what landed: `ToolExecutionContext` gained a
+`runSubAgent` capability (`createToolExecutionContextFromGuard` option), the *owning*
+orchestrator installs it via `gateway.setSubAgentRunner(...)`, and the `delegate` tool in
+tool-runtime calls it — so the registry stays session-agnostic (no closure capturing a wrong
+orchestrator) and the sub-agent binds to the session that owns the gateway. A nested
+`delegate` call is refused by name in the child's read-only subset, so sub-agents cannot
+recurse.
 
 ### 🟡 Phase 47 — product parity (2026-09-27) — data-contract half landed, UI-runtime half needs a live extension
 
@@ -2416,7 +2420,14 @@ the snapshot is finite/complete (K3) and that the plan sidecar round-trips a ful
 degrades to `null` on corrupt input (K8). build 0 · typecheck 0 · **55 suites** — and critically, the
 **extension itself compiles** against the shared types (so K2–K5 type alignment is real, not hopeful).
 
-**Not claimed (needs the running VS Code / webview):** B11/B12 webview XSS hardening (add DOMPurify —
+**Update (2026-09-27, later batch):** of the list below, **B11/B12 and K10 have since landed** —
+`webview/markdown.ts` routes every render through DOMPurify (dep added), `open.file` enforces the
+workspace boundary, and the `apply.patch` handler exists in `ChatViewProvider`. Still open (each
+genuine UI-runtime work that must be validated against a live extension host): K12 batched delta
+`postMessage`, lazy activation / stop-when-hidden, the keybinding conflict, and webview input
+parity (multiline/history/slash/`@`mention).
+
+**Not claimed at the time (needed the running VS Code / webview):** B11/B12 webview XSS hardening (add DOMPurify —
 the dep is absent — and tighten CSP `img-src` + the `open.file` workspace boundary), K12 batched
 delta `postMessage`, lazy activation / stop-when-hidden, the keybinding conflict, CLI input parity
 (multiline/history/slash/`@`mention in the webview), and the K10 `apply.patch` handler. These are
@@ -2428,6 +2439,25 @@ authored blind into files I cannot execute here.
 
 
 
+
+### ✅ Launch-sprint batch — image self-read, parallel reads, CI evals, CLI DX (2026-09-27)
+
+| Part | What landed |
+|---|---|
+| Phase 27 completion — agent-initiated image reads | `read_file` detects `.png/.jpg/.jpeg/.webp/.gif` (`READABLE_IMAGE_MEDIA_TYPES`, 4 MB cap) and returns a structured `ToolResult.images` part — and honest `[binary file …]` messages for other binaries instead of UTF-8 mojibake. `AgentOrchestrator.injectToolResultImages` delivers the image as an immediately-following user turn (providers refuse images inside tool_result roles); the persisted transcript keeps a text marker. User-attached screenshots already worked via Phase 27 — this closes the *agent opens it itself* half |
+| Phase 28 — parallel read-only execution | Consecutive concurrently-safe calls (cacheable, core, read-only, non-`delegate`) batch via `Promise.all`; budget, events, context, store and `TurnResult.toolResults` apply in **call order** after the batch settles; mixed sequences keep sequential semantics; a gateway-level surprise becomes a per-call error result, never a dead turn. Batch members cannot mutate, checkpoint, or rate-limit, so nothing downstream can tell the difference except wall-clock time |
+| Phase 45 completion — CI eval job | `evals` job in `ci.yml`: both eval suites run with `set -o pipefail`, recall/precision reports tee'd to files and uploaded as 90-day artifacts; weekly cron trigger (`0 3 * * 1`) added to the workflow |
+| CLI — project instructions | `loadProjectInstructions()` (`@inflynx/config`): `AGENTS.md` → `.inflynx/AGENTS.md`, 32k cap with announced truncation, absent/whitespace ⇒ null; injected into every mode system prompt as a distinct, non-authoritative block |
+| CLI — markdown streaming | `createMarkdownStreamRenderer` (`@inflynx/ui-components`): renders each completed block at safe boundaries — blank lines *outside* code fences; a fence spanning paragraphs stays one block (the naive `\n\n` split rendered half a snippet twice). Sanitize **before** render, so N5 terminal hygiene holds and the renderer's own ANSI survives |
+| CLI — headless / one-shot | `inflynx -p "…"` / positional prompt / `--image <path>` (repeatable) / piped stdin (`cat error.log \| inflynx "explain"`); banner suppressed, exit code 0/1/2 by turn outcome so scripts and git hooks can branch; `--help`/`--version` fast-exit before any setup |
+| CLI — `/attach` | Queues image/text attachments for exactly the next prompt; images ride the Phase 27 structured carrier (never base64-in-text), text files inline with a 200 KB cap; same `isSensitiveToRead` fence as `@`mentions (B7) and the canonical path guard |
+
+**Verified:** typecheck 0 · build 0 · **58/58 unit suites** · the 3 service-dependent suites
+(`postgres-store`, `concurrency-postgres`, `live-e2e-demo`) proven green against
+correctly-credentialed Postgres/Redis on alternate ports — the earlier local failures were a
+foreign container squatting port 5432 with different credentials (environmental, not code).
+New suites: `tests/unit/image-read.test.ts`, `tests/unit/phase28-parallel.test.ts`,
+`tests/unit/cli-dx.test.ts`.
 
 ### Follow-ups discovered by Phases 2, 4, 5, 6 and 7 (added to the inventory)
 
