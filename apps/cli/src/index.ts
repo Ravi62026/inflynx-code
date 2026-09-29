@@ -658,20 +658,43 @@ async function main() {
     }
   });
 
-  // Model text streams as markdown. Rendering every delta would repaint the screen;
-  // rendering only at the end loses the streaming feel — so blocks render as they close
-  // (see createMarkdownStreamRenderer). The untrusted source is sanitized *before*
-  // rendering; sanitizing after would strip the ANSI codes the renderer adds.
-  const markdownStream = createMarkdownStreamRenderer({
+  // Model output streams on two channels: reasoning summaries (thought_delta) and the
+  // answer (text_delta). Both are markdown and both go through the block renderer —
+  // a dim-wrapped stream for thinking, the plain one for the answer. A header is
+  // printed whenever the active channel switches: the two streams used to run together
+  // on one line ("…correctly!Heading"), and the thinking stream printed raw markdown
+  // markers (`**`, `***`) that the answer path never showed.
+  type StreamKind = "thought" | "text";
+  let activeStream: StreamKind | null = null;
+  const streamHeader = (kind: StreamKind) =>
+    kind === "thought"
+      ? `${colors.gray}── thinking ────────────────────────────────────────${colors.reset}\n`
+      : `${colors.gray}── answer ──────────────────────────────────────────${colors.reset}\n`;
+  const thoughtStream = createMarkdownStreamRenderer({
+    write: (chunk) => process.stdout.write(`${colors.gray}${chunk}${colors.reset}`),
+    render: (block) => renderTerminalMarkdown(sanitizeForTerminal(block)),
+  });
+  const answerStream = createMarkdownStreamRenderer({
     write: (chunk) => process.stdout.write(chunk),
     render: (block) => renderTerminalMarkdown(sanitizeForTerminal(block)),
   });
+  const switchStream = (kind: StreamKind) => {
+    if (activeStream === kind) return;
+    if (activeStream === "thought" && kind === "text") thoughtStream.end();
+    if (activeStream === "text" && kind === "thought") answerStream.end();
+    // The ⚡ prefix already announces the first answer; a thinking stream always gets
+    // labelled, because unexplained gray text reads like a rendering bug.
+    if (activeStream !== null || kind === "thought") process.stdout.write(streamHeader(kind));
+    activeStream = kind;
+  };
   eventBus.on<{ text: string }>("model.text_delta", (evt) => {
-    markdownStream.push(evt.payload.text);
+    switchStream("text");
+    answerStream.push(evt.payload.text);
   });
 
   eventBus.on<{ thought: string }>("model.thought_delta", (evt) => {
-    process.stdout.write(`${colors.gray}${sanitizeForTerminal(evt.payload.thought)}${colors.reset}`);
+    switchStream("thought");
+    thoughtStream.push(evt.payload.thought);
   });
 
   eventBus.on("turn.started", () => {
@@ -880,7 +903,9 @@ async function main() {
     } catch (err: any) {
       console.error(`inflynx: turn error: ${err?.message || String(err)}`);
     } finally {
-      markdownStream.end();
+      thoughtStream.end();
+      answerStream.end();
+      activeStream = null;
     }
     const headGate = headlessResult?.verification;
     if (headGate) {
@@ -1088,7 +1113,7 @@ async function main() {
               console.log(`\n${colors.bold}${colors.brightCyan}User:${colors.reset} ${sanitizeForTerminal(msg.content)}`);
             } else if (msg.role === "assistant") {
               if (msg.content) {
-                console.log(`\n${colors.bold}${colors.brightMagenta}⚡ Inflynx (${hydration.session.model}):${colors.reset}\n${sanitizeForTerminal(msg.content)}`);
+                console.log(`\n${colors.bold}${colors.brightMagenta}⚡ Inflynx (${hydration.session.model}):${colors.reset}\n${renderTerminalMarkdown(sanitizeForTerminal(msg.content))}`);
               }
             } else if (msg.role === "tool") {
               const snippet = (msg.content || "").split("\n").slice(0, 3).join("\n");
@@ -2354,9 +2379,11 @@ async function main() {
     } catch (err: any) {
       console.error(`\n${colors.red}❌ Unexpected orchestrator error:${colors.reset} ${err?.message || String(err)}\n`);
     } finally {
-      // Flush any markdown tail still held by the block streamer (unclosed fence, a
+      // Flush any markdown tail still held by the block streamers (unclosed fence, a
       // final paragraph with no trailing blank line) before status lines print.
-      markdownStream.end();
+      thoughtStream.end();
+      answerStream.end();
+      activeStream = null;
       turnInFlight = false;
     }
 
