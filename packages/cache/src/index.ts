@@ -63,6 +63,26 @@ export function getRedisClient(): Redis | null {
   return sharedClient;
 }
 
+/**
+ * Eagerly create + connect the shared Redis client and resolve once it is actually usable, so a
+ * cold-started server never makes the FIRST rate-limited request race the TCP handshake. Without
+ * this, ioredis (a lazy singleton, `enableOfflineQueue:false`) rejects the very first command while
+ * still connecting, and the server's fail-CLOSED limiter turns that transient into a spurious 429 —
+ * exactly what a real user would hit on their first turn/login after boot. Bounded and never throws:
+ * on timeout we resolve "unavailable" and let the normal fail-closed behaviour apply for a real outage.
+ */
+export function ensureRedisReady(timeoutMs = 3000): Promise<"ready" | "unavailable" | "disabled"> {
+  const client = getRedisClient();
+  if (!client) return Promise.resolve("disabled");
+  if (client.status === "ready") return Promise.resolve("ready");
+  return new Promise((resolve) => {
+    const t = setTimeout(() => resolve("unavailable"), Math.max(0, timeoutMs));
+    client.once("ready", () => { clearTimeout(t); resolve("ready"); });
+    // If the connection fully closed before ever becoming ready (e.g. wrong host), don't hang.
+    client.once("end", () => { clearTimeout(t); resolve("unavailable"); });
+  });
+}
+
 /** True when a Redis URL is configured (drives the default fail-open-vs-closed choice). */
 export function isRedisConfigured(): boolean {
   return Boolean(process.env.REDIS_URL);

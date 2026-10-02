@@ -28,7 +28,7 @@ import { handleAuthRoutes } from "./auth/routes.js";
 import { authEnforced, resolveUser, clientIp } from "./auth/middleware.js";
 import { creditsForCostUsd } from "./auth/credits.js";
 import { isProviderError } from "@inflynx/model-gateway";
-import { getRedisClient, checkRateLimit } from "@inflynx/cache";
+import { getRedisClient, checkRateLimit, ensureRedisReady, isRedisConfigured } from "@inflynx/cache";
 
 loadEnv();
 
@@ -906,6 +906,15 @@ const server = http.createServer(async (req, res) => {
     });
   }
 });
+
+// Eagerly start the shared Redis connection at boot rather than lazily on the first request, so a
+// cold start doesn't make the very first rate-limited call race a just-constructed client and get a
+// spurious fail-closed 429 (see cache.ensureRedisReady). Fire-and-forget: never delays `listen`.
+if (isRedisConfigured()) {
+  void ensureRedisReady(5000).then((s) => {
+    if (s !== "ready") console.warn(`[inflynx-server] Redis not ready at boot (${s}) — rate limiting will fail-closed until it connects.`);
+  });
+}
 
 server.listen(PORT, HOST, () => {
   console.log("==================================================================");
