@@ -43,3 +43,27 @@ demo mode.
 With the default (no `DATABASE_URL`) configuration, all transcripts and checkpoints live under the
 workspace's `.inflynx/` directory on your own machine. `.inflynx/` is git-ignored so it is not
 committed by accident.
+
+## Accounts & identity data (only when the auth layer is enabled)
+
+The optional auth layer (Phases 1-4) is **off by default** and only records data when
+`INFLYNX_AUTH_ENFORCED` / `INFLYNX_REQUIRE_LOGIN` are turned on against a `DATABASE_URL`. When enabled,
+the server stores, per account:
+
+- **Identity** — email, display name, avatar URL, the Clerk subject, and the auth provider. Our own
+  app JWT (not Clerk's token) carries only the user id + plan.
+- **Metering** — plan, credit balance/used, and a credit ledger keyed by user id (delta, reason,
+  session id, balance snapshot). No prompt contents are in the ledger.
+- **Abuse-prevention signals** — the signup IP and last IP (stored as `INET`), a device fingerprint
+  string, and the signup user-agent, used to count signups per IP / fingerprint / email-domain so one
+  person cannot farm the signup credit grant. Exceeding a threshold flags the account and withholds the
+  bonus; it does not block the sign-up itself.
+- **Session ownership** — each `agent_sessions` row is tagged with its `user_id` so per-user history
+  and cross-owner access control (403) work.
+
+These fields are personally identifying and live **server-side in Postgres** (not on the CLI device,
+except the short-lived app token in `~/.inflynx/auth.json`, written `0600`). Client IP is treated as
+PII: it is only trusted from proxy headers when `INFLYNX_TRUST_PROXY=1`, and should be pruned by a
+retention job as the product scales — it is deliberately **never** returned to the client (`/me` and
+session lists expose only `UserPublic`: id, email, name, avatar, plan, credits). Deleting a user should
+cascade or null their `agent_sessions.user_id`, ledger, account links, and signup-attempt rows.

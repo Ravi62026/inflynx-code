@@ -59,6 +59,19 @@ inflynx --help
 
 Inside the REPL, `/help` lists the slash commands (modes, plan, sessions, mcp, undo, …).
 
+## Sign in (optional)
+
+By default the CLI runs fully **local and bring-your-own-key** — no account, no sign-in, nothing leaves
+your machine except the calls to the model provider you configured. An account layer exists for the
+metered/cloud mode and is **off by default**:
+
+- `/login` — browser device-flow sign-in; stores a short-lived token at `~/.inflynx/auth.json` (`0600`).
+- `/account` — show your signed-in plan and credit balance; `/logout` clears the local token.
+
+Enabling enforcement (`INFLYNX_REQUIRE_LOGIN=1` in the CLI, `INFLYNX_AUTH_ENFORCED=1` on the server) is
+opt-in and requires the backend + identity keys to be configured (see root `.env.example`). Until then,
+`icode` behaves exactly as the local tool above.
+
 ## Status & honesty
 
 This is an early **local-first developer tool**, not a hardened multi-tenant service. The companion

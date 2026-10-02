@@ -50,6 +50,32 @@ about *attacks and controls*, not data flows.
 - **Provider-side retention** depends on the chosen provider/account; the Responses path sends
   `store:false`, but the guarantees are the provider's, not ours.
 
+## Auth, accounts & abuse (optional layer — active only when enforced)
+
+The auth layer is inert by default; these controls apply once `INFLYNX_AUTH_ENFORCED` is on. Each row
+maps a vector to the mitigation that is actually implemented (not planned):
+
+- **App-token theft / replay** — the CLI/extension present our own HS256 app JWT (1 h TTL, `jti`,
+  constant-time signature compare), never Clerk's. Stored `0600` in `~/.inflynx/auth.json`. *Open:* no
+  refresh-token rotation or server-side revocation list yet — a stolen token is valid for its hour; the
+  next hardening step is a short TTL + revocation table.
+- **Device-code brute force / minting** — human-format `user_code` + expiring `device_code`; every
+  `/auth/device/*` call is capped per client IP (default 20 / 60 s) with the atomic limiter, so one box
+  cannot enumerate codes or hammer the token poll. The approve step additionally requires a valid Clerk
+  identity token, so approving someone else's code needs their account.
+- **Signup credit farming (multi-account)** — before granting the signup bonus we count recent signups
+  sharing a device fingerprint, IP, or email-domain over a 24 h window; over any threshold the account is
+  flagged and the bonus is withheld (the sign-up still works, just un-granted). Thresholds are env-tunable.
+- **Cross-owner data access** — `agent_sessions.user_id` is set at creation; reading or turning on a
+  session that belongs to another user returns 403, and the session list is scoped to the caller.
+- **Negative balance / runaway spend** — `debitCredits` is a single conditional `UPDATE … WHERE credits
+  >= amount`, so a balance can never go negative even under concurrent turns; the pre-turn 402 gate
+  blocks spend once a balance is exhausted.
+- **Model-path DoS** — turns are limited by two buckets (per-user 30 / 60 s, per-IP 120 / 60 s) that
+  fail **closed** on the server when Redis errors, so the limiter is a control, not a suggestion.
+- **IP spoofing into the abuse signals** — `X-Forwarded-For` is trusted only when `INFLYNX_TRUST_PROXY=1`;
+  otherwise the socket address is used, so a client cannot forge the IP that abuse counting keys on.
+
 ## Non-goals of this model
 
 Physical/access-control compromise of the host, malicious *installed* MCP servers that the user
