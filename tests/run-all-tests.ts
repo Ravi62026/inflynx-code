@@ -67,6 +67,7 @@ const unitTestFiles = [
   "tests/unit/phase44-skills.test.ts",  // Phase 44: real SKILL.md frontmatter parser (I5)
   "tests/unit/phase47-parity.test.ts",  // Phase 47: normalized wire BudgetSnapshot (K3) + shared protocol types
   "tests/unit/config-efforts.test.ts",  // Effort matrix (researched) + startup clamp
+  "tests/unit/auth-foundation.test.ts",  // Phase 1 auth: migration + identity/credit method presence (offline)
   "tests/unit/image-read.test.ts",  // Phase 27 completion: read_file returns images; orchestrator injects them natively
   "tests/unit/phase28-parallel.test.ts",  // Phase 28: parallel read-only batch keeps call-order guarantees
   "tests/unit/cli-dx.test.ts",  // Launch sprint: markdown block streaming + AGENTS.md loading
@@ -86,6 +87,7 @@ const integrationTestFiles = [
   "tests/integration/concurrency-postgres.test.ts",
   "tests/integration/phase41-single-source-pg.test.ts",   // Phase 41: per-session pinning / no-fork on real Postgres
   "tests/integration/phase42-redis-ratelimit.test.ts",    // Phase 42: atomic INCR+EXPIRE window on real Redis
+  "tests/integration/auth-users-credits.test.ts",         // Phase 1: idempotent users + credit ledger + no-negative guard on real PG
   "tests/e2e/live-e2e-demo.test.ts",
 ];
 

@@ -18,6 +18,9 @@ import type {
   StoredTokenTelemetry,
   SessionHydration,
   SessionModelConfig,
+  User,
+  CreateUserIdentityInput,
+  SignupSignal,
 } from "./types.js";
 import { generateSessionId, generateRecordId } from "./types.js";
 import { MIGRATIONS } from "./migrations.js";
@@ -100,7 +103,8 @@ export class PostgresSessionStore implements SessionStore {
     effortLevel: string = "medium",
     title?: string,
     sessionId?: string,
-    modelConfig?: Partial<SessionModelConfig>
+    modelConfig?: Partial<SessionModelConfig>,
+    userId?: string | null
   ): Promise<SessionRecord> {
     await this.ensureMigrated();
 
@@ -120,6 +124,7 @@ export class PostgresSessionStore implements SessionStore {
       effortLevel,
       title: title || `Session in ${path.basename(cwd)}`,
       status: "active",
+      userId: userId ?? null,
     };
 
     const client = await this.pool.connect();
@@ -129,8 +134,8 @@ export class PostgresSessionStore implements SessionStore {
         `INSERT INTO agent_sessions (
           session_id, cwd, created_at, updated_at, provider, model,
           credential_profile_id, base_url, reasoning_effort, actual_model,
-          active_mode, effort_level, title, status
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+          active_mode, effort_level, title, status, user_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
         [
           record.sessionId,
           record.cwd,
@@ -146,6 +151,7 @@ export class PostgresSessionStore implements SessionStore {
           record.effortLevel,
           record.title,
           record.status,
+          record.userId,
         ]
       );
       await client.query(
@@ -297,7 +303,7 @@ export class PostgresSessionStore implements SessionStore {
     const sRes = await this.pool.query(
       `SELECT session_id, cwd, created_at, updated_at, provider, model,
               credential_profile_id, base_url, reasoning_effort, actual_model,
-              active_mode, effort_level, title, status
+              active_mode, effort_level, title, status, user_id
        FROM agent_sessions WHERE session_id = $1`, [sessionId]);
     if (sRes.rows.length === 0) return null;
 
@@ -372,7 +378,7 @@ export class PostgresSessionStore implements SessionStore {
     const res = await this.pool.query(
       `SELECT session_id, cwd, created_at, updated_at, provider, model,
               credential_profile_id, base_url, reasoning_effort, actual_model,
-              active_mode, effort_level, title, status
+              active_mode, effort_level, title, status, user_id
        FROM agent_sessions ${where} ORDER BY updated_at DESC`, params);
     return res.rows.map((row) => this.mapSessionRow(row));
   }
@@ -417,6 +423,164 @@ export class PostgresSessionStore implements SessionStore {
       effortLevel: row.effort_level,
       title: row.title,
       status: row.status,
+      userId: row.user_id ?? null,
     };
+  }
+
+  // ── Phase 1 identity + credits + anti-abuse signals ──────────────────────────
+
+  private mapUserRow(row: any): User {
+    return {
+      id: row.id,
+      email: row.email ?? null,
+      displayName: row.display_name ?? null,
+      avatarUrl: row.avatar_url ?? null,
+      authProvider: row.auth_provider,
+      authSubject: row.auth_subject,
+      plan: row.plan,
+      credits: Number(row.credits),
+      creditsUsed: Number(row.credits_used),
+      disabled: row.disabled,
+      flagged: row.flagged,
+      flaggedReason: row.flagged_reason ?? null,
+      createdAt: Number(row.created_at),
+      lastSeenAt: row.last_seen_at != null ? Number(row.last_seen_at) : null,
+    };
+  }
+
+  async createUser(input: CreateUserIdentityInput): Promise<User> {
+    await this.ensureMigrated();
+    const now = Date.now();
+    const domain = input.email?.includes("@") ? input.email.split("@")[1]?.toLowerCase() ?? null : null;
+    const res = await this.pool.query(
+      `INSERT INTO users (
+         email, display_name, avatar_url, auth_provider, auth_subject, plan, credits,
+         credits_used, signup_ip, last_ip, signup_user_agent, device_fingerprint, created_at, last_seen_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $8, $9, $10, $11, $11)
+       ON CONFLICT (auth_provider, auth_subject) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at
+       RETURNING *`,
+      [
+        input.email ?? null,
+        input.displayName ?? null,
+        input.avatarUrl ?? null,
+        input.authProvider,
+        input.authSubject,
+        input.plan ?? "free",
+        input.credits ?? 0,
+        input.signupSignal?.ip ?? null,
+        input.signupSignal?.userAgent ?? null,
+        input.signupSignal?.deviceFingerprint ?? null,
+        now,
+      ]
+    );
+    void domain; // email-domain counting happens in countSignupSignals via users.email
+    return this.mapUserRow(res.rows[0]);
+  }
+
+  async getUser(id: string): Promise<User | null> {
+    await this.ensureMigrated();
+    const res = await this.pool.query(`SELECT * FROM users WHERE id = $1`, [id]);
+    return res.rows[0] ? this.mapUserRow(res.rows[0]) : null;
+  }
+
+  async getUserBySubject(provider: string, subject: string): Promise<User | null> {
+    await this.ensureMigrated();
+    const res = await this.pool.query(
+      `SELECT * FROM users WHERE auth_provider = $1 AND auth_subject = $2`, [provider, subject]);
+    return res.rows[0] ? this.mapUserRow(res.rows[0]) : null;
+  }
+
+  async listSessionsByUser(userId: string, limit = 100): Promise<SessionRecord[]> {
+    await this.ensureMigrated();
+    const res = await this.pool.query(
+      `SELECT session_id, cwd, created_at, updated_at, provider, model,
+              credential_profile_id, base_url, reasoning_effort, actual_model,
+              active_mode, effort_level, title, status, user_id
+       FROM agent_sessions WHERE user_id = $1 AND status <> 'archived'
+       ORDER BY updated_at DESC LIMIT $2`, [userId, Math.max(1, Math.min(1000, limit))]);
+    return res.rows.map((row) => this.mapSessionRow(row));
+  }
+
+  async grantCredits(userId: string, amount: number, reason: string): Promise<User | null> {
+    await this.ensureMigrated();
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const u = await client.query(`UPDATE users SET credits = credits + $1 WHERE id = $2 RETURNING *`, [amount, userId]);
+      if (u.rows.length === 0) { await client.query("ROLLBACK"); return null; }
+      const user = this.mapUserRow(u.rows[0]);
+      await client.query(
+        `INSERT INTO credit_ledger (user_id, delta, reason, balance_after, created_at) VALUES ($1, $2, $3, $4, $5)`,
+        [userId, amount, reason, user.credits, Date.now()]);
+      await client.query("COMMIT");
+      return user;
+    } catch (err) { await client.query("ROLLBACK"); throw err; } finally { client.release(); }
+  }
+
+  async debitCredits(userId: string, amount: number, reason: string, sessionId?: string): Promise<{ ok: boolean; user: User | null }> {
+    await this.ensureMigrated();
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      // Conditional update is the atomic guard against a negative balance under concurrent debits:
+      // only rows that still have enough credits are updated.
+      const u = await client.query(
+        `UPDATE users SET credits = credits - $1, credits_used = credits_used + $1
+         WHERE id = $2 AND credits >= $1 RETURNING *`, [amount, userId]);
+      if (u.rows.length === 0) {
+        await client.query("ROLLBACK");
+        const cur = await this.getUser(userId);
+        return { ok: false, user: cur };
+      }
+      const user = this.mapUserRow(u.rows[0]);
+      await client.query(
+        `INSERT INTO credit_ledger (user_id, delta, reason, session_id, balance_after, created_at) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [userId, -amount, reason, sessionId ?? null, user.credits, Date.now()]);
+      await client.query("COMMIT");
+      return { ok: true, user };
+    } catch (err) { await client.query("ROLLBACK"); throw err; } finally { client.release(); }
+  }
+
+  async recordSignupAttempt(signal: SignupSignal & { outcome: string }): Promise<void> {
+    await this.ensureMigrated();
+    const domain = signal.emailDomain ?? null;
+    await this.pool.query(
+      `INSERT INTO signup_attempts (ip, device_fingerprint, email_domain, user_agent, outcome, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [signal.ip ?? null, signal.deviceFingerprint ?? null, domain, signal.userAgent ?? null, signal.outcome, Date.now()]);
+  }
+
+  async countSignupSignals(q: Partial<SignupSignal> & { sinceMs: number }): Promise<{ fingerprint: number; ipRange: number; emailDomain: number }> {
+    await this.ensureMigrated();
+    const since = Date.now() - q.sinceMs;
+    const fp = q.deviceFingerprint
+      ? (await this.pool.query(`SELECT COUNT(*)::int AS c FROM users WHERE device_fingerprint = $1 AND created_at >= $2`, [q.deviceFingerprint, since])).rows[0]?.c ?? 0
+      : 0;
+    const ip = q.ip
+      ? (await this.pool.query(`SELECT COUNT(*)::int AS c FROM users WHERE signup_ip = $1 AND created_at >= $2`, [q.ip, since])).rows[0]?.c ?? 0
+      : 0;
+    const dom = q.emailDomain
+      ? (await this.pool.query(`SELECT COUNT(*)::int AS c FROM users WHERE split_part(email, '@', 2) = $1 AND created_at >= $2`, [q.emailDomain, since])).rows[0]?.c ?? 0
+      : 0;
+    return { fingerprint: Number(fp), ipRange: Number(ip), emailDomain: Number(dom) };
+  }
+
+  async markUserFlagged(userId: string, reason: string): Promise<void> {
+    await this.ensureMigrated();
+    await this.pool.query(`UPDATE users SET flagged = true, flagged_reason = $1 WHERE id = $2`, [reason, userId]);
+  }
+
+  async setUserDisabled(userId: string, disabled: boolean): Promise<void> {
+    await this.ensureMigrated();
+    await this.pool.query(`UPDATE users SET disabled = $1 WHERE id = $2`, [disabled, userId]);
+  }
+
+  async touchUserSeen(userId: string, ip?: string): Promise<void> {
+    await this.ensureMigrated();
+    if (ip) {
+      await this.pool.query(`UPDATE users SET last_seen_at = $1, last_ip = $2 WHERE id = $3`, [Date.now(), ip, userId]);
+    } else {
+      await this.pool.query(`UPDATE users SET last_seen_at = $1 WHERE id = $2`, [Date.now(), userId]);
+    }
   }
 }

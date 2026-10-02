@@ -26,6 +26,11 @@ export interface SessionRecord {
   effortLevel: string;
   title?: string;
   status: "active" | "completed" | "failed" | "cancelled" | "archived";
+  /**
+   * Phase 1 auth: owning user. Nullable in the store (pre-auth + the synthetic `legacy` row);
+   * the server always sets it for new sessions once login is mandatory.
+   */
+  userId?: string | null;
 }
 
 export interface StoredMessage {
@@ -106,7 +111,9 @@ export interface SessionStore {
     effortLevel?: string,
     title?: string,
     sessionId?: string,
-    modelConfig?: Partial<SessionModelConfig>
+    modelConfig?: Partial<SessionModelConfig>,
+    /** Phase 1: owning user (server sets it once login is mandatory). */
+    userId?: string | null
   ): Promise<SessionRecord>;
   saveMessage(sessionId: string, message: Omit<StoredMessage, "id" | "timestamp" | "sessionId">): Promise<StoredMessage>;
   saveToolExecution(sessionId: string, execution: Omit<StoredToolExecution, "id" | "timestamp" | "sessionId">): Promise<StoredToolExecution>;
@@ -126,6 +133,24 @@ export interface SessionStore {
   deleteSession(sessionId: string): Promise<boolean>;
   /** Releases underlying connections/handles, if any. Safe to call on stores that don't need it. */
   close(): Promise<void>;
+
+  // ── Phase 1 identity + credits (OPTIONAL: only the Postgres backend implements them; the
+  // local JSON dev fallback leaves them undefined, and callers feature-detect). ────────────
+  createUser?(input: CreateUserIdentityInput): Promise<User>;
+  getUser?(id: string): Promise<User | null>;
+  getUserBySubject?(provider: string, subject: string): Promise<User | null>;
+  /** Sessions belonging to a user, newest first. Used for the per-user history view. */
+  listSessionsByUser?(userId: string, limit?: number): Promise<SessionRecord[]>;
+  /** Credit ledger. `debitCredits` refuses to go negative (returns { ok:false, balance }). */
+  grantCredits?(userId: string, amount: number, reason: string): Promise<User | null>;
+  debitCredits?(userId: string, amount: number, reason: string, sessionId?: string): Promise<{ ok: boolean; user: User | null }>;
+  /** Anti-abuse signal capture at signup. Returns whether the account should be flagged/bonus-less. */
+  recordSignupAttempt?(signal: SignupSignal & { outcome: string }): Promise<void>;
+  /** How many accounts/signups share this fingerprint / ip-range / email-domain in the window. */
+  countSignupSignals?(q: Partial<SignupSignal> & { sinceMs: number }): Promise<{ fingerprint: number; ipRange: number; emailDomain: number }>;
+  markUserFlagged?(userId: string, reason: string): Promise<void>;
+  setUserDisabled?(userId: string, disabled: boolean): Promise<void>;
+  touchUserSeen?(userId: string, ip?: string): Promise<void>;
 }
 
 import { randomUUID } from "node:crypto";
@@ -145,4 +170,57 @@ export function generateRecordId(prefix: string): string {
 /** Generates a session ID in the shared `session_<ts>_<rand>` format used across the codebase. */
 export function generateSessionId(): string {
   return `session_${Date.now()}_${randomUUID().slice(0, 8)}`;
+}
+
+// ─── Phase 1: identity, credits, anti-abuse signals ───────────────────────────
+
+export type UserPlan = "free" | "pro" | string;
+
+/** A user as stored/returned by the identity layer. `credits` is the remaining balance. */
+export interface User {
+  id: string;
+  email: string | null;
+  displayName: string | null;
+  avatarUrl: string | null;
+  authProvider: string;
+  authSubject: string;
+  plan: UserPlan;
+  credits: number;
+  creditsUsed: number;
+  disabled: boolean;
+  flagged: boolean;
+  flaggedReason: string | null;
+  createdAt: number;
+  lastSeenAt: number | null;
+}
+
+/** Input to `createUser` — the (provider, subject) pair is the idempotency key. */
+export interface CreateUserIdentityInput {
+  authProvider: string;
+  authSubject: string;
+  email?: string | null;
+  displayName?: string | null;
+  avatarUrl?: string | null;
+  plan?: UserPlan;
+  /** Initial balance to seed (e.g. the signup bonus), already abuse-gated by the caller. */
+  credits?: number;
+  signupSignal?: SignupSignal;
+}
+
+/** Non-secret-ish abuse signals captured at signup/login. IP is PII — retention applies. */
+export interface SignupSignal {
+  ip?: string | null;
+  deviceFingerprint?: string | null;
+  emailDomain?: string | null;
+  userAgent?: string | null;
+}
+
+export interface CreditLedgerEntry {
+  id: string;
+  userId: string;
+  delta: number;
+  reason: string;
+  sessionId: string | null;
+  balanceAfter: number;
+  createdAt: number;
 }

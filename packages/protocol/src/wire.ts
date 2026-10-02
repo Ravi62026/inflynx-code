@@ -57,6 +57,29 @@ export interface SessionRecordWire {
   state?: string;
   title?: string;
   cwd?: string;
+  userId?: string | null;
   createdAt?: string;
   updatedAt?: string;
+}
+
+/**
+ * Public-safe user projection for the UI (never the signup IP / fingerprint / flagged reason —
+ * those are internal abuse-control fields). `credits` is the remaining balance.
+ */
+export interface UserPublic {
+  id: string;
+  email: string | null;
+  displayName: string | null;
+  avatarUrl: string | null;
+  plan: string;
+  credits: number;
+}
+
+/** Device-authorization grant returned to the CLI by `/login` (RFC 8628-shaped). */
+export interface DeviceCodeStart {
+  deviceCode: string;
+  userCode: string;
+  verificationUri: string;
+  expiresInSeconds: number;
+  intervalSeconds: number;
 }
