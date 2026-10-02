@@ -3,6 +3,7 @@ import { AgentEventBus, type PublicAgentEvent, type BudgetSnapshot } from "@infl
 import { streamModel, toProviderError, type FinishReason, type Message, type ModelEvent, type ReasoningEffort, type TokenUsage } from "@inflynx/model-gateway";
 import {
   assertSupportedReasoningEffort,
+  clampReasoningEffort,
   getCredentialProfile,
   getProvider,
   redactSecrets,
@@ -1782,13 +1783,26 @@ export class AgentOrchestrator {
   private static assertModelSelection(options: ExecutionOptions): void {
     if (!options.reasoningEffort) return;
     if (options.providerId === "custom-openai-compatible") {
-      if (!options.customCapabilities?.supportedEfforts.includes(options.reasoningEffort)) {
-        throw new Error(
-          `Custom model "${options.model}" does not declare support for effort "${options.reasoningEffort}".`
+      const declared = options.customCapabilities?.supportedEfforts ?? [];
+      if (declared.length && !declared.includes(options.reasoningEffort)) {
+        const fallback = (declared[declared.length - 1] ?? "none") as ReasoningEffort;
+        console.warn(
+          `[agent] custom model "${options.model}" does not declare effort "${options.reasoningEffort}"; ` +
+          `using "${fallback}" (declared: ${declared.join(", ")}).`
         );
+        options.reasoningEffort = fallback;
       }
       return;
     }
-    assertSupportedReasoningEffort(options.providerId, options.model, options.reasoningEffort);
+    // Startup must not brick on a bad MODEL/effort combo — lower it to a supported level and say so
+    // (loudly, not silently). `assertSupportedReasoningEffort` still exists for deliberate paths.
+    const clamped = clampReasoningEffort(options.providerId, options.model, options.reasoningEffort);
+    if (clamped.changed) {
+      console.warn(
+        `[agent] model "${options.model}" on ${options.providerId} does not support effort ` +
+        `"${options.reasoningEffort}"; using "${clamped.effort}" (supported: ${clamped.supported.join(", ") || "none"}).`
+      );
+      options.reasoningEffort = clamped.effort;
+    }
   }
 }

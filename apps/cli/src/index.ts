@@ -1,6 +1,7 @@
-#!/usr/bin/env node
-
 /**
+ * NOTE: the `#!/usr/bin/env node` shebang is injected by esbuild in the bundle (see
+ * esbuild.config.mjs) so it lands as the very first line of `dist/inflynx.mjs`. Keeping it here
+ * too would double it in the bundle, and a second `#!` line is a SyntaxError.
  * Inflynx Code CLI Agent — Full Agentic Loop with Surgical Patching & Diff Previews
  */
 

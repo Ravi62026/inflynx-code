@@ -66,6 +66,7 @@ const unitTestFiles = [
   "tests/unit/phase19-subagent.test.ts",  // Phase 19: nested read-only sub-agent, context isolation
   "tests/unit/phase44-skills.test.ts",  // Phase 44: real SKILL.md frontmatter parser (I5)
   "tests/unit/phase47-parity.test.ts",  // Phase 47: normalized wire BudgetSnapshot (K3) + shared protocol types
+  "tests/unit/config-efforts.test.ts",  // Effort matrix (researched) + startup clamp
   "tests/unit/image-read.test.ts",  // Phase 27 completion: read_file returns images; orchestrator injects them natively
   "tests/unit/phase28-parallel.test.ts",  // Phase 28: parallel read-only batch keeps call-order guarantees
   "tests/unit/cli-dx.test.ts",  // Launch sprint: markdown block streaming + AGENTS.md loading

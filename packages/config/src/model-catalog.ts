@@ -47,10 +47,19 @@ export interface ProviderInfo {
   credentialRequired: boolean;
 }
 
+// Effort support is a property of the *model*, not of the routing provider — mapping it per
+// provider family (and per model where the vendor differs) is what stops `google/gemini-*` routed
+// through OpenRouter from falsely claiming OpenAI's `xhigh`/`max`. Values verified against vendor
+// docs (Oct 2026): OpenAI reasoning models expose none/low/medium/high/xhigh/max (GPT-5.x); Google
+// Gemini "thinking_level" is a discrete set per model (see the table below, e.g. gemini-3.8-flash =
+// low/medium/high — there is no "none"); Anthropic extended thinking is on/off + a budget
+// (none/low/medium/high); DeepSeek reasoning is coarse (none/low/medium/high).
 const OPENAI_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"] as const;
-const ANTHROPIC_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"] as const;
-const DEEPSEEK_EFFORTS = ["none", "low", "high", "max"] as const;
-const GEMINI_EFFORTS = ["none", "minimal", "low", "medium", "high"] as const;
+const ANTHROPIC_EFFORTS = ["none", "low", "medium", "high"] as const;
+const DEEPSEEK_EFFORTS = ["none", "low", "medium", "high"] as const;
+// Gemini's family superset (minimal only on some flash tiers); individual entries narrow it.
+const GEMINI_EFFORTS = ["minimal", "low", "medium", "high"] as const;
+const GEMINI_FLASH_3_8_EFFORTS = ["low", "medium", "high"] as const; // ai.google.dev/gemini-api/docs/thinking
 const OPENROUTER_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 export const MODEL_CATALOG: Record<ProviderId, ModelCapability[]> = {
@@ -61,7 +70,7 @@ export const MODEL_CATALOG: Record<ProviderId, ModelCapability[]> = {
       adapter: "openai-chat",
       supportsTools: true,
       supportsThinking: true,
-      supportedEfforts: OPENROUTER_EFFORTS,
+      supportedEfforts: OPENAI_EFFORTS,
       contextWindow: 1_050_000,
       maxOutputTokens: 128_000,
       curated: true,
@@ -72,7 +81,7 @@ export const MODEL_CATALOG: Record<ProviderId, ModelCapability[]> = {
       adapter: "openai-chat",
       supportsTools: true,
       supportsThinking: true,
-      supportedEfforts: OPENROUTER_EFFORTS,
+      supportedEfforts: ANTHROPIC_EFFORTS,
       contextWindow: 200_000,
       maxOutputTokens: 64_000,
       curated: true,
@@ -83,7 +92,7 @@ export const MODEL_CATALOG: Record<ProviderId, ModelCapability[]> = {
       adapter: "openai-chat",
       supportsTools: true,
       supportsThinking: true,
-      supportedEfforts: OPENROUTER_EFFORTS,
+      supportedEfforts: DEEPSEEK_EFFORTS,
       contextWindow: 164_000,
       maxOutputTokens: 8_192,
       curated: true,
@@ -94,7 +103,18 @@ export const MODEL_CATALOG: Record<ProviderId, ModelCapability[]> = {
       adapter: "openai-chat",
       supportsTools: true,
       supportsThinking: true,
-      supportedEfforts: OPENROUTER_EFFORTS,
+      supportedEfforts: GEMINI_EFFORTS,
+      contextWindow: 1_048_576,
+      maxOutputTokens: 65_536,
+      curated: true,
+    },
+    {
+      id: "google/gemini-3.8-flash",
+      label: "Gemini 3.8 Flash",
+      adapter: "openai-chat",
+      supportsTools: true,
+      supportsThinking: true,
+      supportedEfforts: GEMINI_FLASH_3_8_EFFORTS,
       contextWindow: 1_048_576,
       maxOutputTokens: 65_536,
       curated: true,
@@ -147,6 +167,17 @@ export const MODEL_CATALOG: Record<ProviderId, ModelCapability[]> = {
       supportsTools: true,
       supportsThinking: true,
       supportedEfforts: GEMINI_EFFORTS,
+      contextWindow: 1_048_576,
+      maxOutputTokens: 65_536,
+      curated: true,
+    },
+    {
+      id: "gemini-3.8-flash",
+      label: "Gemini 3.8 Flash",
+      adapter: "gemini-generate-content",
+      supportsTools: true,
+      supportsThinking: true,
+      supportedEfforts: GEMINI_FLASH_3_8_EFFORTS,
       contextWindow: 1_048_576,
       maxOutputTokens: 65_536,
       curated: true,
@@ -324,4 +355,28 @@ export function assertSupportedReasoningEffort(
     );
   }
   return effort;
+}
+
+/**
+ * Startup-tolerant sibling of `assertSupportedReasoningEffort`: instead of throwing, it lowers an
+ * unsupported effort to the highest level the model actually supports (by the REASONING_EFFORTS
+ * order), reporting that it changed. This is NOT silent — the caller surfaces the warning — but a
+ * bad `MODEL`/`INFLYNX_REASONING_EFFORT` combo must not brick `icode` at boot with a stack trace
+ * the user cannot act on. Returns `changed` so the caller can print "effort 'high' → 'high'
+ * unsupported, using 'medium'".
+ */
+export function clampReasoningEffort(
+  providerId: string,
+  modelId: string,
+  effort: ReasoningEffort
+): { effort: ReasoningEffort; changed: boolean; supported: readonly ReasoningEffort[] } {
+  const supported = resolveModelCapability(providerId, modelId).supportedEfforts;
+  if (supported.includes(effort)) return { effort, changed: false, supported };
+  // Pick the closest supported level at-or-below the requested one, else the highest available.
+  const rank = (e: ReasoningEffort) => REASONING_EFFORTS.indexOf(e);
+  const desired = rank(effort);
+  const atOrBelow = supported.filter((e) => rank(e) <= desired).sort((a, b) => rank(b) - rank(a));
+  const highestFirst = [...supported].sort((a, b) => rank(b) - rank(a));
+  const picked = atOrBelow[0] ?? highestFirst[0] ?? "none";
+  return { effort: picked as ReasoningEffort, changed: true, supported };
 }

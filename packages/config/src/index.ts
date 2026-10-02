@@ -11,6 +11,7 @@ import { findWorkspaceRoot } from "./workspace-root.js";
 
 export {
   assertSupportedReasoningEffort,
+  clampReasoningEffort,
   CONSERVATIVE_CONTEXT_WINDOW,
   CONSERVATIVE_MAX_OUTPUT_TOKENS,
   CONTEXT_STRATEGIES,
@@ -68,9 +69,10 @@ export { findWorkspaceRoot, loadProjectInstructions } from "./workspace-root.js"
 
 export function loadEnv(startDir: string = process.cwd()): void {
   const rootDir = findWorkspaceRoot(startDir);
-  const envFiles: string[] = [
-    path.join(os.homedir(), ".inflynx", ".env"),
-  ];
+  // Most-specific first: the current project's .env (and any parent up to the workspace root) must
+  // WIN over a stale global ~/.inflynx/.env, because vars are only applied when unset (see below).
+  // Previously the global file was loaded first and shadowed the project config (wrong ports/URLs).
+  const envFiles: string[] = [];
 
   // Search for .env from current directory up to root monorepo directory
   let curr = path.resolve(startDir);
@@ -84,6 +86,9 @@ export function loadEnv(startDir: string = process.cwd()): void {
   if (process.env.INIT_CWD) {
     envFiles.push(path.join(process.env.INIT_CWD, ".env"));
   }
+
+  // Global defaults LAST — they only fill keys no project .env provided.
+  envFiles.push(path.join(os.homedir(), ".inflynx", ".env"));
 
   for (const envFile of envFiles) {
     if (fs.existsSync(envFile)) {

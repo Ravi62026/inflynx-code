@@ -1,20 +1,38 @@
 {
   "name": "inflynx-agent",
   "version": "1.0.0",
-  "description": "Inflynx Code CLI Agent - Local AI agent engine",
+  "description": "Inflynx Code CLI Agent - a local-first, BYOK, approval-gated agentic coding tool",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "inflynx-agent": "./dist/index.js",
-    "inflynx": "./dist/index.js"
+    "inflynx-agent": "./dist/inflynx.mjs",
+    "inflynx": "./dist/inflynx.mjs",
+    "icode": "./dist/inflynx.mjs"
   },
+  "files": [
+    "dist/inflynx.mjs",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "bundle": "node esbuild.config.mjs",
+    "prepack": "node esbuild.config.mjs",
     "dev": "tsx src/index.ts",
     "start": "tsx src/index.ts"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
+    "@napi-rs/keyring": "^1.3.0",
+    "typescript": "^6.0.2"
+  },
+  "optionalDependencies": {
+    "ioredis": "^5.4.2",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
     "@inquirer/prompts": "^7.8.10",
     "@inflynx/agent-core": "workspace:*",
     "@inflynx/config": "workspace:*",
@@ -28,10 +46,9 @@
     "@inflynx/tool-runtime": "workspace:*",
     "@inflynx/ui-components": "workspace:*",
     "@inflynx/vector-store": "workspace:*",
-    "@inflynx/workspace-runtime": "workspace:*"
-  },
-  "devDependencies": {
+    "@inflynx/workspace-runtime": "workspace:*",
     "@types/node": "^25.5.0",
+    "esbuild": "^0.25.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2"
   }
