@@ -26,6 +26,7 @@ import { AgentOrchestrator, type AgentBudgetLevel, type AgentMode, type ToolAppr
 import { AgentEventBus, type PublicAgentEvent } from "@inflynx/protocol";
 import { handleAuthRoutes } from "./auth/routes.js";
 import { authEnforced, resolveUser } from "./auth/middleware.js";
+import { creditsForCostUsd } from "./auth/credits.js";
 import { isProviderError } from "@inflynx/model-gateway";
 import { getRedisClient } from "@inflynx/cache";
 
@@ -520,6 +521,19 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 400, { error: "Missing required 'prompt' field in request body." });
       }
 
+      // Phase 2/3: with an authenticated caller (only present when INFLYNX_AUTH_ENFORCED is on),
+      // enforce ownership, disablement, and a credit balance BEFORE running (402 = out of credits).
+      const caller = (req as { __inflynxUser?: { sub: string } }).__inflynxUser;
+      if (caller && identityStore && authEnforced()) {
+        const own = await sessionStore.getSessionHydration(sessionId);
+        if (own?.session?.userId && own.session.userId !== caller.sub) {
+          return sendJson(res, 403, { error: "forbidden" });
+        }
+        const u = await identityStore.getUser(caller.sub);
+        if (!u || u.disabled) return sendJson(res, 403, { error: "account disabled" });
+        if (u.credits <= 0) return sendJson(res, 402, { error: "out of credits — top up to continue" });
+      }
+
       // Rehydrate or reuse active orchestrator
       let active = activeOrchestrators.get(sessionId);
       if (!active) {
@@ -769,6 +783,7 @@ const server = http.createServer(async (req, res) => {
       req.on("close", onClientClose);
 
       try {
+        const costBefore = active.orchestrator.budget.estimatedCostUsd;
         const turnResult = await active.orchestrator.runTurn(prompt, attachedContext || undefined, messageImages.length ? messageImages : undefined);
         sseWrite("turn.completed", {
           finalText: turnResult.finalText,
@@ -776,6 +791,11 @@ const server = http.createServer(async (req, res) => {
           budgetState: active.orchestrator.budgetSnapshot,
           isCompleted: turnResult.isCompleted,
         });
+        // Phase 3: meter the turn — debit the session's incremental cost from the owner's balance.
+        if (caller && identityStore && authEnforced()) {
+          const delta = Math.max(0, active.orchestrator.budget.estimatedCostUsd - costBefore);
+          if (delta > 0) await identityStore.debitCredits(caller.sub, creditsForCostUsd(delta), "model-turn", sessionId).catch(() => {});
+        }
         res.write("data: [DONE]\n\n");
       } catch (err: any) {
         const errMsg = isProviderError(err) ? err.userMessage : err?.message || String(err);

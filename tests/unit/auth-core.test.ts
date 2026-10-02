@@ -10,6 +10,7 @@ import { strict as assert } from "node:assert";
 process.env.INFLYNX_TOKEN_SECRET = "unit-test-secret-value-1234567890";
 
 import { signAppToken, verifyAppToken } from "../../apps/server/src/auth/jwt.js";
+import { creditsForCostUsd } from "../../apps/server/src/auth/credits.js";
 import { startDeviceCode, approveDevice, pollDeviceToken, type AuthStore, type DeviceFlowDeps } from "../../apps/server/src/auth/deviceFlow.js";
 import type { DeviceCode, User } from "../../packages/session-store/src/index.js";
 
@@ -104,6 +105,16 @@ async function main() {
     const s = makeStore();
     assert.deepEqual(await pollDeviceToken(deps(s), "nope"), { status: "invalid_grant", error: "invalid_grant" });
     console.log("  ✓ unknown device code → invalid_grant");
+  }
+
+  // 7 --- metering policy: a real turn always debits ≥1 credit; rate is tunable; negatives clamp.
+  {
+    assert.equal(creditsForCostUsd(0, 100), 1, "a zero-cost turn still costs the minimum 1 credit");
+    assert.equal(creditsForCostUsd(0.0001, 100), 1, "sub-cent cost rounds up to 1");
+    assert.equal(creditsForCostUsd(0.023, 100), 3, "$0.023 at 100 credits/$ = 3");
+    assert.equal(creditsForCostUsd(0.02, 50), 1, "$0.02 at 50/$ = 1");
+    assert.equal(creditsForCostUsd(-5, 100), 1, "negative clamps to the minimum");
+    console.log("  ✓ creditsForCostUsd: min-1, round-up, tunable rate, negative-safe");
   }
 
   console.log("\n=== auth core results:", 0, "failures ===");
