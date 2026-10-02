@@ -131,6 +131,8 @@ export interface SessionStore {
   archiveSession(sessionId: string): Promise<void>;
   /** Hard delete: removes the session and, via cascade, its messages/executions/telemetry. */
   deleteSession(sessionId: string): Promise<boolean>;
+  /** Phase 2: attribute a session to its owner (set once, right after creation, when auth is on). */
+  setSessionUser?(sessionId: string, userId: string): Promise<void>;
   /** Releases underlying connections/handles, if any. Safe to call on stores that don't need it. */
   close(): Promise<void>;
 
@@ -151,6 +153,12 @@ export interface SessionStore {
   markUserFlagged?(userId: string, reason: string): Promise<void>;
   setUserDisabled?(userId: string, disabled: boolean): Promise<void>;
   touchUserSeen?(userId: string, ip?: string): Promise<void>;
+
+  // ── Device-authorization grant for the CLI /login flow (RFC 8628-shaped). ──────
+  createDeviceCode?(input: { verificationUri: string; ttlMs: number }): Promise<DeviceCode>;
+  lookupDeviceCode?(userCode: string): Promise<DeviceCode | null>;
+  lookupDeviceCodeByDevice?(deviceCode: string): Promise<DeviceCode | null>;
+  approveDeviceCode?(userCode: string, userId: string): Promise<boolean>;
 }
 
 import { randomUUID } from "node:crypto";
@@ -222,5 +230,16 @@ export interface CreditLedgerEntry {
   reason: string;
   sessionId: string | null;
   balanceAfter: number;
+  createdAt: number;
+}
+
+/** A row of the `device_codes` table (the CLI device-authorization grant). */
+export interface DeviceCode {
+  userCode: string;
+  deviceCode: string;
+  verificationUri: string;
+  expiresAt: number;
+  userId: string | null;
+  approved: boolean;
   createdAt: number;
 }

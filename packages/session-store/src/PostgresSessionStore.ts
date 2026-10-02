@@ -10,6 +10,7 @@
 
 import pg from "pg";
 import path from "path";
+import { randomBytes } from "node:crypto";
 import type {
   SessionStore,
   SessionRecord,
@@ -21,6 +22,7 @@ import type {
   User,
   CreateUserIdentityInput,
   SignupSignal,
+  DeviceCode,
 } from "./types.js";
 import { generateSessionId, generateRecordId } from "./types.js";
 import { MIGRATIONS } from "./migrations.js";
@@ -403,6 +405,11 @@ export class PostgresSessionStore implements SessionStore {
     return (res.rowCount ?? 0) > 0;
   }
 
+  async setSessionUser(sessionId: string, userId: string): Promise<void> {
+    await this.ensureMigrated();
+    await this.pool.query(`UPDATE agent_sessions SET user_id = $2 WHERE session_id = $1`, [sessionId, userId]);
+  }
+
   async close(): Promise<void> {
     await this.pool.end();
   }
@@ -582,5 +589,59 @@ export class PostgresSessionStore implements SessionStore {
     } else {
       await this.pool.query(`UPDATE users SET last_seen_at = $1 WHERE id = $2`, [Date.now(), userId]);
     }
+  }
+
+  // ── Device-authorization grant (CLI /login) ────────────────────────────
+
+  private mapDeviceCodeRow(row: any): DeviceCode {
+    return {
+      userCode: row.user_code,
+      deviceCode: row.device_code,
+      verificationUri: row.verification_uri,
+      expiresAt: Number(row.expires_at),
+      userId: row.user_id ?? null,
+      approved: row.approved,
+      createdAt: Number(row.created_at),
+    };
+  }
+
+  async createDeviceCode(input: { verificationUri: string; ttlMs: number }): Promise<DeviceCode> {
+    await this.ensureMigrated();
+    // Human-readable code avoids easily-confused glyphs (no I/O/0/1); the device code is opaque.
+    const alphabet = "BCDFGHJKLMNPQRSTVWXZ";
+    const rand = (n: number) => Array.from(randomBytes(n)).map((b) => alphabet[b % alphabet.length]).join("");
+    const userCode = `${rand(4)}-${rand(4)}`;
+    const deviceCode = randomBytes(32).toString("hex");
+    const now = Date.now();
+    const expires = now + Math.max(30_000, input.ttlMs);
+    await this.pool.query(
+      `INSERT INTO device_codes (user_code, device_code, verification_uri, expires_at, approved, created_at)
+       VALUES ($1, $2, $3, $4, false, $5)`,
+      [userCode, deviceCode, input.verificationUri, expires, now]
+    );
+    return { userCode, deviceCode, verificationUri: input.verificationUri, expiresAt: expires, userId: null, approved: false, createdAt: now };
+  }
+
+  async lookupDeviceCode(userCode: string): Promise<DeviceCode | null> {
+    await this.ensureMigrated();
+    const res = await this.pool.query(`SELECT * FROM device_codes WHERE user_code = $1`, [userCode]);
+    return res.rows[0] ? this.mapDeviceCodeRow(res.rows[0]) : null;
+  }
+
+  async lookupDeviceCodeByDevice(deviceCode: string): Promise<DeviceCode | null> {
+    await this.ensureMigrated();
+    const res = await this.pool.query(`SELECT * FROM device_codes WHERE device_code = $1`, [deviceCode]);
+    return res.rows[0] ? this.mapDeviceCodeRow(res.rows[0]) : null;
+  }
+
+  async approveDeviceCode(userCode: string, userId: string): Promise<boolean> {
+    await this.ensureMigrated();
+    // Only an unexpired grant can be approved, and approval is one-shot per user binding.
+    const res = await this.pool.query(
+      `UPDATE device_codes SET approved = true, user_id = $1
+       WHERE user_code = $2 AND expires_at > $3`,
+      [userId, userCode, Date.now()]
+    );
+    return (res.rowCount ?? 0) > 0;
   }
 }

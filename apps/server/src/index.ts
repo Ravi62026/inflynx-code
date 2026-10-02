@@ -20,10 +20,12 @@ import {
   supportsReasoningEffort,
   type ReasoningEffort,
 } from "@inflynx/config";
-import { createSessionStore, type SessionStore } from "@inflynx/session-store";
+import { createSessionStore, PostgresSessionStore, type SessionStore } from "@inflynx/session-store";
 import { ToolRegistry, CORE_TOOLS } from "@inflynx/tool-runtime";
 import { AgentOrchestrator, type AgentBudgetLevel, type AgentMode, type ToolApprovalRequest } from "@inflynx/agent-core";
 import { AgentEventBus, type PublicAgentEvent } from "@inflynx/protocol";
+import { handleAuthRoutes } from "./auth/routes.js";
+import { authEnforced, resolveUser } from "./auth/middleware.js";
 import { isProviderError } from "@inflynx/model-gateway";
 import { getRedisClient } from "@inflynx/cache";
 
@@ -100,6 +102,11 @@ function resolveServerWorkspaceRoot(): string {
 const WORKSPACE_ROOT = resolveServerWorkspaceRoot();
 
 const sessionStore: SessionStore = createSessionStore(WORKSPACE_ROOT);
+
+// Auth (Phase 2): identity/device codes/credits require Postgres. Present only when DATABASE_URL is
+// set; the /auth + /me routes and the (default-off) INFLYNX_AUTH_ENFORCED gate no-op without it, so
+// the local BYOK demo flow is untouched until the keys + CLI /login (Phase 4) turn it on.
+const identityStore = process.env.DATABASE_URL ? new PostgresSessionStore(process.env.DATABASE_URL) : null;
 
 /**
  * One tool registry **per session**, built on demand rather than shared.
@@ -307,6 +314,29 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    // ─── Auth routes (CLI device flow) + /me ──────────────────────────────────
+    // Only meaningful with a Postgres identity store; otherwise they 404, leaving the local flow intact.
+    if (identityStore && (pathname.startsWith("/auth/") || pathname === "/me" || pathname.startsWith("/me/"))) {
+      const handled = await handleAuthRoutes(req, res, {
+        store: identityStore,
+        baseUrl: (process.env.INFLYNX_PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/+$/, ""),
+        send: sendJson,
+        readBody: parseJsonBody,
+        toWireSession,
+      });
+      if (handled) return;
+      return sendJson(res, 404, { error: "not found" });
+    }
+
+    // Mandatory-login gate (Phase 2). Default OFF (INFLYNX_AUTH_ENFORCED unset) so the BYOK local
+    // flow is unaffected; flipped on with Clerk keys + the CLI /login (Phase 4). When on, session
+    // routes require a valid app token. /health and /api/models stay public.
+    if (authEnforced() && pathname.startsWith("/api/sessions")) {
+      const claims = resolveUser(req);
+      if (!claims) return sendJson(res, 401, { error: "authentication required — run: icode /login" });
+      (req as { __inflynxUser?: unknown }).__inflynxUser = claims;
+    }
+
     // ─── GET /health ────────────────────────────────────────────────────────
     if (req.method === "GET" && pathname === "/health") {
       let postgresStatus = "disconnected";
@@ -346,6 +376,12 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && pathname === "/api/sessions") {
       const now = Date.now();
       const limit = Number(reqUrl.searchParams.get("limit") || "50");
+      // Per-user history: with auth on, a caller sees only their own sessions (not the shared cwd).
+      const claims = (req as { __inflynxUser?: { sub: string } }).__inflynxUser;
+      if (claims && identityStore) {
+        const mine = await identityStore.listSessionsByUser(claims.sub, limit);
+        return sendJson(res, 200, { sessions: mine.map(toWireSession) });
+      }
       if (listSessionsCache && (now - listSessionsCache.time) < 800) {
         return sendJson(res, 200, { sessions: listSessionsCache.data.slice(0, limit).map(toWireSession) });
       }
@@ -430,6 +466,12 @@ const server = http.createServer(async (req, res) => {
 
       activeOrchestrators.set(orchestrator.sessionId, { orchestrator, bus, registry });
 
+      // Attribute the new session to the authenticated caller (owner is fixed at creation).
+      const ownerClaims = (req as { __inflynxUser?: { sub: string } }).__inflynxUser;
+      if (ownerClaims && identityStore) {
+        await identityStore.setSessionUser(orchestrator.sessionId, ownerClaims.sub).catch(() => {});
+      }
+
       return sendJson(res, 201, {
         sessionId: orchestrator.sessionId,
         providerId,
@@ -453,6 +495,11 @@ const server = http.createServer(async (req, res) => {
       const hydration = await sessionStore.getSessionHydration(sessionId);
       if (!hydration) {
         return sendJson(res, 404, { error: `Session "${sessionId}" not found.` });
+      }
+      // Per-user authorization: a session belongs to exactly one owner; never leak another's.
+      const caller = (req as { __inflynxUser?: { sub: string } }).__inflynxUser;
+      if (caller && hydration.session.userId && hydration.session.userId !== caller.sub) {
+        return sendJson(res, 403, { error: "forbidden" });
       }
       // K2: normalize the inner session row so the extension reads real providerId/budgetLevel/state.
       const wireHydration = { ...hydration, session: toWireSession(hydration.session) };
