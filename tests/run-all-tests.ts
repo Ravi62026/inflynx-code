@@ -70,6 +70,7 @@ const unitTestFiles = [
   "tests/unit/auth-foundation.test.ts",  // Phase 1 auth: migration + identity/credit method presence (offline)
   "tests/unit/auth-core.test.ts",  // Phase 2 auth core: app JWT + device flow + abuse-gated signup (pure)
   "tests/unit/auth-routes.test.ts",  // Phase 2 auth routes: device flow + /me status codes (fake store/verifier)
+  "tests/unit/cli-auth-client.test.ts",  // Phase 4 CLI auth client: device flow + 0600 token store (fake fetch)
   "tests/unit/image-read.test.ts",  // Phase 27 completion: read_file returns images; orchestrator injects them natively
   "tests/unit/phase28-parallel.test.ts",  // Phase 28: parallel read-only batch keeps call-order guarantees
   "tests/unit/cli-dx.test.ts",  // Launch sprint: markdown block streaming + AGENTS.md loading

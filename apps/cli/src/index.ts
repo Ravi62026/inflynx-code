@@ -72,6 +72,7 @@ import { HnswVectorStore } from "@inflynx/vector-store";
 import { createSessionStore } from "@inflynx/session-store";
 import { applySurgicalPatch, computeUnifiedDiff } from "@inflynx/patch-engine";
 import { McpClientManager } from "@inflynx/mcp-runtime";
+import { runDeviceLogin, loadToken, clearToken } from "./auth-client.js";
 import { SkillManager } from "@inflynx/skill-runtime";
 import {
   buildWorkspaceIndex,
@@ -123,6 +124,9 @@ const SLASH_COMMANDS = [
   { name: "/index",        value: "/index",        description: "View workspace index summary & relevant files" },
   { name: "/attach",       value: "/attach",       description: "Attach an image or text file to the NEXT prompt: /attach <path> (images become visible to the model)" },
   { name: "/clear",        value: "/clear",        description: "Clear terminal screen & conversation" },
+  { name: "/login",        value: "/login",        description: "Sign in via the browser (device flow) to link this session to your account" },
+  { name: "/account",      value: "/account",      description: "Show your signed-in account, plan, and credit balance" },
+  { name: "/logout",       value: "/logout",       description: "Sign out (remove the local token)" },
   { name: "/help",         value: "/help",         description: "Show all available commands" },
   { name: "/exit",         value: "/exit",         description: "Exit Inflynx Code CLI agent" },
 ];
@@ -2105,6 +2109,47 @@ async function main() {
         continue;
       }
 
+      if (cmd === "login") {
+        const base = process.env.INFLYNX_SERVER_URL || "https://api.inflynx.ai";
+        console.log(`\n${colors.cyan}Signing in against ${base} — a browser window will open with your one-time code.${colors.reset}`);
+        const r = await runDeviceLogin({
+          baseUrl: base,
+          fetch,
+          open: async (url) => {
+            // Best-effort cross-platform open; a failure here must NOT abort the flow (the user
+            // can open the URL + code manually — the code is printed below regardless).
+            try {
+              const { spawn } = await import("node:child_process");
+              const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+              spawn(opener, [url], { shell: true, stdio: "ignore" }).on("error", () => {});
+            } catch { /* non-fatal */ }
+            console.log(`  ${colors.gray}If it didn't open, go to ${url}${colors.reset}`);
+          },
+        });
+        console.log(r.ok
+          ? `\n${colors.green}✓ Signed in. Your sessions are now linked to your account.${colors.reset}\n`
+          : `\n${colors.red}✗ Login failed: ${!r.ok ? r.error : ""}${colors.reset}\n`);
+        continue;
+      }
+      if (cmd === "logout") {
+        clearToken();
+        console.log(`${colors.gray}Signed out — the local token was removed. Run /login to sign back in.${colors.reset}\n`);
+        continue;
+      }
+      if (cmd === "account") {
+        const t = loadToken();
+        if (!t) { console.log(`${colors.gray}Not signed in. Run ${colors.reset}/login${colors.gray}.${colors.reset}\n`); continue; }
+        const base = process.env.INFLYNX_SERVER_URL || "https://api.inflynx.ai";
+        try {
+          const res = await fetch(`${base}/me`, { headers: { authorization: `Bearer ${t}` } });
+          if (!res.ok) { console.log(`${colors.red}Account lookup failed (HTTP ${res.status}). Try /login again.${colors.reset}\n`); continue; }
+          const me = (await res.json()) as any;
+          console.log(`\n${colors.cyan}Account${colors.reset}: ${me.email || me.id} · plan ${me.plan} · ${me.credits} credits\n`);
+        } catch (e) {
+          console.log(`${colors.red}Could not reach ${base}: ${(e as Error).message}${colors.reset}\n`);
+        }
+        continue;
+      }
       if (cmd === "effort" || cmd === "thinking" || cmd === "reasoning") {
         try {
           const effort = (arg
@@ -2364,6 +2409,14 @@ async function main() {
       pendingTextAttachments.length = 0;
     }
     const turnImages = pendingImages.splice(0);
+
+    // Phase 4 entitlement gate (default-off): when INFLYNX_REQUIRE_LOGIN is on, a real model turn
+    // needs a signed-in account. It is a purely LOCAL check (no backend round-trip), so a Clerk or
+    // backend outage can never break the CLI — turn it on only once login is wired end-to-end.
+    if (process.env.INFLYNX_REQUIRE_LOGIN === "1" && !loadToken()) {
+      console.log(`\n${colors.yellow}Sign in first — run ${colors.reset}/login${colors.yellow} to link this session to your account.${colors.reset}\n`);
+      continue;
+    }
 
     // ─── Agentic Turn ────────────────────────────────────────────────────────────
     // AgentOrchestrator.runTurn() now owns the entire loop: streaming, mode-based
