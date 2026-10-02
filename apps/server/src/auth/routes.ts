@@ -11,6 +11,7 @@ import { startDeviceCode, approveDevice, pollDeviceToken, type AuthStore } from 
 import { getIdentityVerifier, type VerifyIdentity } from "./identity.js";
 import { signAppToken, verifyAppToken } from "./jwt.js";
 import { bearerToken, clientIp } from "./middleware.js";
+import { checkRateLimit } from "@inflynx/cache";
 import type { UserPublic } from "@inflynx/protocol";
 
 export interface AuthRouteCtx {
@@ -29,6 +30,18 @@ function toPublic(u: any): UserPublic {
 export async function handleAuthRoutes(req: IncomingMessage, res: ServerResponse, ctx: AuthRouteCtx): Promise<boolean> {
   const path = (new URL(req.url || "/", "http://x").pathname.replace(/\/+$/, "")) || "/";
   const method = req.method || "GET";
+
+  // Phase 3.5: the device endpoints are unauthenticated entry points — cap them per IP so one box
+  // can't mint unlimited codes or brute-force the token poll. Reuses the Phase 42 limiter.
+  if (method === "POST" && path.startsWith("/auth/device/")) {
+    const rl = await checkRateLimit(`auth:ip:${clientIp(req)}`, Number(process.env.INFLYNX_AUTH_PER_IP || "20"), 60, { failClosed: process.env.INFLYNX_RATE_LIMIT_FAIL_CLOSED === "1" });
+    if (!rl.allowed) {
+      res.setHeader?.("retry-after", String(rl.resetInSec));
+      ctx.send(res, 429, { error: "rate_limited", resetInSec: rl.resetInSec });
+      return true;
+    }
+  }
+
   const deps = {
     store: ctx.store,
     signForUser: (userId: string) => ({ token: signAppToken({ sub: userId, plan: "free" }, 3600), expiresInSec: 3600 }),

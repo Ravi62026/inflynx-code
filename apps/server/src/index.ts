@@ -25,10 +25,10 @@ import { ToolRegistry, CORE_TOOLS } from "@inflynx/tool-runtime";
 import { AgentOrchestrator, type AgentBudgetLevel, type AgentMode, type ToolApprovalRequest } from "@inflynx/agent-core";
 import { AgentEventBus, type PublicAgentEvent } from "@inflynx/protocol";
 import { handleAuthRoutes } from "./auth/routes.js";
-import { authEnforced, resolveUser } from "./auth/middleware.js";
+import { authEnforced, resolveUser, clientIp } from "./auth/middleware.js";
 import { creditsForCostUsd } from "./auth/credits.js";
 import { isProviderError } from "@inflynx/model-gateway";
-import { getRedisClient } from "@inflynx/cache";
+import { getRedisClient, checkRateLimit } from "@inflynx/cache";
 
 loadEnv();
 
@@ -532,6 +532,21 @@ const server = http.createServer(async (req, res) => {
         const u = await identityStore.getUser(caller.sub);
         if (!u || u.disabled) return sendJson(res, 403, { error: "account disabled" });
         if (u.credits <= 0) return sendJson(res, 402, { error: "out of credits — top up to continue" });
+
+        // Phase 3.5: two buckets — per-user (one account can't hammer) and per-IP (a fleet of
+        // accounts from one box can't either). Server fails CLOSED on a Redis error (a control
+        // must not silently open). Reuses the atomic Phase 42 limiter — no new limiter.
+        const winSec = Number(process.env.INFLYNX_TURNS_WINDOW_SEC || "60");
+        const failClosed = process.env.INFLYNX_RATE_LIMIT_FAIL_CLOSED === "1";
+        const rlUser = await checkRateLimit(`turn:user:${caller.sub}`, Number(process.env.INFLYNX_TURNS_PER_USER || "30"), winSec, { failClosed });
+        const rlIp = rlUser.allowed
+          ? await checkRateLimit(`turn:ip:${clientIp(req)}`, Number(process.env.INFLYNX_TURNS_PER_IP || "120"), winSec, { failClosed })
+          : null;
+        const limited = !rlUser.allowed ? rlUser : rlIp && !rlIp.allowed ? rlIp : null;
+        if (limited) {
+          res.setHeader("retry-after", String(limited.resetInSec));
+          return sendJson(res, 429, { error: "rate_limited", limit: limited.limit, resetInSec: limited.resetInSec });
+        }
       }
 
       // Rehydrate or reuse active orchestrator
