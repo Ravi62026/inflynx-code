@@ -17,6 +17,7 @@ import TermsPage from './pages/TermsPage'
 import ContactPage from './pages/ContactPage'
 import SignUpPage from './pages/SignUpPage'
 import SignInPage from './pages/SignInPage'
+import ActivatePage from './pages/ActivatePage'
 import OnboardingPage from './pages/OnboardingPage'
 import DocsPage from './pages/DocsPage'
 
@@ -139,6 +140,7 @@ export default function App() {
         <Route path="/signup" element={<SignUpPage />} />
         <Route path="/signin" element={<SignInPage />} />
         <Route path="/onboarding" element={<OnboardingPage />} />
+        <Route path="/activate" element={<ActivatePage />} />
 
         {/* App — fullscreen with own sidebar */}
         <Route path="/dashboard" element={<DashboardPage />} />
